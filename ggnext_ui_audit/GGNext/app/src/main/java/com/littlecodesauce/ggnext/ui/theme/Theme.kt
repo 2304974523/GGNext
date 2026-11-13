@@ -1,0 +1,213 @@
+package com.littlecodesauce.ggnext.ui.theme
+
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+import com.littlecodesauce.ggnext.core.Session
+import com.littlecodesauce.ggnext.ui.components.I18n
+
+/**
+ * 全局动态响应式色板：
+ * Bug 1 修复 & 界面调整 10：
+ * 1. 当切换深色/浅色模式、主题色或语言时，在 `GgNextTheme` 中通过 `key(activePreset, activeDarkMode, activeDynamicColor, systemDark, lang)`
+ *    强制整棵 UI 组合树在同一帧内同步重绘，彻底消除部分子组件跳过重组导致字体残留白色的问题（如图1）。
+ * 2. 浅色模式下所有数据类型语义色、指针色与区域色均采用高对比深色值，保证极佳可读性。
+ */
+object Rose {
+    var palette by mutableStateOf(buildAppPalette(ThemePreset.ROSE.seed, dark = true))
+
+    val IsDark: Boolean get() = palette.isDark
+    val Scrim: Color get() = palette.scrim
+    val Surface: Color get() = palette.surface
+    val Card: Color get() = palette.card
+    val CardHigh: Color get() = palette.cardHigh
+    val Row: Color get() = palette.row
+
+    val Primary: Color get() = palette.primary
+    val PrimaryDeep: Color get() = palette.primaryDeep
+    val PrimarySoft: Color get() = palette.primarySoft
+    val OnPrimary: Color get() = palette.onPrimary
+    val Chip: Color get() = palette.chip
+    val ChipSelected: Color get() = palette.chipSelected
+
+    val Text: Color get() = palette.text
+    val TextSecond: Color get() = palette.textSecond
+    val TextDim: Color get() = palette.textDim
+    val Divider: Color get() = palette.divider
+
+    // 界面调整 10：数据类型与内存区域语义色（浅色模式下采用深色高对比度色值）
+    val Green: Color get() = if (palette.isDark) Color(0xFF7FD99A) else Color(0xFF0E632B)
+    val Lime: Color get() = if (palette.isDark) Color(0xFFA8D97F) else Color(0xFF33610B)
+    val Cyan: Color get() = if (palette.isDark) Color(0xFF8FD6DE) else Color(0xFF0B5863)
+    val Blue: Color get() = if (palette.isDark) Color(0xFF8AA9E8) else Color(0xFF1A3E8C)
+    val Violet: Color get() = if (palette.isDark) Color(0xFFC79AE0) else Color(0xFF5B1F7D)
+    val Magenta: Color get() = if (palette.isDark) Color(0xFFD848A8) else Color(0xFF8C1160)
+    val Yellow: Color get() = if (palette.isDark) Color(0xFFE8D07F) else Color(0xFF735100)
+    val Orange: Color get() = if (palette.isDark) Color(0xFFE8A97F) else Color(0xFF8C3A06)
+    val Red: Color get() = if (palette.isDark) Color(0xFFE87F8A) else Color(0xFFA11826)
+    val Frozen: Color get() = palette.primary
+
+    // 跳转地址专属高亮背景与边框色
+    val JumpHighlight: Color get() = if (palette.isDark) Color(0x4CB8A832) else Color(0x36C8A618)
+    val JumpBorder: Color get() = if (palette.isDark) Color(0xAAE8D07F) else Color(0xAA8C6900)
+
+    // 原版 GG 内存页指针类型专属颜色
+    val PointerRO: Color get() = if (palette.isDark) Color(0xFFFFF066) else Color(0xFF7A5900)
+    val PointerW: Color get() = if (palette.isDark) Color(0xFFB57BFF) else Color(0xFF5618AB)
+    val PointerX: Color get() = if (palette.isDark) Color(0xFFFF66B2) else Color(0xFFA60E58)
+    val PointerWX: Color get() = if (palette.isDark) Color(0xFFFF66FF) else Color(0xFF8A0C8A)
+}
+
+fun regionColor(code: String): Color = when (code.uppercase()) {
+    "CH" -> Rose.Green
+    "JH" -> Rose.Green
+    "CA" -> Rose.Lime
+    "CD" -> Rose.Lime
+    "CB" -> Rose.Lime
+    "A", "AA" -> Rose.Green
+    "PS" -> Rose.Lime
+    // 需求 2：内存类型（J，S，As，V）配色参考图 1（暖黄/黄褐/橄榄绿系）
+    "J" -> Color(0xFFD4C894)   // Java：暖黄褐色
+    "S" -> Color(0xFFC8CA8E)   // Stack：浅卡其黄
+    "AS" -> Color(0xFFBAC484)  // Ashmem：橄榄卡其绿
+    "V" -> Color(0xFFBAC484)   // Video：橄榄卡其绿
+    "O" -> Color(0xFFD4D050)   // Other：金黄偏暗
+    "B" -> Rose.Red            // Bad：红色 (危险)
+    "XA" -> Color(0xFFB880B8)  // Code app：浅紫红 (危险)
+    "XS" -> Rose.Magenta       // Code system：亮品红 (危险)
+    else -> Rose.TextSecond
+}
+
+fun typeColor(flags: Int): Color = when (flags and 0x7F) {
+    1 -> if (Rose.palette.isDark) Color(0xFFE7A8D8) else Color(0xFF82186A) // Byte
+    2 -> Rose.Lime                                                           // Word
+    4 -> Rose.Cyan                                                           // Dword
+    8 -> if (Rose.palette.isDark) Color(0xFFB9A8E7) else Color(0xFF43288C) // Xor
+    16 -> if (Rose.palette.isDark) Color(0xFFE7A8A8) else Color(0xFF991F1F) // Float
+    32 -> Rose.Blue                                                          // Qword
+    64 -> Rose.Yellow                                                        // Double
+    127 -> Rose.Text                                                         // Auto
+    else -> Rose.Text
+}
+
+fun pointerColor(pointer: Int): Color = when (pointer) {
+    8 -> Rose.PointerRO
+    16 -> Rose.PointerW
+    2 -> Rose.PointerX
+    1 -> Rose.PointerWX
+    else -> Rose.TextSecond
+}
+
+fun pointerTypeLabel(pointer: Int): String = when (pointer) {
+    8 -> "RO"
+    16 -> "W"
+    2 -> "X"
+    1 -> "WX"
+    else -> ""
+}
+
+object Motion {
+    val Fast = androidx.compose.animation.core.tween<Float>(140)
+    val Normal = androidx.compose.animation.core.tween<Float>(240)
+    val Springy = androidx.compose.animation.core.spring<Float>(
+        dampingRatio = 0.72f,
+        stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow
+    )
+    val NavSpring = androidx.compose.animation.core.spring<androidx.compose.ui.unit.Dp>(
+        dampingRatio = 0.70f,
+        stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow
+    )
+    val ColorFast = androidx.compose.animation.core.tween<Color>(140)
+    val ColorNormal = androidx.compose.animation.core.tween<Color>(240)
+    const val DIALOG_ENTER_MS = 220
+    const val DIALOG_EXIT_MS = 160
+}
+
+data class UiMetrics(
+    val fontScale: Float = 0.88f,
+    val dialogCorner: Int = 12,
+    val sheetBlur: Int = 110,
+    val iconBlur: Int = 139,
+    val skeletonLoading: Boolean = true,
+    val bgOpacity: Float = 0.96f,
+    val panelScale: Float = 1.0f
+)
+
+val LocalUiMetrics = staticCompositionLocalOf { UiMetrics() }
+
+@Composable
+fun GgNextTheme(
+    preset: ThemePreset? = null,
+    darkMode: DarkMode? = null,
+    dynamicColor: Boolean? = null,
+    metrics: UiMetrics? = null,
+    content: @Composable () -> Unit
+) {
+    val ui by Session.ui.collectAsState()
+    val systemDark = isSystemInDarkTheme()
+    val activePreset = preset ?: ui.preset
+    val activeDarkMode = darkMode ?: ui.darkMode
+    val activeDynamic = dynamicColor ?: ui.dynamicColor
+    val lang = ui.settings["language"] ?: "0"
+
+    val (computedPalette, scheme) = rememberPaletteAndScheme(
+        preset = activePreset,
+        darkMode = activeDarkMode,
+        dynamicColor = activeDynamic,
+        systemDark = systemDark
+    )
+    Rose.palette = computedPalette
+    I18n.currentLang = lang
+    SideEffect {
+        Rose.palette = computedPalette
+        I18n.currentLang = lang
+    }
+
+    val m = metrics ?: ui.metrics
+    val typography = Typography(
+        titleLarge = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.Medium,
+            fontSize = (21 * m.fontScale).sp,
+            color = computedPalette.text
+        ),
+        bodyMedium = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontSize = (14 * m.fontScale).sp,
+            color = computedPalette.text
+        ),
+        labelSmall = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontSize = (10 * m.fontScale).sp,
+            color = computedPalette.textDim
+        )
+    )
+
+    // Bug 1 修复：使用 key(...) 包裹主题子树，确保切换浅色/深色模式、预设主题或语言时，
+    // 所有子组件在同一帧内 100% 重新组合并立即应用新文字与背景颜色，绝不残留旧帧白色文字。
+    key(activePreset, activeDarkMode, activeDynamic, systemDark, lang) {
+        CompositionLocalProvider(
+            LocalUiMetrics provides m,
+            LocalContentColor provides computedPalette.text
+        ) {
+            MaterialTheme(colorScheme = scheme, typography = typography) {
+                content()
+            }
+        }
+    }
+}

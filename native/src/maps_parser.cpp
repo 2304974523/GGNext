@@ -85,7 +85,7 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
         return RegionFlag::CH;
     }
 
-    // 7. Java / ART Virtual Machine Heap (Jh)
+    // 7. Java Heap (Jh) vs Java Runtime Structures (J)
     if (containsStr(path, "dalvik-") || startsWith(path, "[anon:dalvik-") ||
         startsWith(path, "/dev/ashmem/dalvik-") ||
         startsWith(path, "[anon:art_") ||
@@ -95,10 +95,21 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
         if (vma.executable) {
             return RegionFlag::XA; // ART JIT Code Cache
         }
-        if (vma.writable) {
+        bool isPrimaryJavaHeap =
+            containsStr(path, "main space") ||
+            containsStr(path, "alloc space") ||
+            containsStr(path, "region space") ||
+            containsStr(path, "large object") ||
+            containsStr(path, "non moving space") ||
+            containsStr(path, "zygote space") ||
+            containsStr(path, "free list large");
+        if (vma.writable && isPrimaryJavaHeap) {
             return RegionFlag::JH;
         }
-        return RegionFlag::O;
+        return RegionFlag::J;
+    }
+    if (endsWith(path, ".vdex") || endsWith(path, ".dex") || containsStr(path, "classes.dex")) {
+        return RegionFlag::J;
     }
 
     // 8. C++ Allocator (Ca): Bionic libc_malloc, Scudo, Jemalloc, GWP-ASan

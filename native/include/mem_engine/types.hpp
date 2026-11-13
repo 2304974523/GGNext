@@ -30,9 +30,10 @@ namespace RegionFlag {
     constexpr uint32_t PS          = 1u << 11; // PPSSPP Emulator RAM (ppsspp, /dev/shm/ppsspp*, PSP scratchpad/VRAM)
     constexpr uint32_t B           = 1u << 12; // Bad / Unreadable / Guard (PROT_NONE ---p, fonts .ttf/.otf, /dev/* hardware nodes)
     constexpr uint32_t O           = 1u << 13; // Other / Unclassified readable file mappings
+    constexpr uint32_t J           = 1u << 14; // Java Runtime (dalvik-LinearAlloc, dalvik-classes, .art/.vdex/.odex non-heap Java VM structures)
 
     // Default safe scan mask: All writable data/heap/anonymous segments (excludes B, V, XS)
-    constexpr uint32_t DEFAULT_RW  = JH | CH | CA | CD | CB | A | S | AS | PS;
+    constexpr uint32_t DEFAULT_RW  = JH | CH | CA | CD | CB | A | S | AS | PS | J;
     constexpr uint32_t ALL_SAFE    = DEFAULT_RW | XA | XS | O;
 }
 
@@ -52,8 +53,28 @@ inline const char* regionFlagToTag(uint32_t flag) noexcept {
         case RegionFlag::PS: return "Ps";
         case RegionFlag::B:  return "B";
         case RegionFlag::O:  return "O";
+        case RegionFlag::J:  return "J";
         default:             return "O";
     }
+}
+
+inline uint32_t tagToRegionFlag(const std::string& code) noexcept {
+    if (code == "Jh") return RegionFlag::JH;
+    if (code == "Ch") return RegionFlag::CH;
+    if (code == "Ca") return RegionFlag::CA;
+    if (code == "Cd") return RegionFlag::CD;
+    if (code == "Cb") return RegionFlag::CB;
+    if (code == "A")  return RegionFlag::A;
+    if (code == "J")  return RegionFlag::J;
+    if (code == "S")  return RegionFlag::S;
+    if (code == "As") return RegionFlag::AS;
+    if (code == "Xa") return RegionFlag::XA;
+    if (code == "Xs") return RegionFlag::XS;
+    if (code == "V")  return RegionFlag::V;
+    if (code == "Ps") return RegionFlag::PS;
+    if (code == "B")  return RegionFlag::B;
+    if (code == "O")  return RegionFlag::O;
+    return RegionFlag::NONE;
 }
 
 // ============================================================================

@@ -14,12 +14,14 @@ import {
   CheckCircle2,
   Terminal,
   Database,
-  Activity
+  Activity,
+  Sparkles
 } from 'lucide-react';
 import benchmarkData from './benchmark_results.json';
 import { STATIC_AUDIT_FINDINGS } from './sourceData';
+import { GGNextWorkbench } from './GGNextWorkbench';
 
-type TabId = 'benchmarks' | 'audit' | 'architecture' | 'files';
+type TabId = 'ggnext' | 'benchmarks' | 'audit' | 'architecture' | 'files';
 
 const VMA_CLASSIFICATION_RULES = [
   { tag: 'Jh', flag: '1 << 0', name: 'Java / ART Heap', rule: '[anon:dalvik-*], [anon:main space], [anon:region space], [anon:large object space], [anon:zygote*]' },
@@ -53,7 +55,7 @@ const NATIVE_SOURCE_MANIFEST = [
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<TabId>('benchmarks');
+  const [activeTab, setActiveTab] = useState<TabId>('ggnext');
   const [selectedScaleIdx, setSelectedScaleIdx] = useState<number>(2); // Default to 3072 MB (3GB)
 
   const scales = benchmarkData.scales;
@@ -71,20 +73,21 @@ export default function App() {
             <div>
               <div className="flex items-center gap-2.5">
                 <h1 className="text-lg font-bold tracking-tight text-white">
-                  MemEngine C++20 Cross-Process Memory Analysis & Search Engine
+                  GGNext v0.4 Rose UI × C++20 MemEngine Cross-Process Memory Suite
                 </h1>
                 <span className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
                   16KB Page Ready
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Standard Linux/Android DAC &amp; SELinux Compliant • ARM64 NEON + x86_64 SIMD • Disk-Backed mmap OOM Protection
+                Deep JNI Integration • 14 UI &amp; Engine Bugs Fixed • ARM64 NEON + x86_64 SIMD • Disk-Backed mmap OOM Protection
               </p>
             </div>
           </div>
 
-          <nav className="flex items-center gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800">
+          <nav className="flex flex-wrap items-center gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800">
             {[
+              { id: 'ggnext', label: 'GGNext UI 集成与 14 项缺陷审查', icon: Sparkles },
               { id: 'benchmarks', label: '3-Way Benchmarks (500M–3G)', icon: Gauge },
               { id: 'audit', label: 'Reference Code Audit', icon: AlertTriangle },
               { id: 'architecture', label: 'VMA & Engine Spec', icon: Layers },
@@ -131,7 +134,7 @@ export default function App() {
               <Activity className="w-4 h-4 text-cyan-400" />
             </div>
             <div className="text-2xl font-bold text-white mt-1 font-mono">
-              {scales[2] ? `${(3072 / (scales[2].ours.exactScanMs / 1000)).toFixed(2)} GB/s` : '4.12 GB/s'}
+              {scales[2] ? `${(3.0 / (scales[2].ours.exactScanMs / 1000)).toFixed(2)} GB/s` : '3.89 GB/s'}
             </div>
             <div className="text-xs text-slate-400 mt-1">
               {scales[2]?.ours.exactScanMs.toFixed(1)} ms across 3,072 MB ({scales[2]?.ours.syscallsExact} syscalls)
@@ -162,6 +165,9 @@ export default function App() {
             </div>
           </div>
         </section>
+
+        {/* TAB 0: GGNext UI Deep Integration & 14-Bug Code Review */}
+        {activeTab === 'ggnext' && <GGNextWorkbench />}
 
         {/* TAB 1: Empirical Multi-Scale Benchmarks */}
         {activeTab === 'benchmarks' && (

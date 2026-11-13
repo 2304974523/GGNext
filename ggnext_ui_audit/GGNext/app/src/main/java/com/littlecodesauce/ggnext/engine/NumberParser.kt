@@ -1,0 +1,276 @@
+package com.littlecodesauce.ggnext.engine
+
+import com.littlecodesauce.ggnext.model.ValueType
+
+/**
+ * 查询解析器。支持 GG 的输入语法：
+ *  - 普通数字：123 / -100 / -4.5 / 0x1F / 1e9
+ *  - 十六进制：1234h、h41424344、0x10F
+ *  - 文本：'abc'（UTF-8）、"abc"（UTF-16LE）、:abc、;abc
+ *  - 范围：10~20、-50~50、100~~200（反向）
+ *  - 联合：1;2;3 / 1;2;3:100（无序） / 1;2;3::64（有序）
+ *  - 异或：100X7 / 1000X5A5Ah
+ *  - 类型后缀：10D、10F、10W、10B、10Q、10E、10X
+ */
+object NumberParser {
+
+    class ParseException(message: String) : Exception(message)
+
+    enum class Kind { NUMBER, TEXT, RANGE, GROUP }
+
+    data class Query(
+        val kind: Kind,
+        val raw: String,
+        val numbers: List<Long> = emptyList(),
+        /** 每个数字的类型 flags */
+        val types: List<Int> = emptyList(),
+        /** 范围上界（仅 RANGE） */
+        val to: List<Long> = emptyList(),
+        val sign: Int = ValueType.SIGN_EQUAL,
+        val xorKey: Long = 0L,
+        val area: Int = 512,
+        val ordered: Boolean = false,
+        val notRange: Boolean = false,
+        val textBytes: ByteArray = ByteArray(0),
+        val textUtf16: Boolean = false
+    ) {
+        val baseType: Int get() = types.firstOrNull() ?: ValueType.AUTO
+    }
+
+    private val TYPE_SUFFIX = mapOf(
+        'b' to ValueType.BYTE, 'w' to ValueType.WORD, 'd' to ValueType.DWORD,
+        'x' to ValueType.XOR, 'f' to ValueType.FLOAT, 'q' to ValueType.QWORD,
+        'e' to ValueType.DOUBLE, 'a' to ValueType.AUTO
+    )
+
+    fun isText(raw: String): Boolean {
+        val t = raw.trim()
+        return t.length > 1 && (t[0] == '\'' || t[0] == '"' || t[0] == ':' || t[0] == ';')
+    }
+
+    /** 解析一条完整输入（自动识别联合/范围/文本/异或） */
+    fun parse(raw: String, defaultType: Int, sign: Int = ValueType.SIGN_EQUAL): Query {
+        var input = raw.trim()
+        if (input.isEmpty()) throw ParseException("请输入要搜索的值")
+
+        if (isText(input)) {
+            val quote = input[0]
+            val utf16 = quote == '"' || quote == ';'
+            var body = input.substring(1)
+            if ((quote == '\'' || quote == '"') && body.endsWith(quote) && body.isNotEmpty()) {
+                body = body.dropLast(1)
+            }
+            val bytes = if (utf16) body.toByteArray(Charsets.UTF_16LE) else body.toByteArray(Charsets.UTF_8)
+            if (bytes.isEmpty()) throw ParseException("文本不能为空")
+            return Query(
+                kind = Kind.TEXT,
+                raw = input,
+                numbers = listOf(bytes.size.toLong()),
+                types = listOf(if (utf16) ValueType.WORD else ValueType.BYTE),
+                sign = sign,
+                area = bytes.size,
+                ordered = true,
+                textBytes = bytes,
+                textUtf16 = utf16
+            )
+        }
+
+        var effSign = sign
+        when {
+            input.startsWith("!=") -> {
+                effSign = ValueType.SIGN_NOT_EQUAL
+                input = input.substring(2).trim()
+            }
+            input.startsWith(">=") -> {
+                effSign = ValueType.SIGN_GREATER_EQ
+                input = input.substring(2).trim()
+            }
+            input.startsWith("<=") -> {
+                effSign = ValueType.SIGN_LESS_EQ
+                input = input.substring(2).trim()
+            }
+            input.startsWith("=") -> {
+                effSign = ValueType.SIGN_EQUAL
+                input = input.substring(1).trim()
+            }
+        }
+
+        if (input.contains(';')) return parseGroup(input, defaultType, effSign)
+        if (input.contains('~')) return parseRange(input, defaultType, effSign)
+
+        var body = input
+        var xorKey = 0L
+        val upper = body.uppercase()
+        if (!upper.startsWith("0X") && !upper.endsWith("X")) {
+            val xIdx = upper.indexOf('X')
+            if (xIdx > 0) {
+                val keyText = body.substring(xIdx + 1).trim()
+                if (keyText.isNotEmpty()) {
+                    xorKey = parseNumber(keyText, ValueType.DWORD).first
+                    body = body.substring(0, xIdx).trim()
+                }
+            }
+        }
+
+        val parsed = parseNumber(body, defaultType)
+        return Query(
+            kind = Kind.NUMBER,
+            raw = input,
+            numbers = listOf(parsed.first),
+            types = listOf(parsed.second),
+            sign = effSign,
+            xorKey = xorKey
+        )
+    }
+
+    /** 单个数字解析，返回 (valueBits, typeFlags) */
+    fun parseNumber(text: String, defaultType: Int): Pair<Long, Int> {
+        var s = text.trim().replace("_", "").replace(",", "")
+        if (s.isEmpty()) throw ParseException("数值为空")
+
+        // 1. 优先识别显式十六进制前缀/后缀，防止 0x10F / 123Ah 末尾的 A/B/D/E/F 被误判为类型后缀
+        if (s.startsWith("0x", true)) {
+            val hex = s.substring(2)
+            val v = hex.toULongOrNull(16)?.toLong() ?: hex.toLongOrNull(16) ?: throw ParseException("无效的十六进制: $s")
+            return v to (if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType)
+        }
+        if (s.length > 1 && (s[0] == 'h' || s[0] == 'H') && s.substring(1).all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) {
+            val hex = s.substring(1)
+            val v = hex.toULongOrNull(16)?.toLong() ?: hex.toLongOrNull(16) ?: throw ParseException("无效的十六进制: $hex")
+            return v to (if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType)
+        }
+        if (s.length > 1 && (s.last() == 'h' || s.last() == 'H')) {
+            val hex = s.dropLast(1)
+            val v = hex.toULongOrNull(16)?.toLong() ?: hex.toLongOrNull(16) ?: throw ParseException("无效的十六进制: $hex")
+            return v to (if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType)
+        }
+
+        // 2. 识别类型后缀 (B/W/D/X/F/Q/E/A)，仅当去掉后缀后是纯十进制整数或浮点数时才剥离后缀
+        var type = defaultType
+        val last = s.last().lowercaseChar()
+        if (s.length > 1 && TYPE_SUFFIX.containsKey(last) && last !in "0123456789") {
+            val suffixType = TYPE_SUFFIX.getValue(last)
+            val candidate = s.dropLast(1).trim()
+            if (isDecimalOrFloat(candidate)) {
+                type = if (defaultType == ValueType.AUTO) suffixType else (defaultType and suffixType).let { if (it == 0) suffixType else it }
+                s = candidate
+            }
+        }
+
+        val targetType = if (type == ValueType.AUTO) {
+            if (s.contains('.')) ValueType.FLOAT else ValueType.DWORD
+        } else type
+
+        return when (targetType and 0x7F) {
+            ValueType.FLOAT -> {
+                val f = s.toFloatOrNull() ?: throw ParseException("无效的浮点数: $s")
+                (f.toRawBits().toLong() and 0xFFFFFFFFL) to ValueType.FLOAT
+            }
+            ValueType.DOUBLE -> {
+                val d = s.toDoubleOrNull() ?: throw ParseException("无效的双精度数: $s")
+                d.toRawBits() to ValueType.DOUBLE
+            }
+            ValueType.QWORD -> {
+                val v = s.toLongOrNull() ?: s.toULongOrNull()?.toLong()
+                    ?: s.toULongOrNull(16)?.toLong()
+                    ?: throw ParseException("无效的 64 位数值: $s")
+                v to ValueType.QWORD
+            }
+            else -> {
+                val v = s.toLongOrNull() ?: s.toULongOrNull()?.toLong()
+                    ?: s.toULongOrNull(16)?.toLong()
+                    ?: throw ParseException("无效的数值: $s")
+                validate(v, targetType)
+                v to (targetType and 0x7F)
+            }
+        }
+    }
+
+    private fun isDecimalOrFloat(s: String): Boolean {
+        if (s.isEmpty()) return false
+        return s.toLongOrNull() != null || s.toULongOrNull() != null || s.toDoubleOrNull() != null
+    }
+
+    private fun validate(v: Long, type: Int) {
+        when (type and 0x7F) {
+            ValueType.BYTE -> if (v < -128L || v > 255L) {
+                throw ParseException("Byte 取值范围为 -128 ~ 255，当前: $v")
+            }
+            ValueType.WORD -> if (v < -32768L || v > 65535L) {
+                throw ParseException("Word 取值范围为 -32,768 ~ 65,535，当前: $v")
+            }
+            ValueType.DWORD, ValueType.XOR -> if (v < -2147483648L || v > 4294967295L) {
+                throw ParseException("Dword 取值范围为 -2,147,483,648 ~ 4,294,967,295，当前: $v")
+            }
+        }
+    }
+
+    private fun parseRange(input: String, defaultType: Int, sign: Int): Query {
+        val inverted = input.contains("~~")
+        val parts = input.split(if (inverted) "~~" else "~")
+        if (parts.size != 2) throw ParseException("范围只能有两个边界值")
+        val a = parseNumber(parts[0], defaultType)
+        val b = parseNumber(parts[1], if (a.second == ValueType.AUTO) defaultType else a.second)
+        val type = if ((a.second and b.second) != 0) (a.second and b.second) else a.second
+        return Query(
+            kind = Kind.RANGE,
+            raw = input,
+            numbers = listOf(a.first),
+            to = listOf(b.first),
+            types = listOf(type),
+            sign = sign,
+            notRange = inverted
+        )
+    }
+
+    private fun parseGroup(input: String, defaultType: Int, sign: Int): Query {
+        val ordered = input.contains("::")
+        val hasArea = ordered || input.contains(":")
+        var area = 512
+        var listPart = input
+        if (hasArea) {
+            val splitter = if (ordered) "::" else ":"
+            val idx = input.lastIndexOf(splitter)
+            listPart = input.substring(0, idx)
+            val areaStr = input.substring(idx + splitter.length).trim()
+            if (areaStr.isNotEmpty()) {
+                area = areaStr.toIntOrNull() ?: throw ParseException("区域大小无效: $areaStr")
+                if (area < 2 || area > 65536) throw ParseException("区域必须在 2 - 65,536 之间")
+            }
+        }
+        val items = listPart.split(';').map { it.trim() }.filter { it.isNotEmpty() }
+        if (items.size < 2) throw ParseException("联合搜索至少需要两个数值")
+        if (items.size > 32) throw ParseException("联合搜索最多 32 个数值")
+
+        val values = ArrayList<Long>(items.size)
+        val types = ArrayList<Int>(items.size)
+        items.forEach { item ->
+            if (item.contains('~')) {
+                val r = parseRange(item, defaultType, ValueType.SIGN_EQUAL)
+                values.add(r.numbers.first())
+                types.add(r.types.first())
+            } else {
+                val p = parseNumber(item, defaultType)
+                values.add(p.first)
+                types.add(p.second)
+            }
+        }
+        return Query(
+            kind = Kind.GROUP,
+            raw = input,
+            numbers = values,
+            types = types,
+            sign = sign,
+            area = area,
+            ordered = ordered
+        )
+    }
+
+    /** 输入是否是合法十六进制串（用于 HEX 按钮转换） */
+    fun isHex(text: String): Boolean = text.isNotEmpty() && text.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
+
+    fun textToHex(text: String, utf16: Boolean = false): String {
+        val bytes = if (utf16) text.toByteArray(Charsets.UTF_16LE) else text.toByteArray(Charsets.UTF_8)
+        return bytes.joinToString(" ") { String.format("%02X", it) }
+    }
+}
