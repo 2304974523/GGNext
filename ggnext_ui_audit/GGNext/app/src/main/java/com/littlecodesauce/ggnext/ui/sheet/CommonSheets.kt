@@ -147,7 +147,7 @@ fun EditSheet(ui: Ui) {
         mutableStateOf(TextFieldValue("", TextRange(0)))
     }
     var noteTf by remember(firstItem) {
-        mutableStateOf(TextFieldValue(firstItem.note, TextRange(firstItem.note.length)))
+        mutableStateOf(TextFieldValue(firstItem.note, TextRange(0, firstItem.note.length)))
     }
     var moreExpanded by remember { mutableStateOf(false) }
     var activeFillIndex by remember { mutableIntStateOf(-1) }
@@ -679,7 +679,7 @@ fun AddressEditSheet(ui: Ui) {
     val item = ui.editing ?: ui.contextItem
     val initAddr = item?.cachedAddressHex ?: "79F1497F24"
     var addr by remember {
-        mutableStateOf(TextFieldValue(initAddr, TextRange(initAddr.length)))
+        mutableStateOf(TextFieldValue(initAddr, TextRange(0, initAddr.length)))
     }
     var showKeyboard by remember { mutableStateOf(true) }
     NextSheetCard(title = "更改地址 / 类型", onDismiss = Session::closeSheet) {
@@ -827,8 +827,8 @@ fun OffsetSheet(ui: Ui) {
     val clip = LocalClipboardManager.current
     val baseDefault = ui.contextItem?.cachedAddressHex
         ?: java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
-    var baseHex by remember { mutableStateOf(TextFieldValue(baseDefault, TextRange(baseDefault.length))) }
-    var offTf by remember { mutableStateOf(TextFieldValue("0", TextRange(1))) }
+    var baseHex by remember { mutableStateOf(TextFieldValue(baseDefault, TextRange(0, baseDefault.length))) }
+    var offTf by remember { mutableStateOf(TextFieldValue("0", TextRange(0, 1))) }
     var isHex by remember { mutableStateOf(true) }
     var showKeyboard by remember { mutableStateOf(true) }
 
@@ -1022,7 +1022,7 @@ fun RemoveSheet(ui: Ui) {
 @Composable
 fun GotoSheet() {
     val initHex = java.lang.Long.toHexString(Session.ui.value.memoryHighlightAddress ?: Session.ui.value.memoryBase).uppercase()
-    var tf by remember { mutableStateOf(TextFieldValue(initHex, TextRange(initHex.length))) }
+    var tf by remember { mutableStateOf(TextFieldValue(initHex, TextRange(0, initHex.length))) }
     var showKeyboard by remember { mutableStateOf(true) }
     var showGotoHistory by remember { mutableStateOf(false) }
     val gotoHistory = Session.ui.collectAsState().value.gotoHistory
@@ -1208,23 +1208,22 @@ fun ModuleListSheet() {
     var selectedTab by remember { mutableStateOf("权限") }
     var searchQuery by remember { mutableStateOf(TextFieldValue("")) }
 
-    val defaultModules = remember {
-        listOf(
-            MemoryModuleItem("Xa", 0x717B199000L, 0x717B22B000L, "r-xp", "'/data/app/~~wQejEbhZxiJ9_z-VAQRWag==/com.example.piliplus-bYXCXGVLWeJlzb80Y4XuiQ==/lib/arm64/libmedia_kit_native_event_loop.so'"),
-            MemoryModuleItem("Xa", 0x7180998000L, 0x71809F2000L, "r-xp", "'/data/app/~~wQejEbhZxiJ9_z-VAQRWag==/com.example.piliplus-bYXCXGVLWeJlzb80Y4XuiQ==/lib/arm64/libmediakitandroidhelper.so'"),
-            MemoryModuleItem("Xa", 0x7180F17000L, 0x71817E2000L, "r-xp", "'/data/app/~~wQejEbhZxiJ9_z-VAQRWag==/com.example.piliplus-bYXCXGVLWeJlzb80Y4XuiQ==/lib/arm64/libmpv.so'"),
-            MemoryModuleItem("Xa", 0x7182C88000L, 0x7182CA6000L, "r-xp", "'/data/app/~~wQejEbhZxiJ9_z-VAQRWag==/com.example.piliplus-bYXCXGVLWeJlzb80Y4XuiQ==/lib/arm64/libdartjni.so'"),
-            MemoryModuleItem("Xa", 0x718825D000L, 0x7188F36000L, "r-xp", "'/data/app/~~wQejEbhZxiJ9_z-VAQRWag==/com.example.piliplus-bYXCXGVLWeJlzb80Y4XuiQ==/lib/arm64/libflutter.so'"),
-            MemoryModuleItem("Cd", 0x718A000000L, 0x718C800000L, "r-xp", "'/data/app/~~libgame/lib/arm64/libil2cpp.so'"),
-            MemoryModuleItem("Cd", 0x718D000000L, 0x718E500000L, "r-xp", "'/data/app/~~libgame/lib/arm64/libunity.so'"),
-            MemoryModuleItem("Cd", 0x718F000000L, 0x718F200000L, "r-xp", "'/data/app/~~libgame/lib/arm64/libmain.so'"),
-            MemoryModuleItem("Xs", 0x7F80000000L, 0x7F80120000L, "r-xp", "'/apex/com.android.runtime/lib64/bionic/libc.so'"),
-            MemoryModuleItem("Xs", 0x7F80200000L, 0x7F80750000L, "r-xp", "'/apex/com.android.art/lib64/libart.so'")
-        )
+    val liveModules = remember {
+        Session.currentProcessRegions()
+            .filter { it.path.isNotBlank() && !it.path.startsWith("[anon:") }
+            .map { r ->
+                MemoryModuleItem(
+                    regionCode = r.code,
+                    startAddress = r.start,
+                    endAddress = r.end,
+                    perms = r.perms,
+                    path = "'${r.path}'"
+                )
+            }
     }
 
-    val filteredList = remember(selectedTab, searchQuery.text) {
-        var list = defaultModules
+    val filteredList = remember(selectedTab, searchQuery.text, liveModules) {
+        var list = liveModules
         val q = searchQuery.text.trim()
         if (q.isNotEmpty()) {
             list = list.filter { it.path.contains(q, ignoreCase = true) || it.regionCode.contains(q, ignoreCase = true) }
@@ -1353,7 +1352,7 @@ fun ModuleListSheet() {
 @Composable
 fun ScriptSheet(ui: Ui) {
     var scriptTf by remember(ui.scriptPath) {
-        mutableStateOf(TextFieldValue(ui.scriptPath, TextRange(ui.scriptPath.length)))
+        mutableStateOf(TextFieldValue(ui.scriptPath, TextRange(0, ui.scriptPath.length)))
     }
     var showRecent by remember { mutableStateOf(false) }
 
@@ -2110,9 +2109,9 @@ private fun loadBrowserEntries(
 @Composable
 fun CopyMemorySheet(ui: Ui) {
     val initHex = java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
-    var fromTf by remember { mutableStateOf(TextFieldValue(initHex, TextRange(initHex.length))) }
-    var toTf by remember { mutableStateOf(TextFieldValue("00000000", TextRange(8))) }
-    var bytesTf by remember { mutableStateOf(TextFieldValue("0", TextRange(1))) }
+    var fromTf by remember { mutableStateOf(TextFieldValue(initHex, TextRange(0, initHex.length))) }
+    var toTf by remember { mutableStateOf(TextFieldValue("00000000", TextRange(0, 8))) }
+    var bytesTf by remember { mutableStateOf(TextFieldValue("0", TextRange(0, 1))) }
     var focusField by remember { mutableStateOf(0) } // 0: from, 1: to, 2: bytes
     var showKeyboard by remember { mutableStateOf(true) }
 
@@ -2283,14 +2282,14 @@ fun CopyMemorySheet(ui: Ui) {
 fun DumpSheet(ui: Ui) {
     var fromTf by remember {
         val hex = java.lang.Long.toHexString(ui.memoryBase).uppercase()
-        mutableStateOf(TextFieldValue(hex, TextRange(hex.length)))
+        mutableStateOf(TextFieldValue(hex, TextRange(0, hex.length)))
     }
     var toTf by remember {
         val endHex = java.lang.Long.toHexString(ui.memoryBase + 0x10000L).uppercase()
-        mutableStateOf(TextFieldValue(endHex, TextRange(endHex.length)))
+        mutableStateOf(TextFieldValue(endHex, TextRange(0, endHex.length)))
     }
     var pathTf by remember(ui.dumpDirPath) {
-        mutableStateOf(TextFieldValue(ui.dumpDirPath, TextRange(ui.dumpDirPath.length)))
+        mutableStateOf(TextFieldValue(ui.dumpDirPath, TextRange(0, ui.dumpDirPath.length)))
     }
     var focusTarget by remember { mutableIntStateOf(1) } // 0=from, 1=to, 2=path
     var showKeyboard by remember { mutableStateOf(true) }
@@ -2569,7 +2568,7 @@ private fun AllocPermRow(
 @Composable
 fun FileSheet(ui: Ui) {
     var tf by remember(ui.fileManagerPath) {
-        mutableStateOf(TextFieldValue(ui.fileManagerPath, TextRange(ui.fileManagerPath.length)))
+        mutableStateOf(TextFieldValue(ui.fileManagerPath, TextRange(0, ui.fileManagerPath.length)))
     }
     NextSheetCard(
         title = if (ui.tab == NextTab.SAVED_LIST) "保存/载入列表文件" else "导出选定项到文件",

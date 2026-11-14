@@ -71,7 +71,50 @@ void SearchEngine::clearSession() noexcept {
     m_candidates.clear();
     m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
+}
+
+void SearchEngine::fetchCandidates(size_t offset, size_t limit, std::vector<CandidateEntry>& out) const {
+    out.clear();
+    if (limit == 0) return;
+
+    if (!m_candidates.empty()) {
+        size_t total = m_candidates.size();
+        if (offset >= total) return;
+        size_t count = std::min(limit, total - offset);
+        out.resize(count);
+        std::memcpy(out.data(), m_candidates.data() + offset, count * sizeof(CandidateEntry));
+        return;
+    }
+
+    if (m_hasFullSnapshot) {
+        size_t elemSz = std::max<size_t>(1, dataTypeSize(m_snapshotType));
+        size_t curIndex = 0;
+        out.reserve(std::min<size_t>(limit, 4096));
+        for (const auto& blk : m_snapshotStore.blocks()) {
+            const uint8_t* ptr = m_snapshotStore.getBlockData(blk);
+            if (!ptr) continue;
+            size_t blkElems = blk.length / elemSz;
+            if (curIndex + blkElems <= offset) {
+                curIndex += blkElems;
+                continue;
+            }
+            size_t startElem = (offset > curIndex) ? (offset - curIndex) : 0;
+            uint8_t rTag = regionFlagToIndex(blk.regionFlag);
+            for (size_t e = startElem; e < blkElems && out.size() < limit; ++e) {
+                size_t byteOff = e * elemSz;
+                CandidateEntry entry{};
+                entry.address = blk.startAddress + byteOff;
+                std::memcpy(&entry.rawValue, ptr + byteOff, std::min<size_t>(elemSz, 8));
+                entry.type = static_cast<uint8_t>(m_snapshotType);
+                entry.regionTag = rTag;
+                out.push_back(entry);
+            }
+            curIndex += blkElems;
+            if (out.size() >= limit) break;
+        }
+    }
 }
 
 uint8_t SearchEngine::regionFlagToIndex(uint32_t flag) noexcept {
@@ -228,7 +271,9 @@ EngineErrc SearchEngine::searchExact(
 ) {
     auto t0 = std::chrono::steady_clock::now();
     m_candidates.clear();
+    m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
     if (m_regions.empty()) {
@@ -248,6 +293,8 @@ EngineErrc SearchEngine::searchExact(
     std::atomic<size_t> readableBytes{0};
     std::atomic<size_t> guardPages{0};
     std::atomic<size_t> syscalls{0};
+    std::atomic<size_t> totalMatches{0};
+    std::atomic<size_t> storedCount{0};
     std::mutex storeMutex;
 
     size_t numThreads = std::min(m_workerThreads, tasks.size());
@@ -262,7 +309,7 @@ EngineErrc SearchEngine::searchExact(
             std::vector<uint8_t> validMask;
             std::vector<size_t> offsets;
             std::vector<CandidateEntry> localHits;
-            localHits.reserve(4096);
+            localHits.reserve(8192);
 
             while (true) {
                 if (token && token->isCancelled()) break;
@@ -285,6 +332,7 @@ EngineErrc SearchEngine::searchExact(
 
                 if (rc == EngineErrc::OK && chunkReadable > 0) {
                     uint8_t rTag = regionFlagToIndex(task.regionFlag);
+                    size_t chunkMatchCount = 0;
 
                     auto runTypeScan = [&](DataType dt) {
                         offsets.clear();
@@ -314,22 +362,31 @@ EngineErrc SearchEngine::searchExact(
                                 break;
                         }
 
+                        bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
+
                         for (size_t off : offsets) {
-                            // Strictly enforce off < task.logicalLen so overlap window never causes duplicate hits
                             if (off >= task.logicalLen) continue;
                             if (!isRangeInValidPages(off, itemSz, task.startAddr, pageSize, validMask)) continue;
 
-                            CandidateEntry entry{};
-                            entry.address   = task.startAddr + off;
-                            entry.rawValue  = extractRawValue(buf.data() + off, dt);
-                            entry.type      = static_cast<uint8_t>(dt);
-                            entry.regionTag = rTag;
-                            localHits.push_back(entry);
+                            chunkMatchCount++;
 
-                            if (localHits.size() >= 16384) {
-                                std::lock_guard<std::mutex> lk(storeMutex);
-                                m_candidates.appendBatch(localHits.data(), localHits.size());
-                                localHits.clear();
+                            if (!storeAlreadyFull) {
+                                CandidateEntry entry{};
+                                entry.address   = task.startAddr + off;
+                                entry.rawValue  = extractRawValue(buf.data() + off, dt);
+                                entry.type      = static_cast<uint8_t>(dt);
+                                entry.regionTag = rTag;
+                                localHits.push_back(entry);
+
+                                if (localHits.size() >= 16384) {
+                                    std::lock_guard<std::mutex> lk(storeMutex);
+                                    m_candidates.appendBatch(localHits.data(), localHits.size());
+                                    storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                    localHits.clear();
+                                    if (m_candidates.isFull()) {
+                                        storeAlreadyFull = true;
+                                    }
+                                }
                             }
                         }
                     };
@@ -342,6 +399,11 @@ EngineErrc SearchEngine::searchExact(
                     } else {
                         runTypeScan(type);
                     }
+
+                    if (chunkMatchCount > 0) {
+                        size_t newTotal = totalMatches.fetch_add(chunkMatchCount, std::memory_order_relaxed) + chunkMatchCount;
+                        m_totalMatchedCount = newTotal;
+                    }
                 }
 
                 size_t done = processedBytes.fetch_add(task.logicalLen, std::memory_order_relaxed) + task.logicalLen;
@@ -353,6 +415,7 @@ EngineErrc SearchEngine::searchExact(
             if (!localHits.empty()) {
                 std::lock_guard<std::mutex> lk(storeMutex);
                 m_candidates.appendBatch(localHits.data(), localHits.size());
+                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
             }
         });
     }
@@ -364,6 +427,7 @@ EngineErrc SearchEngine::searchExact(
     }
 
     m_candidates.sortByAddress();
+    m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
 
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -371,7 +435,7 @@ EngineErrc SearchEngine::searchExact(
     m_lastTelemetry.totalBytesScanned = processedBytes.load();
     m_lastTelemetry.readableBytes     = readableBytes.load();
     m_lastTelemetry.guardPagesSkipped = guardPages.load();
-    m_lastTelemetry.candidatesFound   = m_candidates.size();
+    m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued    = syscalls.load();
     m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
 
@@ -386,17 +450,19 @@ EngineErrc SearchEngine::refineExact(
     int64_t intTarget,
     double floatTarget,
     double epsilon,
-    CancellationToken* token
+    CancellationToken* token,
+    ProgressCallback progress
 ) {
     auto t0 = std::chrono::steady_clock::now();
-    if (m_candidates.empty()) return EngineErrc::OK;
+    if (m_candidates.empty()) {
+        m_totalMatchedCount = 0;
+        return EngineErrc::OK;
+    }
 
     m_candidates.sortByAddress();
     const size_t count = m_candidates.size();
     const size_t pageSize = m_io.pageSize();
 
-    // Coalesce nearby candidate addresses into tight read intervals (merging gaps <= 256B up to pageSize)
-    // so scattered candidates only transfer their exact bytes across batched iovecs (1024 iovecs/syscall)
     struct CoalescedGroup {
         uintptr_t startPageAddr;
         size_t    byteLen;
@@ -424,7 +490,6 @@ EngineErrc SearchEngine::refineExact(
             size_t nextSz = dataTypeSize(nextDt);
             uintptr_t nextEnd = nextAddr + nextSz;
 
-            // Coalesce if within 256 bytes of current spanEnd and within the same pageSize window
             if (nextAddr <= spanEnd + 256 && (nextEnd - spanStart) <= pageSize) {
                 if (nextEnd > spanEnd) spanEnd = nextEnd;
                 idx++;
@@ -435,14 +500,12 @@ EngineErrc SearchEngine::refineExact(
         groups.push_back(CoalescedGroup{spanStart, spanEnd - spanStart, firstIdx, idx});
     }
 
-    // Allocate backing buffer and build BatchReadRange vector
     size_t totalBatchBytes = 0;
     for (const auto& g : groups) totalBatchBytes += g.byteLen;
 
     MmapCandidateStore nextStore(MmapCandidateStore::DEFAULT_MEMORY_THRESHOLD, m_spillDir);
     size_t syscallsIssued = 0;
 
-    // Process groups in batches of 4096 ranges to bound temporary buffer size
     constexpr size_t BATCH_GROUP_LIMIT = 4096;
     for (size_t gBase = 0; gBase < groups.size(); gBase += BATCH_GROUP_LIMIT) {
         if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
@@ -482,15 +545,21 @@ EngineErrc SearchEngine::refineExact(
                 }
             }
         }
+
+        m_totalMatchedCount = nextStore.size();
+        if (progress) {
+            progress(gEnd, groups.size());
+        }
     }
 
     m_candidates = std::move(nextStore);
+    m_totalMatchedCount = m_candidates.size();
 
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
     m_lastTelemetry.totalBytesScanned = totalBatchBytes;
     m_lastTelemetry.readableBytes     = totalBatchBytes;
-    m_lastTelemetry.candidatesFound   = m_candidates.size();
+    m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued    = syscallsIssued;
     m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
 
@@ -509,7 +578,9 @@ EngineErrc SearchEngine::searchBytePattern(
     if (pattern.empty()) return EngineErrc::ERR_INVAL;
     auto t0 = std::chrono::steady_clock::now();
     m_candidates.clear();
+    m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
     if (m_regions.empty()) refreshRegions();
@@ -527,6 +598,8 @@ EngineErrc SearchEngine::searchBytePattern(
     std::atomic<size_t> readableBytes{0};
     std::atomic<size_t> guardPages{0};
     std::atomic<size_t> syscalls{0};
+    std::atomic<size_t> totalMatches{0};
+    std::atomic<size_t> storedCount{0};
     std::mutex storeMutex;
 
     size_t numThreads = std::min(m_workerThreads, tasks.size());
@@ -558,17 +631,34 @@ EngineErrc SearchEngine::searchBytePattern(
                     offsets.clear();
                     SimdKernel::scanBytePattern(buf.data(), task.readLen, pattern.data(), maskPtr, patLen, offsets);
                     uint8_t rTag = regionFlagToIndex(task.regionFlag);
+                    bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
+                    size_t chunkMatches = 0;
 
                     for (size_t off : offsets) {
                         if (off >= task.logicalLen) continue;
                         if (!isRangeInValidPages(off, patLen, task.startAddr, pageSize, validMask)) continue;
 
-                        CandidateEntry entry{};
-                        entry.address   = task.startAddr + off;
-                        std::memcpy(&entry.rawValue, buf.data() + off, std::min<size_t>(patLen, 8));
-                        entry.type      = static_cast<uint8_t>(DataType::BYTE_ARRAY);
-                        entry.regionTag = rTag;
-                        localHits.push_back(entry);
+                        chunkMatches++;
+                        if (!storeAlreadyFull) {
+                            CandidateEntry entry{};
+                            entry.address   = task.startAddr + off;
+                            std::memcpy(&entry.rawValue, buf.data() + off, std::min<size_t>(patLen, 8));
+                            entry.type      = static_cast<uint8_t>(DataType::BYTE_ARRAY);
+                            entry.regionTag = rTag;
+                            localHits.push_back(entry);
+
+                            if (localHits.size() >= 16384) {
+                                std::lock_guard<std::mutex> lk(storeMutex);
+                                m_candidates.appendBatch(localHits.data(), localHits.size());
+                                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                localHits.clear();
+                                if (m_candidates.isFull()) storeAlreadyFull = true;
+                            }
+                        }
+                    }
+
+                    if (chunkMatches > 0) {
+                        m_totalMatchedCount = totalMatches.fetch_add(chunkMatches, std::memory_order_relaxed) + chunkMatches;
                     }
                 }
 
@@ -579,6 +669,7 @@ EngineErrc SearchEngine::searchBytePattern(
             if (!localHits.empty()) {
                 std::lock_guard<std::mutex> lk(storeMutex);
                 m_candidates.appendBatch(localHits.data(), localHits.size());
+                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
             }
         });
     }
@@ -587,13 +678,14 @@ EngineErrc SearchEngine::searchBytePattern(
     if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
 
     m_candidates.sortByAddress();
+    m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
     m_lastTelemetry.totalVmasScanned  = m_regions.size();
     m_lastTelemetry.totalBytesScanned = processedBytes.load();
     m_lastTelemetry.readableBytes     = readableBytes.load();
     m_lastTelemetry.guardPagesSkipped = guardPages.load();
-    m_lastTelemetry.candidatesFound   = m_candidates.size();
+    m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued    = syscalls.load();
     m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
     return EngineErrc::OK;
@@ -636,7 +728,9 @@ EngineErrc SearchEngine::searchRange(
 ) {
     auto t0 = std::chrono::steady_clock::now();
     m_candidates.clear();
+    m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
     if (m_regions.empty()) refreshRegions();
@@ -653,6 +747,8 @@ EngineErrc SearchEngine::searchRange(
     std::atomic<size_t> processedBytes{0};
     std::atomic<size_t> readableBytes{0};
     std::atomic<size_t> syscalls{0};
+    std::atomic<size_t> totalMatches{0};
+    std::atomic<size_t> storedCount{0};
     std::mutex storeMutex;
 
     size_t numThreads = std::min(m_workerThreads, tasks.size());
@@ -666,6 +762,7 @@ EngineErrc SearchEngine::searchRange(
             std::vector<uint8_t> validMask;
             std::vector<size_t> offsets;
             std::vector<CandidateEntry> localHits;
+            localHits.reserve(8192);
 
             while (true) {
                 if (token && token->isCancelled()) break;
@@ -706,22 +803,34 @@ EngineErrc SearchEngine::searchRange(
                     }
 
                     uint8_t rTag = regionFlagToIndex(task.regionFlag);
+                    bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
+                    size_t chunkMatches = 0;
+
                     for (size_t off : offsets) {
                         if (off >= task.logicalLen) continue;
                         if (!isRangeInValidPages(off, itemSz, task.startAddr, pageSize, validMask)) continue;
 
-                        CandidateEntry entry{};
-                        entry.address   = task.startAddr + off;
-                        entry.rawValue  = extractRawValue(buf.data() + off, type);
-                        entry.type      = static_cast<uint8_t>(type);
-                        entry.regionTag = rTag;
-                        localHits.push_back(entry);
+                        chunkMatches++;
+                        if (!storeAlreadyFull) {
+                            CandidateEntry entry{};
+                            entry.address   = task.startAddr + off;
+                            entry.rawValue  = extractRawValue(buf.data() + off, type);
+                            entry.type      = static_cast<uint8_t>(type);
+                            entry.regionTag = rTag;
+                            localHits.push_back(entry);
 
-                        if (localHits.size() >= 16384) {
-                            std::lock_guard<std::mutex> lk(storeMutex);
-                            m_candidates.appendBatch(localHits.data(), localHits.size());
-                            localHits.clear();
+                            if (localHits.size() >= 16384) {
+                                std::lock_guard<std::mutex> lk(storeMutex);
+                                m_candidates.appendBatch(localHits.data(), localHits.size());
+                                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                localHits.clear();
+                                if (m_candidates.isFull()) storeAlreadyFull = true;
+                            }
                         }
+                    }
+
+                    if (chunkMatches > 0) {
+                        m_totalMatchedCount = totalMatches.fetch_add(chunkMatches, std::memory_order_relaxed) + chunkMatches;
                     }
                 }
 
@@ -732,6 +841,7 @@ EngineErrc SearchEngine::searchRange(
             if (!localHits.empty()) {
                 std::lock_guard<std::mutex> lk(storeMutex);
                 m_candidates.appendBatch(localHits.data(), localHits.size());
+                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
             }
         });
     }
@@ -740,12 +850,13 @@ EngineErrc SearchEngine::searchRange(
     if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
 
     m_candidates.sortByAddress();
+    m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
     m_lastTelemetry.totalVmasScanned  = m_regions.size();
     m_lastTelemetry.totalBytesScanned = processedBytes.load();
     m_lastTelemetry.readableBytes     = readableBytes.load();
-    m_lastTelemetry.candidatesFound   = m_candidates.size();
+    m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued    = syscalls.load();
     m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
     return EngineErrc::OK;
@@ -758,10 +869,14 @@ EngineErrc SearchEngine::refineRange(
     double floatMin,
     double floatMax,
     bool inclusive,
-    CancellationToken* token
+    CancellationToken* token,
+    ProgressCallback progress
 ) {
     auto t0 = std::chrono::steady_clock::now();
-    if (m_candidates.empty()) return EngineErrc::OK;
+    if (m_candidates.empty()) {
+        m_totalMatchedCount = 0;
+        return EngineErrc::OK;
+    }
 
     m_candidates.sortByAddress();
     const size_t count = m_candidates.size();
@@ -832,19 +947,23 @@ EngineErrc SearchEngine::refineRange(
                 }
             }
         }
+
+        m_totalMatchedCount = nextStore.size();
+        if (progress) progress(gEnd, groups.size());
     }
 
     m_candidates = std::move(nextStore);
+    m_totalMatchedCount = m_candidates.size();
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs       = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    m_lastTelemetry.candidatesFound = m_candidates.size();
+    m_lastTelemetry.candidatesFound = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued  = syscallsIssued;
     m_lastTelemetry.spilledToMmap   = m_candidates.isSpilledToDisk();
     return EngineErrc::OK;
 }
 
 // ============================================================================
-// 3. Fuzzy / Delta Search: Disk-Backed Full Snapshot + State-Change Refinement
+// 3. Fuzzy / Delta Search: Anonymous Demand-Paged Full Snapshot + Refinement
 // ============================================================================
 EngineErrc SearchEngine::startUnknownSnapshot(
     DataType type,
@@ -854,9 +973,10 @@ EngineErrc SearchEngine::startUnknownSnapshot(
     auto t0 = std::chrono::steady_clock::now();
     m_candidates.clear();
     m_snapshotStore.clear();
-    m_hasFullSnapshot = false;
-    m_snapshotType    = type;
-    m_lastTelemetry   = ScanTelemetry{};
+    m_hasFullSnapshot   = false;
+    m_snapshotType      = (type == DataType::AUTO) ? DataType::INT32 : type;
+    m_totalMatchedCount = 0;
+    m_lastTelemetry     = ScanTelemetry{};
 
     if (m_regions.empty()) refreshRegions();
 
@@ -870,12 +990,12 @@ EngineErrc SearchEngine::startUnknownSnapshot(
         return EngineErrc::ERR_NOMEM;
     }
 
+    const size_t elemSz = std::max<size_t>(1, dataTypeSize(m_snapshotType));
     std::atomic<size_t> nextIdx{0};
     std::atomic<size_t> processedBytes{0};
     std::atomic<size_t> readableBytes{0};
     std::atomic<size_t> guardPages{0};
     std::atomic<size_t> syscalls{0};
-    std::atomic<bool>   nomemErr{false};
     std::mutex          snapMutex;
     const size_t        pageSize = m_io.pageSize();
 
@@ -888,7 +1008,7 @@ EngineErrc SearchEngine::startUnknownSnapshot(
             std::vector<uint8_t> validMask;
 
             while (true) {
-                if ((token && token->isCancelled()) || nomemErr.load(std::memory_order_relaxed)) break;
+                if (token && token->isCancelled()) break;
                 size_t idx = nextIdx.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= tasks.size()) break;
 
@@ -898,7 +1018,8 @@ EngineErrc SearchEngine::startUnknownSnapshot(
                 size_t chunkReadable = 0;
                 EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.logicalLen, validMask, &chunkReadable);
                 syscalls.fetch_add(1, std::memory_order_relaxed);
-                readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed);
+                size_t totalReadSoFar = readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed) + chunkReadable;
+                m_totalMatchedCount = totalReadSoFar / elemSz;
 
                 size_t chunkGuards = 0;
                 for (uint8_t v : validMask) {
@@ -920,14 +1041,12 @@ EngineErrc SearchEngine::startUnknownSnapshot(
                         size_t runByteLen    = std::min((p - runStart) * pageSize, task.logicalLen - runByteOffset);
                         if (runByteLen > 0) {
                             std::lock_guard<std::mutex> lk(snapMutex);
-                            if (!m_snapshotStore.appendRegionChunk(
-                                    task.startAddr + runByteOffset,
-                                    buf.data() + runByteOffset,
-                                    runByteLen,
-                                    task.regionFlag)) {
-                                nomemErr.store(true, std::memory_order_relaxed);
-                                break;
-                            }
+                            m_snapshotStore.appendRegionChunk(
+                                task.startAddr + runByteOffset,
+                                buf.data() + runByteOffset,
+                                runByteLen,
+                                task.regionFlag
+                            );
                         }
                     }
                 }
@@ -940,9 +1059,9 @@ EngineErrc SearchEngine::startUnknownSnapshot(
 
     for (auto& w : workers) w.join();
     if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
-    if (nomemErr.load()) return EngineErrc::ERR_NOMEM;
 
-    m_hasFullSnapshot = true;
+    m_hasFullSnapshot   = !m_snapshotStore.blocks().empty();
+    m_totalMatchedCount = m_snapshotStore.totalSnapshotBytes() / elemSz;
 
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -950,9 +1069,9 @@ EngineErrc SearchEngine::startUnknownSnapshot(
     m_lastTelemetry.totalBytesScanned = processedBytes.load();
     m_lastTelemetry.readableBytes     = readableBytes.load();
     m_lastTelemetry.guardPagesSkipped = guardPages.load();
-    m_lastTelemetry.candidatesFound   = readableBytes.load() / dataTypeSize(type);
+    m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued    = syscalls.load();
-    m_lastTelemetry.spilledToMmap     = true; // Snapshot lives in disk-backed mmap
+    m_lastTelemetry.spilledToMmap     = true;
 
     return EngineErrc::OK;
 }
@@ -962,18 +1081,25 @@ EngineErrc SearchEngine::refineFuzzy(
     int64_t intDelta,
     double floatDelta,
     double epsilon,
-    CancellationToken* token
+    CancellationToken* token,
+    ProgressCallback progress
 ) {
     auto t0 = std::chrono::steady_clock::now();
 
-    // Case 1: First refinement pass directly against the full MmapRegionSnapshotStore
+    // Case 1: Refinement pass directly against the full MmapRegionSnapshotStore
     if (m_hasFullSnapshot && m_candidates.empty()) {
         const auto& blocks = m_snapshotStore.blocks();
-        if (blocks.empty()) return EngineErrc::OK;
+        if (blocks.empty()) {
+            m_totalMatchedCount = 0;
+            return EngineErrc::OK;
+        }
 
+        const size_t totalSnapBytes = std::max<size_t>(1, m_snapshotStore.totalSnapshotBytes());
         std::atomic<size_t> nextBlock{0};
         std::atomic<size_t> syscalls{0};
         std::atomic<size_t> bytesScanned{0};
+        std::atomic<size_t> totalMatches{0};
+        std::atomic<size_t> storedCount{0};
         std::mutex storeMutex;
 
         size_t numThreads = std::min(m_workerThreads, blocks.size());
@@ -983,8 +1109,8 @@ EngineErrc SearchEngine::refineFuzzy(
             workers.emplace_back([&]() {
                 std::vector<uint8_t> curBuf;
                 std::vector<uint8_t> validMask;
-                std::vector<CandidateEntry> localHits;
-                localHits.reserve(8192);
+                std::vector<CandidateEntry> blockHits;
+                blockHits.reserve(8192);
 
                 while (true) {
                     if (token && token->isCancelled()) break;
@@ -992,51 +1118,60 @@ EngineErrc SearchEngine::refineFuzzy(
                     if (bIdx >= blocks.size()) break;
 
                     const auto& blk = blocks[bIdx];
-                    const uint8_t* oldPtr = m_snapshotStore.getBlockData(blk);
+                    uint8_t* oldPtr = m_snapshotStore.getBlockDataMut(blk);
                     if (!oldPtr) continue;
 
                     if (curBuf.size() < blk.length) curBuf.resize(blk.length);
                     size_t chunkReadable = 0;
                     EngineErrc rc = m_io.readChunkFaultTolerant(blk.startAddress, curBuf.data(), blk.length, validMask, &chunkReadable);
                     syscalls.fetch_add(1, std::memory_order_relaxed);
-                    bytesScanned.fetch_add(blk.length, std::memory_order_relaxed);
+                    size_t doneBytes = bytesScanned.fetch_add(blk.length, std::memory_order_relaxed) + blk.length;
 
-                    if (rc != EngineErrc::OK || chunkReadable == 0) continue;
+                    if (rc != EngineErrc::OK || chunkReadable == 0) {
+                        if (progress) progress(doneBytes, totalSnapBytes);
+                        continue;
+                    }
 
+                    blockHits.clear();
                     uint8_t rTag = regionFlagToIndex(blk.regionFlag);
                     switch (m_snapshotType) {
                         case DataType::INT8:
-                            SimdKernel::compareBuffersDelta<int8_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int8_t>(intDelta), rTag, localHits);
+                            SimdKernel::compareBuffersDelta<int8_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int8_t>(intDelta), rTag, blockHits);
                             break;
                         case DataType::INT16:
-                            SimdKernel::compareBuffersDelta<int16_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int16_t>(intDelta), rTag, localHits);
+                            SimdKernel::compareBuffersDelta<int16_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int16_t>(intDelta), rTag, blockHits);
                             break;
                         case DataType::INT32:
-                            SimdKernel::compareBuffersDelta<int32_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int32_t>(intDelta), rTag, localHits);
+                            SimdKernel::compareBuffersDelta<int32_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int32_t>(intDelta), rTag, blockHits);
                             break;
                         case DataType::INT64:
-                            SimdKernel::compareBuffersDelta<int64_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, intDelta, rTag, localHits);
+                            SimdKernel::compareBuffersDelta<int64_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, intDelta, rTag, blockHits);
                             break;
                         case DataType::FLOAT:
-                            SimdKernel::compareBuffersDelta<float>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<float>(floatDelta), rTag, localHits);
+                            SimdKernel::compareBuffersDelta<float>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<float>(floatDelta), rTag, blockHits);
                             break;
                         case DataType::DOUBLE:
-                            SimdKernel::compareBuffersDelta<double>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, floatDelta, rTag, localHits);
+                            SimdKernel::compareBuffersDelta<double>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, floatDelta, rTag, blockHits);
                             break;
                         default:
                             break;
                     }
 
-                    if (localHits.size() >= 16384) {
-                        std::lock_guard<std::mutex> lk(storeMutex);
-                        m_candidates.appendBatch(localHits.data(), localHits.size());
-                        localHits.clear();
-                    }
-                }
+                    // Update snapshot block in-place with current live bytes so repeated UNCHANGED passes stay fresh
+                    std::memcpy(oldPtr, curBuf.data(), blk.length);
 
-                if (!localHits.empty()) {
-                    std::lock_guard<std::mutex> lk(storeMutex);
-                    m_candidates.appendBatch(localHits.data(), localHits.size());
+                    if (!blockHits.empty()) {
+                        size_t newTotal = totalMatches.fetch_add(blockHits.size(), std::memory_order_relaxed) + blockHits.size();
+                        m_totalMatchedCount = newTotal;
+
+                        if (storedCount.load(std::memory_order_relaxed) < MmapCandidateStore::MAX_STORED_CANDIDATES) {
+                            std::lock_guard<std::mutex> lk(storeMutex);
+                            m_candidates.appendBatch(blockHits.data(), blockHits.size());
+                            storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                        }
+                    }
+
+                    if (progress) progress(doneBytes, totalSnapBytes);
                 }
             });
         }
@@ -1044,23 +1179,35 @@ EngineErrc SearchEngine::refineFuzzy(
         for (auto& w : workers) w.join();
         if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
 
-        // Release full-region snapshot once narrowed into candidate store
-        m_snapshotStore.clear();
-        m_hasFullSnapshot = false;
-        m_candidates.sortByAddress();
+        size_t matched = totalMatches.load();
+        if (deltaOp == SearchOp::UNCHANGED && matched > MmapCandidateStore::MAX_STORED_CANDIDATES) {
+            // Keep full updated snapshot active when UNCHANGED still spans >2M values so subsequent CHANGED/INCREASED/DECREASED scans full memory
+            m_candidates.clear();
+            m_hasFullSnapshot = true;
+            m_totalMatchedCount = matched;
+        } else {
+            // Narrowed into candidate store: release snapshot memory and sort candidates
+            m_snapshotStore.clear();
+            m_hasFullSnapshot = false;
+            m_candidates.sortByAddress();
+            m_totalMatchedCount = std::max(matched, m_candidates.size());
+        }
 
         auto t1 = std::chrono::steady_clock::now();
         m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
         m_lastTelemetry.totalBytesScanned = bytesScanned.load();
         m_lastTelemetry.readableBytes     = bytesScanned.load();
-        m_lastTelemetry.candidatesFound   = m_candidates.size();
+        m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
         m_lastTelemetry.syscallsIssued    = syscalls.load();
-        m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
+        m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk() || m_hasFullSnapshot;
         return EngineErrc::OK;
     }
 
     // Case 2: Subsequent iterative fuzzy refinement on existing m_candidates via tight-coalesced iovec
-    if (m_candidates.empty()) return EngineErrc::OK;
+    if (m_candidates.empty()) {
+        m_totalMatchedCount = 0;
+        return EngineErrc::OK;
+    }
 
     m_candidates.sortByAddress();
     const size_t count = m_candidates.size();
@@ -1216,12 +1363,16 @@ EngineErrc SearchEngine::refineFuzzy(
                 }
             }
         }
+
+        m_totalMatchedCount = nextStore.size();
+        if (progress) progress(gEnd, groups.size());
     }
 
     m_candidates = std::move(nextStore);
+    m_totalMatchedCount = m_candidates.size();
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs       = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    m_lastTelemetry.candidatesFound = m_candidates.size();
+    m_lastTelemetry.candidatesFound = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued  = syscallsIssued;
     m_lastTelemetry.spilledToMmap   = m_candidates.isSpilledToDisk();
     return EngineErrc::OK;
@@ -1240,7 +1391,6 @@ EngineErrc SearchEngine::searchEncoded(
     CancellationToken* token,
     ProgressCallback progress
 ) {
-    // Fast-path transformations where encoded search maps directly onto SIMD Exact Search
     if (mode == EncodedMode::OFFSET_ADDED) {
         int64_t offsetKey = static_cast<int64_t>(keyOrMask);
         return searchExact(type, logicalInt + offsetKey, logicalFloat + static_cast<double>(offsetKey), 1e-4, aligned, token, progress);
@@ -1263,10 +1413,11 @@ EngineErrc SearchEngine::searchEncoded(
         return searchExact(intEquiv, encodedTarget, 0.0, 0.0, aligned, token, progress);
     }
 
-    // Specialized correlated kernels: XOR_PAIR_32, XOR_PAIR_64, XOR_ADDRESS
     auto t0 = std::chrono::steady_clock::now();
     m_candidates.clear();
+    m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
     if (m_regions.empty()) refreshRegions();
@@ -1300,6 +1451,8 @@ EngineErrc SearchEngine::searchEncoded(
     std::atomic<size_t> processedBytes{0};
     std::atomic<size_t> readableBytes{0};
     std::atomic<size_t> syscalls{0};
+    std::atomic<size_t> totalMatches{0};
+    std::atomic<size_t> storedCount{0};
     std::mutex storeMutex;
 
     size_t numThreads = std::min(m_workerThreads, tasks.size());
@@ -1338,17 +1491,35 @@ EngineErrc SearchEngine::searchEncoded(
                     }
 
                     uint8_t rTag = regionFlagToIndex(task.regionFlag);
+                    bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
+                    size_t chunkMatches = 0;
+
                     for (size_t off : offsets) {
                         if (off >= task.logicalLen) continue;
                         if (!isRangeInValidPages(off, spanBytes, task.startAddr, pageSize, validMask)) continue;
 
-                        CandidateEntry entry{};
-                        entry.address   = task.startAddr + off;
-                        entry.rawValue  = targetBits64;
-                        entry.type      = static_cast<uint8_t>(type);
-                        entry.regionTag = rTag;
-                        entry.flags     = static_cast<uint32_t>(mode);
-                        localHits.push_back(entry);
+                        chunkMatches++;
+                        if (!storeAlreadyFull) {
+                            CandidateEntry entry{};
+                            entry.address   = task.startAddr + off;
+                            entry.rawValue  = targetBits64;
+                            entry.type      = static_cast<uint8_t>(type);
+                            entry.regionTag = rTag;
+                            entry.flags     = static_cast<uint32_t>(mode);
+                            localHits.push_back(entry);
+
+                            if (localHits.size() >= 16384) {
+                                std::lock_guard<std::mutex> lk(storeMutex);
+                                m_candidates.appendBatch(localHits.data(), localHits.size());
+                                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                localHits.clear();
+                                if (m_candidates.isFull()) storeAlreadyFull = true;
+                            }
+                        }
+                    }
+
+                    if (chunkMatches > 0) {
+                        m_totalMatchedCount = totalMatches.fetch_add(chunkMatches, std::memory_order_relaxed) + chunkMatches;
                     }
                 }
 
@@ -1359,6 +1530,7 @@ EngineErrc SearchEngine::searchEncoded(
             if (!localHits.empty()) {
                 std::lock_guard<std::mutex> lk(storeMutex);
                 m_candidates.appendBatch(localHits.data(), localHits.size());
+                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
             }
         });
     }
@@ -1367,12 +1539,13 @@ EngineErrc SearchEngine::searchEncoded(
     if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
 
     m_candidates.sortByAddress();
+    m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
     m_lastTelemetry.totalVmasScanned  = m_regions.size();
     m_lastTelemetry.totalBytesScanned = processedBytes.load();
     m_lastTelemetry.readableBytes     = readableBytes.load();
-    m_lastTelemetry.candidatesFound   = m_candidates.size();
+    m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued    = syscalls.load();
     m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
     return EngineErrc::OK;
@@ -1407,7 +1580,10 @@ EngineErrc SearchEngine::refineEncoded(
         return refineExact(intEquiv, static_cast<int64_t>(rawLogical ^ keyOrMask), 0.0, 0.0, token);
     }
 
-    if (m_candidates.empty()) return EngineErrc::OK;
+    if (m_candidates.empty()) {
+        m_totalMatchedCount = 0;
+        return EngineErrc::OK;
+    }
     auto t0 = std::chrono::steady_clock::now();
 
     uint64_t targetBits64 = 0;
@@ -1463,9 +1639,10 @@ EngineErrc SearchEngine::refineEncoded(
     }
 
     m_candidates = std::move(nextStore);
+    m_totalMatchedCount = m_candidates.size();
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs       = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    m_lastTelemetry.candidatesFound = m_candidates.size();
+    m_lastTelemetry.candidatesFound = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued  = syscalls;
     return EngineErrc::OK;
 }
@@ -1481,7 +1658,9 @@ EngineErrc SearchEngine::searchGroup(
     if (query.fields.empty()) return EngineErrc::ERR_INVAL;
     auto t0 = std::chrono::steady_clock::now();
     m_candidates.clear();
+    m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
     if (m_regions.empty()) refreshRegions();
@@ -1498,7 +1677,6 @@ EngineErrc SearchEngine::searchGroup(
     }
     const GroupFieldItem& anchor = query.fields[anchorIdx];
 
-    // Overlap must cover the full group span in both directions
     size_t overlap = query.maxSpanBytes * 2 + 16;
     auto tasks = buildChunkTasks(overlap);
     if (tasks.empty()) return EngineErrc::OK;
@@ -1510,6 +1688,8 @@ EngineErrc SearchEngine::searchGroup(
     std::atomic<size_t> processedBytes{0};
     std::atomic<size_t> readableBytes{0};
     std::atomic<size_t> syscalls{0};
+    std::atomic<size_t> totalMatches{0};
+    std::atomic<size_t> storedCount{0};
     std::mutex storeMutex;
 
     size_t numThreads = std::min(m_workerThreads, tasks.size());
@@ -1542,7 +1722,6 @@ EngineErrc SearchEngine::searchGroup(
                     continue;
                 }
 
-                // Scan chunk only for the selected high-entropy Anchor field
                 anchorOffsets.clear();
                 size_t anchorSz = dataTypeSize(anchor.type);
                 size_t anchorStep = query.aligned ? anchorSz : 1;
@@ -1571,22 +1750,20 @@ EngineErrc SearchEngine::searchGroup(
                 }
 
                 uint8_t rTag = regionFlagToIndex(task.regionFlag);
+                bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
+                size_t chunkMatches = 0;
 
                 for (size_t aOff : anchorOffsets) {
                     if (!isRangeInValidPages(aOff, anchorSz, task.startAddr, pageSize, validMask)) continue;
 
-                    // Determine search window around anchorOff
                     size_t winStart = (aOff > query.maxSpanBytes) ? (aOff - query.maxSpanBytes) : 0;
                     size_t winEnd   = std::min(task.readLen, aOff + query.maxSpanBytes + 16);
 
-                    // Verify all fields in query.fields
                     bool allMatched = true;
                     size_t minMatchedOffset = aOff;
                     size_t maxMatchedEnd    = aOff + anchorSz;
 
                     if (query.ordered) {
-                        // Fields before anchorIdx must appear in [winStart, aOff) in strictly increasing order.
-                        // Walk backwards from anchorIdx - 1 down to 0 to bind the tightest struct fields closest to the anchor!
                         size_t curUpperBound = aOff;
                         size_t firstFieldOffset = aOff;
 
@@ -1626,7 +1803,6 @@ EngineErrc SearchEngine::searchGroup(
                         if (!allMatched) continue;
                         minMatchedOffset = (anchorIdx == 0) ? aOff : firstFieldOffset;
 
-                        // Fields after anchorIdx must appear in [aOff + anchorSz, minMatchedOffset + maxSpanBytes]
                         size_t prevEnd = aOff + anchorSz;
                         size_t allowedEnd = std::min(task.readLen, minMatchedOffset + query.maxSpanBytes);
 
@@ -1654,7 +1830,6 @@ EngineErrc SearchEngine::searchGroup(
                             }
                         }
                     } else {
-                        // Unordered Group Search: all fields must occur within [winStart, winEnd] with total span <= maxSpanBytes
                         for (size_t fIdx = 0; fIdx < query.fields.size(); ++fIdx) {
                             if (fIdx == anchorIdx) continue;
                             const auto& fld = query.fields[fIdx];
@@ -1689,14 +1864,29 @@ EngineErrc SearchEngine::searchGroup(
                     if (allMatched && minMatchedOffset < task.logicalLen) {
                         size_t groupSpan = maxMatchedEnd - minMatchedOffset;
                         if (isRangeInValidPages(minMatchedOffset, groupSpan, task.startAddr, pageSize, validMask)) {
-                            CandidateEntry entry{};
-                            entry.address   = task.startAddr + minMatchedOffset;
-                            entry.rawValue  = extractRawValue(buf.data() + minMatchedOffset, query.fields[0].type);
-                            entry.type      = static_cast<uint8_t>(query.fields[0].type);
-                            entry.regionTag = rTag;
-                            localHits.push_back(entry);
+                            chunkMatches++;
+                            if (!storeAlreadyFull) {
+                                CandidateEntry entry{};
+                                entry.address   = task.startAddr + minMatchedOffset;
+                                entry.rawValue  = extractRawValue(buf.data() + minMatchedOffset, query.fields[0].type);
+                                entry.type      = static_cast<uint8_t>(query.fields[0].type);
+                                entry.regionTag = rTag;
+                                localHits.push_back(entry);
+
+                                if (localHits.size() >= 16384) {
+                                    std::lock_guard<std::mutex> lk(storeMutex);
+                                    m_candidates.appendBatch(localHits.data(), localHits.size());
+                                    storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                    localHits.clear();
+                                    if (m_candidates.isFull()) storeAlreadyFull = true;
+                                }
+                            }
                         }
                     }
+                }
+
+                if (chunkMatches > 0) {
+                    m_totalMatchedCount = totalMatches.fetch_add(chunkMatches, std::memory_order_relaxed) + chunkMatches;
                 }
 
                 size_t done = processedBytes.fetch_add(task.logicalLen, std::memory_order_relaxed) + task.logicalLen;
@@ -1706,6 +1896,7 @@ EngineErrc SearchEngine::searchGroup(
             if (!localHits.empty()) {
                 std::lock_guard<std::mutex> lk(storeMutex);
                 m_candidates.appendBatch(localHits.data(), localHits.size());
+                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
             }
         });
     }
@@ -1714,12 +1905,13 @@ EngineErrc SearchEngine::searchGroup(
     if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
 
     m_candidates.sortByAddress();
+    m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
     m_lastTelemetry.totalVmasScanned  = m_regions.size();
     m_lastTelemetry.totalBytesScanned = processedBytes.load();
     m_lastTelemetry.readableBytes     = readableBytes.load();
-    m_lastTelemetry.candidatesFound   = m_candidates.size();
+    m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
     m_lastTelemetry.syscallsIssued    = syscalls.load();
     m_lastTelemetry.anchorFieldIndex  = anchorIdx;
     m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();

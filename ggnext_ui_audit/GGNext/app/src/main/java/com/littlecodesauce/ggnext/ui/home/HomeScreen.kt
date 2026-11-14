@@ -362,7 +362,7 @@ private fun LauncherHomePage(
                             Spacer(Modifier.width(10.dp))
                             Text(tr("工作模式"), color = Rose.Text, fontSize = fsp(15f), fontWeight = FontWeight.SemiBold)
                         }
-                        // 模式切换 Pills（支持 Root / 免 Root / 演示模式）
+                        // 模式切换 Pills（支持 Root / 免 Root）
                         Row(
                             Modifier
                                 .clip(RoundedCornerShape(8.dp))
@@ -372,7 +372,6 @@ private fun LauncherHomePage(
                         ) {
                             val isRoot = ui.workMode == WorkMode.ROOT
                             val isNoRoot = ui.workMode == WorkMode.NO_ROOT
-                            val isDemo = ui.workMode == WorkMode.DEMO
 
                             Box(
                                 Modifier
@@ -381,7 +380,7 @@ private fun LauncherHomePage(
                                     .clickableWithTooltip(tooltip = "Root 模式：需 Root 权限，全系统跨进程直读") {
                                         Session.setWorkMode(WorkMode.ROOT)
                                     }
-                                    .padding(horizontal = 7.dp, vertical = 4.dp),
+                                    .padding(horizontal = 9.dp, vertical = 4.dp),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
@@ -398,7 +397,7 @@ private fun LauncherHomePage(
                                     .clickableWithTooltip(tooltip = "免 Root 模式：共享 UID / 虚拟空间沙盒") {
                                         Session.setWorkMode(WorkMode.NO_ROOT)
                                     }
-                                    .padding(horizontal = 7.dp, vertical = 4.dp),
+                                    .padding(horizontal = 9.dp, vertical = 4.dp),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
@@ -406,23 +405,6 @@ private fun LauncherHomePage(
                                     color = if (isNoRoot) Rose.Cyan else Rose.TextSecond,
                                     fontSize = fsp(12f),
                                     fontWeight = if (isNoRoot) FontWeight.Bold else FontWeight.Normal
-                                )
-                            }
-                            Box(
-                                Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(if (isDemo) Rose.Yellow.copy(alpha = 0.22f) else Color.Transparent)
-                                    .clickableWithTooltip(tooltip = "演示模式：纯沙盒模拟环境，无需权限，完整体验功能与交互") {
-                                        Session.setWorkMode(WorkMode.DEMO)
-                                    }
-                                    .padding(horizontal = 7.dp, vertical = 4.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    tr("演示模式"),
-                                    color = if (isDemo) Rose.Yellow else Rose.TextSecond,
-                                    fontSize = fsp(12f),
-                                    fontWeight = if (isDemo) FontWeight.Bold else FontWeight.Normal
                                 )
                             }
                         }
@@ -438,10 +420,9 @@ private fun LauncherHomePage(
                                 when (ui.workMode) {
                                     WorkMode.ROOT -> {
                                         if (!ui.hasRootPermission) Session.refreshRootStatus(promptIfMissing = true)
-                                        else Session.toast("当前运行于 Root 守护直读模式")
+                                        else Session.toast("当前运行于 Root 守护直读模式 (UID 0)")
                                     }
                                     WorkMode.NO_ROOT -> Session.toast("当前运行于免 Root 共享 UID 模式")
-                                    WorkMode.DEMO -> Session.toast("当前运行于纯沙盒演示模式")
                                 }
                             }
                             .padding(horizontal = 10.dp, vertical = 8.dp),
@@ -453,10 +434,9 @@ private fun LauncherHomePage(
                                     when (ui.workMode) {
                                         WorkMode.ROOT -> {
                                             if (ui.hasRootPermission) "Root 权限已获取 · 真实跨进程内存读写"
-                                            else "未检测到 Root 权限 · 点击申请授权或切换至「免 Root」或「演示模式」"
+                                            else "未检测到 Root 权限 · 点击申请授权或切换至「免 Root」"
                                         }
                                         WorkMode.NO_ROOT -> "免 Root 共享 UID 模式 · 适用于双开沙箱空间内跨进程读写"
-                                        WorkMode.DEMO -> "演示模式 · 纯沙盒模拟环境，无需权限，完整体验功能与交互"
                                     }
                                 ),
                                 color = if (ui.workMode == WorkMode.ROOT && !ui.hasRootPermission) Rose.Red else Rose.TextSecond,
@@ -470,7 +450,6 @@ private fun LauncherHomePage(
                                     when (ui.workMode) {
                                         WorkMode.ROOT -> if (ui.hasRootPermission) Rose.Green.copy(alpha = 0.18f) else Rose.Red.copy(alpha = 0.18f)
                                         WorkMode.NO_ROOT -> Rose.Cyan.copy(alpha = 0.18f)
-                                        WorkMode.DEMO -> Rose.Yellow.copy(alpha = 0.18f)
                                     },
                                     RoundedCornerShape(6.dp)
                                 )
@@ -480,12 +459,10 @@ private fun LauncherHomePage(
                                 text = when (ui.workMode) {
                                     WorkMode.ROOT -> if (ui.hasRootPermission) tr("已授权 Root") else tr("未授权")
                                     WorkMode.NO_ROOT -> tr("共享 UID")
-                                    WorkMode.DEMO -> tr("演示模式")
                                 },
                                 color = when (ui.workMode) {
                                     WorkMode.ROOT -> if (ui.hasRootPermission) Rose.Green else Rose.Red
                                     WorkMode.NO_ROOT -> Rose.Cyan
-                                    WorkMode.DEMO -> Rose.Yellow
                                 },
                                 fontSize = fsp(11f),
                                 fontWeight = FontWeight.Medium

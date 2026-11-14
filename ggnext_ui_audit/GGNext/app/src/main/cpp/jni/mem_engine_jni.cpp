@@ -109,7 +109,7 @@ Java_com_qa_memengine_MemDiagnosticEngine_nativeCreate(
     jint workerThreads,
     jstring spillDirJstr
 ) {
-    std::string spillDir = "/tmp";
+    std::string spillDir = "/data/local/tmp";
     if (spillDirJstr != nullptr) {
         const char* cstr = env->GetStringUTFChars(spillDirJstr, nullptr);
         if (cstr && cstr[0] != '\0') spillDir = cstr;
@@ -338,7 +338,7 @@ Java_com_qa_memengine_MemDiagnosticEngine_nativeGetCandidateCount(
     auto* session = reinterpret_cast<NativeEngineSession*>(handle);
     if (!session) return 0;
     std::lock_guard<std::mutex> lk(session->mtx);
-    return static_cast<jlong>(session->scanner->candidateCount());
+    return static_cast<jlong>(session->scanner->totalMatchedCount());
 }
 
 JNIEXPORT jlongArray JNICALL
@@ -353,14 +353,14 @@ Java_com_qa_memengine_MemDiagnosticEngine_nativeGetCandidateAddresses(
     if (!session || offset < 0 || limit <= 0) return nullptr;
     std::lock_guard<std::mutex> lk(session->mtx);
 
-    const auto& store = session->scanner->candidates();
-    size_t start = static_cast<size_t>(offset);
-    if (start >= store.size()) return env->NewLongArray(0);
-    size_t count = std::min(static_cast<size_t>(limit), store.size() - start);
+    std::vector<mem_engine::CandidateEntry> slice;
+    session->scanner->fetchCandidates(static_cast<size_t>(offset), static_cast<size_t>(limit), slice);
+    if (slice.empty()) return env->NewLongArray(0);
 
+    size_t count = slice.size();
     std::vector<jlong> addrs(count);
     for (size_t i = 0; i < count; ++i) {
-        addrs[i] = static_cast<jlong>(store[start + i].address);
+        addrs[i] = static_cast<jlong>(slice[i].address);
     }
 
     jlongArray arr = env->NewLongArray(static_cast<jsize>(count));
@@ -484,8 +484,8 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionTotals(
         session->cachedAllRegions = mem_engine::MapsParser::parseProcessMaps(static_cast<int>(pid), 0, false);
     }
 
-    // 30 longs: [size_0..size_14, base_0..base_14] in GGNext RegionCatalog.ALL order
-    jlong out[30];
+    // 45 longs: [size_0..size_14, base_0..base_14, count_0..count_14] in GGNext RegionCatalog.ALL order
+    jlong out[45];
     std::memset(out, 0, sizeof(out));
 
     for (const auto& r : session->cachedAllRegions) {
@@ -495,14 +495,15 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionTotals(
                 if (out[15 + idx] == 0) {
                     out[15 + idx] = static_cast<jlong>(r.startAddress);
                 }
+                out[30 + idx] += 1;
                 break;
             }
         }
     }
 
-    jlongArray arr = env->NewLongArray(30);
+    jlongArray arr = env->NewLongArray(45);
     if (arr) {
-        env->SetLongArrayRegion(arr, 0, 30, out);
+        env->SetLongArrayRegion(arr, 0, 45, out);
     }
     return arr;
 }
@@ -865,15 +866,15 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetCandidatesPacked
     if (!session || offset < 0 || limit <= 0) return nullptr;
     std::lock_guard<std::mutex> lk(session->mtx);
 
-    const auto& store = session->scanner->candidates();
-    size_t start = static_cast<size_t>(offset);
-    if (start >= store.size()) return env->NewLongArray(0);
-    size_t count = std::min(static_cast<size_t>(limit), store.size() - start);
+    std::vector<mem_engine::CandidateEntry> slice;
+    session->scanner->fetchCandidates(static_cast<size_t>(offset), static_cast<size_t>(limit), slice);
+    if (slice.empty()) return env->NewLongArray(0);
 
+    size_t count = slice.size();
     // Pack 3 longs per candidate: [address, rawValue, (type | (regionTag << 8))]
     std::vector<jlong> packed(count * 3);
     for (size_t i = 0; i < count; ++i) {
-        const auto& c = store[start + i];
+        const auto& c = slice[i];
         packed[i * 3 + 0] = static_cast<jlong>(c.address);
         packed[i * 3 + 1] = static_cast<jlong>(c.rawValue);
         packed[i * 3 + 2] = static_cast<jlong>(static_cast<uint64_t>(c.type) | (static_cast<uint64_t>(c.regionTag) << 8));

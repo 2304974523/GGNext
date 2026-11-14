@@ -311,7 +311,8 @@ object I18n {
         "进程列表" to "Process List",
         "选择要附加的进程" to "Select a process to attach",
         "搜索名称 / 包名 / pid" to "Search name / package / pid",
-        "应用" to "Apps",
+        "用户" to "User",
+        "应用" to "Apply",
         "系统" to "System",
         "优先级" to "Order",
         "大小" to "Size",
@@ -341,7 +342,6 @@ object I18n {
         "工作模式" to "Working Mode",
         "Root 模式" to "Root",
         "免 Root 模式" to "No-Root",
-        "演示模式" to "Demo",
         "已授权 Root" to "Root",
         "未授权" to "Unrooted",
         "共享 UID" to "Shared UID",
@@ -550,9 +550,11 @@ fun GgCheckBox(
 }
 
 /**
- * 专用无外置键盘干扰、光标严格居中对齐的输入框组件。
+ * 专用无外置键盘干扰、光标严格居中对齐的输入框组件：
+ * - 3.2：获得焦点或初次打开包含非空文本的输入界面时，自动全选输入框内的内容；
+ * - 3.6：长按输入框弹出「全选 / 复制 / 粘贴 / 剪切 / 清空」快捷菜单。
  */
-@OptIn(ExperimentalComposeUiApi::class)
+@OptIn(ExperimentalComposeUiApi::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun GgTextField(
     value: TextFieldValue,
@@ -562,55 +564,171 @@ fun GgTextField(
     textStyle: TextStyle = monoStyle(15, Rose.Text),
     cursorColor: Color = Rose.Primary,
     suppressSystemKeyboard: Boolean = true,
+    autoSelectOnFocus: Boolean = true,
     onFocus: (() -> Unit)? = null
 ) {
     val focusRequester = remember { FocusRequester() }
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    var wasFocused by remember { mutableStateOf(false) }
+    var showContextMenu by remember { mutableStateOf(false) }
+    val currentVal by androidx.compose.runtime.rememberUpdatedState(value)
+    val currentOnValueChange by androidx.compose.runtime.rememberUpdatedState(onValueChange)
 
-    InterceptPlatformTextInput(
-        interceptor = { request, nextHandler ->
-            if (suppressSystemKeyboard) {
-                awaitCancellation()
-            } else {
-                nextHandler.startInputMethod(request)
-            }
-        }
-    ) {
-        BasicTextField(
-            value = value,
-            onValueChange = onValueChange,
-            singleLine = true,
-            textStyle = textStyle,
-            cursorBrush = SolidColor(cursorColor),
-            keyboardOptions = KeyboardOptions(
-                capitalization = KeyboardCapitalization.None,
-                autoCorrectEnabled = false,
-                keyboardType = KeyboardType.Ascii,
-                imeAction = ImeAction.Done
-            ),
-            modifier = modifier
-                .focusRequester(focusRequester)
-                .onFocusChanged { focusState ->
-                    if (focusState.isFocused) {
-                        onFocus?.invoke()
-                    }
-                },
-            decorationBox = { innerTextField ->
-                Box(
-                    modifier = Modifier.fillMaxWidth(),
-                    contentAlignment = Alignment.CenterStart
-                ) {
-                    if (value.text.isEmpty() && placeholder.isNotEmpty()) {
-                        Text(
-                            text = tr(placeholder),
-                            style = textStyle.copy(color = Rose.TextDim),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    innerTextField()
+    Box(modifier = modifier) {
+        InterceptPlatformTextInput(
+            interceptor = { request, nextHandler ->
+                if (suppressSystemKeyboard) {
+                    awaitCancellation()
+                } else {
+                    nextHandler.startInputMethod(request)
                 }
             }
-        )
+        ) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                singleLine = true,
+                textStyle = textStyle,
+                cursorBrush = SolidColor(cursorColor),
+                keyboardOptions = KeyboardOptions(
+                    capitalization = KeyboardCapitalization.None,
+                    autoCorrectEnabled = false,
+                    keyboardType = KeyboardType.Ascii,
+                    imeAction = ImeAction.Done
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focusRequester)
+                    .onFocusChanged { focusState ->
+                        if (focusState.isFocused && !wasFocused) {
+                            wasFocused = true
+                            onFocus?.invoke()
+                            if (autoSelectOnFocus && currentVal.text.isNotEmpty()) {
+                                currentOnValueChange(
+                                    currentVal.copy(selection = androidx.compose.ui.text.TextRange(0, currentVal.text.length))
+                                )
+                            }
+                        } else if (!focusState.isFocused) {
+                            wasFocused = false
+                        }
+                    },
+                decorationBox = { innerTextField ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                androidx.compose.ui.Modifier.pointerInput(Unit) {
+                                    androidx.compose.foundation.gestures.detectTapGestures(
+                                        onLongPress = {
+                                            focusRequester.requestFocus()
+                                            onFocus?.invoke()
+                                            showContextMenu = true
+                                        },
+                                        onTap = {
+                                            focusRequester.requestFocus()
+                                            onFocus?.invoke()
+                                            if (autoSelectOnFocus && currentVal.text.isNotEmpty() && currentVal.selection.collapsed) {
+                                                currentOnValueChange(
+                                                    currentVal.copy(
+                                                        selection = androidx.compose.ui.text.TextRange(0, currentVal.text.length)
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    )
+                                }
+                            ),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        if (value.text.isEmpty() && placeholder.isNotEmpty()) {
+                            Text(
+                                text = tr(placeholder),
+                                style = textStyle.copy(color = Rose.TextDim),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        innerTextField()
+                    }
+                }
+            )
+        }
+
+        androidx.compose.material3.DropdownMenu(
+            expanded = showContextMenu,
+            onDismissRequest = { showContextMenu = false },
+            modifier = Modifier.background(Rose.CardHigh)
+        ) {
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text(tr("全选"), color = Rose.Text, fontSize = fsp(13f)) },
+                onClick = {
+                    showContextMenu = false
+                    val t = currentVal.text
+                    currentOnValueChange(currentVal.copy(selection = androidx.compose.ui.text.TextRange(0, t.length)))
+                }
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text(tr("复制"), color = Rose.Text, fontSize = fsp(13f)) },
+                onClick = {
+                    showContextMenu = false
+                    val sel = currentVal.selection
+                    val textToCopy = if (!sel.collapsed) {
+                        currentVal.text.substring(sel.min.coerceAtLeast(0), sel.max.coerceAtMost(currentVal.text.length))
+                    } else {
+                        currentVal.text
+                    }
+                    if (textToCopy.isNotEmpty()) {
+                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(textToCopy))
+                        com.littlecodesauce.ggnext.core.Session.toast("已复制: $textToCopy")
+                    }
+                }
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text(tr("粘贴"), color = Rose.Text, fontSize = fsp(13f)) },
+                onClick = {
+                    showContextMenu = false
+                    val clipText = clipboard.getText()?.text.orEmpty()
+                    if (clipText.isNotEmpty()) {
+                        val sel = currentVal.selection
+                        val start = sel.min.coerceIn(0, currentVal.text.length)
+                        val end = sel.max.coerceIn(start, currentVal.text.length)
+                        val nextText = currentVal.text.substring(0, start) + clipText + currentVal.text.substring(end)
+                        val nextCursor = start + clipText.length
+                        currentOnValueChange(
+                            TextFieldValue(
+                                text = nextText,
+                                selection = androidx.compose.ui.text.TextRange(nextCursor)
+                            )
+                        )
+                    }
+                }
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text(tr("剪切"), color = Rose.Text, fontSize = fsp(13f)) },
+                onClick = {
+                    showContextMenu = false
+                    val sel = currentVal.selection
+                    if (!sel.collapsed) {
+                        val start = sel.min.coerceIn(0, currentVal.text.length)
+                        val end = sel.max.coerceIn(start, currentVal.text.length)
+                        val cutStr = currentVal.text.substring(start, end)
+                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(cutStr))
+                        val nextText = currentVal.text.removeRange(start, end)
+                        currentOnValueChange(TextFieldValue(text = nextText, selection = androidx.compose.ui.text.TextRange(start)))
+                    } else if (currentVal.text.isNotEmpty()) {
+                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(currentVal.text))
+                        currentOnValueChange(TextFieldValue(text = "", selection = androidx.compose.ui.text.TextRange(0)))
+                    }
+                }
+            )
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text(tr("清空"), color = Rose.Red, fontSize = fsp(13f)) },
+                onClick = {
+                    showContextMenu = false
+                    currentOnValueChange(TextFieldValue(text = "", selection = androidx.compose.ui.text.TextRange(0)))
+                }
+            )
+        }
     }
 }
 

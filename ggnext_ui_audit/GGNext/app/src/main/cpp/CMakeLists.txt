@@ -5,7 +5,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(MEMENGINE_BUILD_TESTS "Build local automated stress test & 3-way benchmark suite" ON)
 option(MEMENGINE_BUILD_JNI "Build Android JNI shared library target" ON)
 
 # Architecture & SIMD Detection (ARM64 NEON, ARMv7 NEON, x86_64 Scalar/SSE/AVX)
@@ -34,14 +33,14 @@ set(MEMENGINE_CORE_SOURCES
     src/search_engine.cpp
 )
 
-# Static core library for unit tests & benchmarks
+# Static core library
 add_library(mem_engine_core STATIC ${MEMENGINE_CORE_SOURCES})
 target_include_directories(mem_engine_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 target_link_libraries(mem_engine_core PUBLIC Threads::Threads)
 
-# Shared JNI library for Android NDK integration
+# Shared JNI library + Root helper daemon executable (packaged as libmem_engine_root.so) for Android NDK integration
 if(MEMENGINE_BUILD_JNI)
     add_library(mem_engine_jni SHARED
         ${MEMENGINE_CORE_SOURCES}
@@ -51,14 +50,30 @@ if(MEMENGINE_BUILD_JNI)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     )
     target_link_libraries(mem_engine_jni PUBLIC Threads::Threads)
+
+    add_executable(mem_engine_root
+        ${MEMENGINE_CORE_SOURCES}
+        src/root_helper_main.cpp
+    )
+    target_include_directories(mem_engine_root PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    target_compile_options(mem_engine_root PRIVATE -fPIE)
+    target_link_options(mem_engine_root PRIVATE -pie)
+    target_link_libraries(mem_engine_root PRIVATE Threads::Threads)
+    set_target_properties(mem_engine_root PROPERTIES
+        OUTPUT_NAME "mem_engine_root.so"
+        PREFIX "lib"
+    )
+    if(DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+        set_target_properties(mem_engine_root PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        )
+    endif()
+
     if(ANDROID)
         find_library(log-lib log)
         target_link_libraries(mem_engine_jni PUBLIC ${log-lib})
+        target_link_libraries(mem_engine_root PRIVATE ${log-lib})
     endif()
-endif()
-
-# Local controlled stress test & 3-way comparative benchmark executable
-if(MEMENGINE_BUILD_TESTS)
-    add_executable(mem_engine_benchmark tests/benchmark_suite.cpp)
-    target_link_libraries(mem_engine_benchmark PRIVATE mem_engine_core Threads::Threads)
 endif()

@@ -9,6 +9,7 @@ import {
   floatToRawBits,
   formatCellValue,
   formatReverseHex,
+  classifyAndroidProcessCandidate,
   GGNEXT_AUDIT_FINDINGS,
 } from './ggnextEngineLogic.ts';
 
@@ -85,11 +86,32 @@ describe('GGNext + C++20 MemEngine Integration Pure Logic Tests', () => {
     assert.equal(formatReverseHex(0x11223344n, 4), '44332211');
   });
 
-  test('audit catalog contains all 14 documented bugs with non-empty diffs', () => {
-    assert.equal(GGNEXT_AUDIT_FINDINGS.length, 14);
+  test('classifyAndroidProcessCandidate strictly filters Linux/HAL daemons and separates USER vs SYSTEM apps (Bug #16 fix)', () => {
+    // Rejects all Linux/HAL daemons seen in user screenshot
+    assert.equal(classifyAndroidProcessCandidate('media.codec', 1046, false, false, false).accepted, false);
+    assert.equal(classifyAndroidProcessCandidate('media.metrics', 1013, false, false, false).accepted, false);
+    assert.equal(classifyAndroidProcessCandidate('android.hardware.sensors@2.0-service', 1000, false, false, false).accepted, false);
+    assert.equal(classifyAndroidProcessCandidate('vendor.qti.hardware.display.composer-service', 1000, false, false, false).accepted, false);
+    assert.equal(classifyAndroidProcessCandidate('vendor.qti.hardwa', 1000, false, false, false).accepted, false);
+    assert.equal(classifyAndroidProcessCandidate('/system/bin/surfaceflinger', 1000, false, false, false).accepted, false);
+
+    // Accepts real user app (e.g. me.hd.ggtutorial) as USER
+    const userApp = classifyAndroidProcessCandidate('me.hd.ggtutorial', 10294, true, false, false);
+    assert.equal(userApp.accepted, true);
+    assert.equal(userApp.category, 'USER');
+
+    // Accepts real system app (e.g. com.android.systemui) as SYSTEM
+    const sysApp = classifyAndroidProcessCandidate('com.android.systemui', 10085, true, true, false);
+    assert.equal(sysApp.accepted, true);
+    assert.equal(sysApp.category, 'SYSTEM');
+  });
+
+  test('audit catalog contains all 18 documented bugs with non-empty diffs', () => {
+    assert.equal(GGNEXT_AUDIT_FINDINGS.length, 18);
     for (const item of GGNEXT_AUDIT_FINDINGS) {
       assert.ok(item.beforeCode.length > 5);
       assert.ok(item.afterCode.length > 5);
     }
   });
 });
+

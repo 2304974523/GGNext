@@ -57,7 +57,7 @@ class SearchEngine {
 public:
     static constexpr size_t DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB per chunk task
 
-    SearchEngine(ProcIO& io, size_t workerThreads = 4, const std::string& spillDir = "/tmp");
+    SearchEngine(ProcIO& io, size_t workerThreads = 4, const std::string& spillDir = "/data/local/tmp");
     ~SearchEngine() = default;
 
     SearchEngine(const SearchEngine&) = delete;
@@ -81,6 +81,11 @@ public:
     const MmapCandidateStore& candidates() const noexcept { return m_candidates; }
     MmapCandidateStore& candidates() noexcept { return m_candidates; }
     size_t candidateCount() const noexcept { return m_candidates.size(); }
+    size_t totalMatchedCount() const noexcept {
+        return m_totalMatchedCount > m_candidates.size() ? m_totalMatchedCount : m_candidates.size();
+    }
+    bool hasFuzzySnapshot() const noexcept { return m_hasFullSnapshot; }
+    void fetchCandidates(size_t offset, size_t limit, std::vector<CandidateEntry>& out) const;
     const ScanTelemetry& lastTelemetry() const noexcept { return m_lastTelemetry; }
 
     void clearSession() noexcept;
@@ -103,7 +108,8 @@ public:
         int64_t intTarget,
         double floatTarget,
         double epsilon = 1e-4,
-        CancellationToken* token = nullptr
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
     );
 
     // Byte[] (with optional mask) & UTF-8 / UTF-16 String Exact Search
@@ -143,7 +149,8 @@ public:
         double floatMin,
         double floatMax,
         bool inclusive = true,
-        CancellationToken* token = nullptr
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
     );
 
     // ------------------------------------------------------------------------
@@ -160,7 +167,8 @@ public:
         int64_t intDelta = 0,
         double floatDelta = 0.0,
         double epsilon = 1e-4,
-        CancellationToken* token = nullptr
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
     );
 
     // ------------------------------------------------------------------------
@@ -219,13 +227,14 @@ private:
     size_t                   m_workerThreads = 4;
     size_t                   m_chunkSize     = DEFAULT_CHUNK_SIZE;
     uint32_t                 m_regionMask    = RegionFlag::DEFAULT_RW;
-    std::string              m_spillDir      = "/tmp";
+    std::string              m_spillDir      = "/data/local/tmp";
 
     std::vector<VmaRegion>   m_regions;
     MmapCandidateStore       m_candidates;
     MmapRegionSnapshotStore  m_snapshotStore;
-    bool                     m_hasFullSnapshot = false;
-    DataType                 m_snapshotType    = DataType::INT32;
+    bool                     m_hasFullSnapshot   = false;
+    DataType                 m_snapshotType      = DataType::INT32;
+    size_t                   m_totalMatchedCount = 0;
     ScanTelemetry            m_lastTelemetry{};
 };
 

@@ -484,8 +484,8 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionTotals(
         session->cachedAllRegions = mem_engine::MapsParser::parseProcessMaps(static_cast<int>(pid), 0, false);
     }
 
-    // 30 longs: [size_0..size_14, base_0..base_14] in GGNext RegionCatalog.ALL order
-    jlong out[30];
+    // 45 longs: [size_0..size_14, base_0..base_14, count_0..count_14] in GGNext RegionCatalog.ALL order
+    jlong out[45];
     std::memset(out, 0, sizeof(out));
 
     for (const auto& r : session->cachedAllRegions) {
@@ -495,14 +495,15 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionTotals(
                 if (out[15 + idx] == 0) {
                     out[15 + idx] = static_cast<jlong>(r.startAddress);
                 }
+                out[30 + idx] += 1;
                 break;
             }
         }
     }
 
-    jlongArray arr = env->NewLongArray(30);
+    jlongArray arr = env->NewLongArray(45);
     if (arr) {
-        env->SetLongArrayRegion(arr, 0, 30, out);
+        env->SetLongArrayRegion(arr, 0, 45, out);
     }
     return arr;
 }

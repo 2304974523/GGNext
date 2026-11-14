@@ -69,7 +69,7 @@ import com.littlecodesauce.ggnext.ui.theme.typeColor
 
 @Composable
 fun SearchSheet(ui: Ui) {
-    var tf by remember { mutableStateOf(TextFieldValue(ui.search.text, TextRange(ui.search.text.length))) }
+    var tf by remember { mutableStateOf(TextFieldValue(ui.search.text, TextRange(0, ui.search.text.length))) }
     var showSign by remember { mutableStateOf(false) }
     var showType by remember { mutableStateOf(false) }
     val extended = ui.search.expanded
@@ -320,10 +320,10 @@ fun SearchSheet(ui: Ui) {
                     if (ui.search.rangeMode == 1) {
                         Spacer(Modifier.height(8.dp))
                         var fromTf by remember {
-                            mutableStateOf(TextFieldValue(ui.search.rangeFrom, TextRange(ui.search.rangeFrom.length)))
+                            mutableStateOf(TextFieldValue(ui.search.rangeFrom, TextRange(0, ui.search.rangeFrom.length)))
                         }
                         var toTf by remember {
-                            mutableStateOf(TextFieldValue(ui.search.rangeTo, TextRange(ui.search.rangeTo.length)))
+                            mutableStateOf(TextFieldValue(ui.search.rangeTo, TextRange(0, ui.search.rangeTo.length)))
                         }
 
                         Row(
@@ -402,10 +402,10 @@ fun SearchSheet(ui: Ui) {
                             val cur = ui.search.nearbyAddress.ifEmpty {
                                 java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
                             }
-                            mutableStateOf(TextFieldValue(cur, TextRange(cur.length)))
+                            mutableStateOf(TextFieldValue(cur, TextRange(0, cur.length)))
                         }
                         var distTf by remember {
-                            mutableStateOf(TextFieldValue(ui.search.nearbyDistance, TextRange(ui.search.nearbyDistance.length)))
+                            mutableStateOf(TextFieldValue(ui.search.nearbyDistance, TextRange(0, ui.search.nearbyDistance.length)))
                         }
 
                         // 地址: 7168F44CC0
@@ -495,7 +495,7 @@ fun SearchSheet(ui: Ui) {
                     }
 
                     Spacer(Modifier.height(8.dp))
-                    var mask by remember { mutableStateOf(TextFieldValue(ui.search.mask, TextRange(ui.search.mask.length))) }
+                    var mask by remember { mutableStateOf(TextFieldValue(ui.search.mask, TextRange(0, ui.search.mask.length))) }
                     FieldRow("地址蒙版", mask, suppressSystemKeyboard = keyboardOn) {
                         mask = it
                         Session.updateSearch { s -> s.copy(mask = it.text) }
@@ -576,19 +576,19 @@ fun FilterSearchSheet(ui: Ui) {
         mutableStateOf(TextFieldValue(s, TextRange(0, s.length)))
     }
     var addrGreatTf by remember(ui.filter.addrGreat) {
-        mutableStateOf(TextFieldValue(ui.filter.addrGreat, TextRange(ui.filter.addrGreat.length)))
+        mutableStateOf(TextFieldValue(ui.filter.addrGreat, TextRange(0, ui.filter.addrGreat.length)))
     }
     var addrLessTf by remember(ui.filter.addrLess) {
-        mutableStateOf(TextFieldValue(ui.filter.addrLess, TextRange(ui.filter.addrLess.length)))
+        mutableStateOf(TextFieldValue(ui.filter.addrLess, TextRange(0, ui.filter.addrLess.length)))
     }
     var valGreatTf by remember(ui.filter.valGreat) {
-        mutableStateOf(TextFieldValue(ui.filter.valGreat, TextRange(ui.filter.valGreat.length)))
+        mutableStateOf(TextFieldValue(ui.filter.valGreat, TextRange(0, ui.filter.valGreat.length)))
     }
     var valLessTf by remember(ui.filter.valLess) {
-        mutableStateOf(TextFieldValue(ui.filter.valLess, TextRange(ui.filter.valLess.length)))
+        mutableStateOf(TextFieldValue(ui.filter.valLess, TextRange(0, ui.filter.valLess.length)))
     }
     var fracTf by remember(ui.filter.fractional) {
-        mutableStateOf(TextFieldValue(ui.filter.fractional, TextRange(ui.filter.fractional.length)))
+        mutableStateOf(TextFieldValue(ui.filter.fractional, TextRange(0, ui.filter.fractional.length)))
     }
 
     val activeTf = when (focusedField) {
@@ -1170,25 +1170,15 @@ private fun FormatCheckItem(
 @Composable
 fun FuzzySearchSheet(ui: Ui) {
     val fz = ui.fuzzy
-    val hasResults = ui.rawResults.isNotEmpty()
+    val hasResults = ui.rawResults.isNotEmpty() || fz.active
     var showTypeList by remember { mutableStateOf(true) }
-    var onlyNthTf by remember(fz.onlyNth) {
-        mutableStateOf(TextFieldValue(fz.onlyNth, TextRange(fz.onlyNth.length)))
-    }
     var deltaTf by remember(fz.deltaText) {
-        mutableStateOf(TextFieldValue(fz.deltaText, TextRange(fz.deltaText.length)))
+        mutableStateOf(TextFieldValue(fz.deltaText, TextRange(0, fz.deltaText.length)))
     }
-    var editingDelta by remember { mutableStateOf(false) }
 
-    val activeTf = if (editingDelta && fz.extended) deltaTf else onlyNthTf
     fun onActiveChange(next: TextFieldValue) {
-        if (editingDelta && fz.extended) {
-            deltaTf = next
-            Session.updateFuzzy { it.copy(deltaText = next.text) }
-        } else {
-            onlyNthTf = next
-            Session.updateFuzzy { it.copy(onlyNth = next.text) }
-        }
+        deltaTf = next
+        Session.updateFuzzy { it.copy(deltaText = next.text) }
     }
 
     val typeArrowRot by animateFloatAsState(
@@ -1339,10 +1329,10 @@ fun FuzzySearchSheet(ui: Ui) {
                     if (fz.rangeMode == 1) {
                         Spacer(Modifier.height(8.dp))
                         var fromTf by remember {
-                            mutableStateOf(TextFieldValue(fz.rangeFrom, TextRange(fz.rangeFrom.length)))
+                            mutableStateOf(TextFieldValue(fz.rangeFrom, TextRange(0, fz.rangeFrom.length)))
                         }
                         var toTf by remember {
-                            mutableStateOf(TextFieldValue(fz.rangeTo, TextRange(fz.rangeTo.length)))
+                            mutableStateOf(TextFieldValue(fz.rangeTo, TextRange(0, fz.rangeTo.length)))
                         }
 
                         Row(
@@ -1399,10 +1389,10 @@ fun FuzzySearchSheet(ui: Ui) {
                             val cur = fz.nearbyAddress.ifEmpty {
                                 java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
                             }
-                            mutableStateOf(TextFieldValue(cur, TextRange(cur.length)))
+                            mutableStateOf(TextFieldValue(cur, TextRange(0, cur.length)))
                         }
                         var distTf by remember {
-                            mutableStateOf(TextFieldValue(fz.nearbyDistance, TextRange(fz.nearbyDistance.length)))
+                            mutableStateOf(TextFieldValue(fz.nearbyDistance, TextRange(0, fz.nearbyDistance.length)))
                         }
 
                         // 地址: 7168F44CC0
@@ -1561,18 +1551,11 @@ fun FuzzySearchSheet(ui: Ui) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("差值 (D): ", color = Rose.Text, fontSize = fsp(13.5f))
-                        Box(
-                            Modifier
-                                .weight(1f)
-                                .clickableNoRipple(remember { MutableInteractionSource() }) { editingDelta = true }
-                        ) {
+                        Box(Modifier.weight(1f)) {
                             Column {
                                 GgTextField(
                                     value = deltaTf,
-                                    onValueChange = {
-                                        editingDelta = true
-                                        onActiveChange(it)
-                                    },
+                                    onValueChange = { onActiveChange(it) },
                                     modifier = Modifier.fillMaxWidth().height(30.dp),
                                     textStyle = monoStyle(14, Rose.Text),
                                     cursorColor = Rose.Primary,
@@ -1581,8 +1564,8 @@ fun FuzzySearchSheet(ui: Ui) {
                                 Box(
                                     Modifier
                                         .fillMaxWidth()
-                                        .height(if (editingDelta) 2.dp else 1.dp)
-                                        .background(if (editingDelta) Rose.Primary else Rose.Divider)
+                                        .height(2.dp)
+                                        .background(Rose.Primary)
                                 )
                             }
                         }
@@ -1649,40 +1632,6 @@ fun FuzzySearchSheet(ui: Ui) {
 
             Spacer(Modifier.height(10.dp))
 
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 2.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(tr("只有第N个结果: "), color = Rose.Text, fontSize = fsp(13.5f))
-                Column(
-                    Modifier
-                        .weight(1f)
-                        .clickableNoRipple(remember { MutableInteractionSource() }) { editingDelta = false }
-                ) {
-                    GgTextField(
-                        value = onlyNthTf,
-                        onValueChange = {
-                            editingDelta = false
-                            onActiveChange(it)
-                        },
-                        modifier = Modifier.fillMaxWidth().height(30.dp),
-                        textStyle = monoStyle(15, Rose.Text),
-                        cursorColor = Rose.Primary,
-                        suppressSystemKeyboard = fz.keyboardVisible
-                    )
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .height(2.dp)
-                            .background(if (!editingDelta) Rose.Primary else Rose.Divider)
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(10.dp))
-
             FuzzyOptionButton(
                 label = fz.rangeLabel,
                 height = 42,
@@ -1723,7 +1672,7 @@ fun FuzzySearchSheet(ui: Ui) {
             AnimatedVisibility(fz.keyboardVisible, enter = expandEnter(), exit = expandExit()) {
                 Column(Modifier.padding(top = 8.dp)) {
                     BuiltInKeyboard(
-                        value = activeTf,
+                        value = deltaTf,
                         onValueChange = ::onActiveChange,
                         onHistory = { Session.openSheet(Sheet.HISTORY) },
                         onDismiss = { Session.updateFuzzy { it.copy(keyboardVisible = false) } }
@@ -1770,10 +1719,10 @@ private fun FuzzyOptionButton(
 fun MaskSearchSheet(ui: Ui) {
     var addrTf by remember {
         val init = ui.search.text.ifEmpty { "79F165B???" }
-        mutableStateOf(TextFieldValue(init, TextRange(init.length)))
+        mutableStateOf(TextFieldValue(init, TextRange(0, init.length)))
     }
     var maskTf by remember {
-        mutableStateOf(TextFieldValue(ui.search.mask, TextRange(ui.search.mask.length)))
+        mutableStateOf(TextFieldValue(ui.search.mask, TextRange(0, ui.search.mask.length)))
     }
     var focusMask by remember { mutableStateOf(false) }
     var showKeyboard by remember { mutableStateOf(true) }
@@ -1810,11 +1759,26 @@ fun MaskSearchSheet(ui: Ui) {
                         addrTf = it
                         Session.updateSearch { s -> s.copy(text = it.text) }
                     },
+                    onFocus = { focusMask = false },
                     modifier = Modifier.weight(1f).height(36.dp),
                     textStyle = monoStyle(15, Rose.Text),
                     cursorColor = Rose.Primary,
                     suppressSystemKeyboard = showKeyboard
                 )
+                Spacer(Modifier.width(4.dp))
+                Box(
+                    Modifier
+                        .size(34.dp)
+                        .clickableWithTooltip { showKeyboard = !showKeyboard },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Rounded.Keyboard,
+                        contentDescription = "内置键盘",
+                        tint = if (showKeyboard) Rose.Primary else Rose.TextSecond,
+                        modifier = Modifier.size(19.dp)
+                    )
+                }
             }
             Spacer(Modifier.height(8.dp))
             Row(
@@ -1881,11 +1845,11 @@ fun PointerSearchSheet(ui: Ui) {
         ?: ui.editing?.cachedAddressHex
         ?: ui.search.text.ifEmpty { "79F165BD8C" }
     var addrTf by remember {
-        mutableStateOf(TextFieldValue(defaultAddr, TextRange(defaultAddr.length)))
+        mutableStateOf(TextFieldValue(defaultAddr, TextRange(0, defaultAddr.length)))
     }
     var offsetTf by remember {
         val offInit = ui.search.offset.ifEmpty { "200" }
-        mutableStateOf(TextFieldValue(offInit, TextRange(offInit.length)))
+        mutableStateOf(TextFieldValue(offInit, TextRange(0, offInit.length)))
     }
     var focusOffset by remember { mutableStateOf(false) }
     var showKeyboard by remember { mutableStateOf(true) }

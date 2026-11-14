@@ -58,12 +58,18 @@ import com.littlecodesauce.ggnext.ui.theme.Rose
 
 @Composable
 fun ProcessSheet(ui: Ui) {
+    val ctx = LocalContext.current
+    androidx.compose.runtime.LaunchedEffect(ui.workMode, ui.hasRootPermission) {
+        (ctx.applicationContext as? android.app.Application)?.let { app ->
+            Session.loadProcesses(app)
+        }
+    }
     var query by remember { mutableStateOf(TextFieldValue("")) }
     val list = remember(ui.processes, ui.processFilter, query.text) {
         val base = when (ui.processFilter) {
             1 -> ui.processes.filter { !it.system }
             2 -> ui.processes.filter { it.system }
-            3 -> ui.processes.sortedBy { it.pid }
+            3 -> ui.processes.sortedWith(compareBy<TargetProcess> { it.system }.thenBy { it.pid })
             4 -> ui.processes.sortedByDescending { it.sizeBytes }
             else -> ui.processes
         }
@@ -103,7 +109,7 @@ fun ProcessSheet(ui: Ui) {
                 )
             }
             FilterChipRow(
-                items = listOf("全部", "应用", "系统", "优先级", "大小"),
+                items = listOf("全部", "用户", "系统", "优先级", "大小"),
                 selected = ui.processFilter,
                 onSelect = Session::setProcessFilter
             )

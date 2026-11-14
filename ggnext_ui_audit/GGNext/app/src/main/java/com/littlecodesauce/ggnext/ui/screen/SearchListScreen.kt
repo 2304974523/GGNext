@@ -81,11 +81,13 @@ fun SearchListScreen(ui: Ui) {
 @Composable
 fun AddressRow(item: MemoryItem, mask: Int, index: Int) {
     val currentItem by rememberUpdatedState(item)
+    val bgOpacity = com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics.current.bgOpacity.coerceIn(0.25f, 1.0f)
     val accent = remember(item.flags) { typeColor(item.flags) }
     val regColor = remember(item.region) { regionColor(item.region) }
     val shortType = remember(item.flags) { ValueType.shortName(item.flags) }
     val bg by animateColorAsState(
-        if (item.checked) Rose.Primary.copy(alpha = if (Rose.IsDark) 0.18f else 0.22f) else Rose.Row,
+        if (item.checked) Rose.Primary.copy(alpha = if (Rose.IsDark) 0.18f else 0.22f)
+        else Rose.Row.copy(alpha = (bgOpacity * 0.88f).coerceIn(0.18f, 1.0f)),
         Motion.ColorFast,
         label = "rowBg"
     )
@@ -109,7 +111,7 @@ fun AddressRow(item: MemoryItem, mask: Int, index: Int) {
                 accentColor = Rose.Primary
             )
             Spacer(Modifier.width(10.dp))
-            Text(item.cachedAddressHex, style = monoStyle(14, Rose.TextSecond))
+            Text(item.cachedAddressHex, style = monoStyle(14, Rose.Primary))
             Spacer(Modifier.width(12.dp))
             Box(
                 Modifier

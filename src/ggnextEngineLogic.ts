@@ -649,4 +649,211 @@ val rc = NativeMemBridge.nativeAttach(handle, targetPid)
     afterCode: `fontSize = ((if (label.length >= 2) 13.5f else 15.5f) * LocalUiMetrics.current.fontScale).sp
 // FileSheet 对接 Session.saveOrLoadListFile(tf.text)，LanguageSheet 补齐繁體中文选项`,
   },
+  {
+    id: 'BUG-15',
+    severity: 'CRITICAL',
+    category: 'ENGINE_CORE',
+    file: 'engine/RootMemDaemon.kt & cpp/src/root_helper_main.cpp',
+    lines: 'RootMemDaemon.kt:1-215 & root_helper_main.cpp:1-410',
+    title: 'Root 模式下普通权限 JNI 进程直接调用 process_vm_readv / open("/proc/pid/mem") 被内核 EACCES 拒绝并回退假演示数据',
+    symptom: '即使授予了 Root 权限，切换不同应用后内存区域大小完全一致、搜索结果完全相同；取消 Root 授权后依然存在相同假数据。',
+    rootCause: 'App 自身的 JVM/JNI 进程运行在普通 u0_aXXX 沙箱下，内核 ptrace_may_access 会拒绝跨 UID 的 process_vm_readv 与 open("/proc/pid/mem")（即使 su chmod 666 也无法绕过 open 时的 cred 校验），导致旧版 attach() 失败后静默进入 simulated = true 假数据模式。',
+    beforeCode: `// 旧版尝试用 su chmod 666 /proc/<pid>/mem 后在普通 UID JNI 线程中打开
+Shell.su("chmod 666 /proc/$pid/mem")
+val rc = NativeMemBridge.nativeAttach(nativeHandle, pid) // EACCES 失败 -> simulated = true!`,
+    afterCode: `// 新增 C++20 PIE 守护进程可执行文件 libmem_engine_root.so，在持久 su (uid=0) 进程内直接运行
+// RootMemDaemon 通过标准输入输出管道发送 ATTACH / REGIONS / SEARCH_EXACT / READ / WRITE 指令
+// 彻底删除 WorkMode.DEMO、simulated、simCells、simRegions、demoSizes 等一切演示代码`,
+  },
+  {
+    id: 'BUG-16',
+    severity: 'CRITICAL',
+    category: 'ENGINE_CORE',
+    file: 'data/ProcessScanner.kt & ui/sheet/ProcessSheet.kt',
+    lines: 'ProcessScanner.kt:45-195 & ProcessSheet.kt:85-120',
+    title: '进程列表“应用/用户”与“系统”分类颠倒且混入大量 Linux/HAL 原生守护进程 (media.codec / android.hardware.* / vendor.qti.*)',
+    symptom: '点击“应用”或“系统”时，列表出现大量 media.codec、android.hardware、media.metrics、vendor.qti.hardwa 等 Linux 底层服务（且包名被截断为 27 字符），真正的应用反而被错误筛选。',
+    rootCause: '1) ps -A -o PID,RSS,ARGS 未加 -w 宽输出参数导致 toybox 截断包名；2) Linux HAL 守护进程包含点号但无 APK，pm.getApplicationInfo 抛异常返回 null，导致 val system = info != null && (info.flags and FLAG_SYSTEM) != 0 计算为 false，所有 Linux 守护进程全被当成“用户应用”！',
+    beforeCode: `val info = runCatching { pm.getApplicationInfo(basePkg, 0) }.getOrNull()
+// 当 media.codec / vendor.qti.* 无 APK 时 info == null，system 被算成 false（用户应用）！
+val system = info != null && ((info.flags and ApplicationInfo.FLAG_SYSTEM) != 0)`,
+    afterCode: `// 1. 使用 ps -A -w -o UID,PID,PPID,RSS,ARGS 禁用列宽截断 + 结合 PackageManager 已安装 APK 映射表
+// 2. 强制剔除 android.hardware.* / vendor.* / media.* 及所有无 ApplicationInfo 的原生守护进程
+// 3. 将 ProcessSheet 筛选按钮由“应用”更新为“用户”，精确区分用户安装应用与系统应用`,
+  },
+  {
+    id: 'BUG-17',
+    severity: 'HIGH',
+    category: 'ENGINE_CORE',
+    file: 'core/Session.kt & engine/MemoryEngine.kt',
+    lines: 'Session.kt:340-395 & MemoryEngine.kt:40-180',
+    title: 'Session.aggregate() 硬编码 demoSizes 导致所有进程内存区域大小恒定不变',
+    symptom: '无论附加到哪个进程（甚至未授权 Root 时），内存范围弹窗中 Jh 恒为 1.18GB、Ca 恒为 34MB、Xa 恒为 49.2MB。',
+    rootCause: 'Session.aggregate() 在 regions 为空时回退读取硬编码的 demoSizes 与 demoCounts 表。',
+    beforeCode: `val size = if (regs.isEmpty()) demoSizes[meta.code] ?: 0L else regs.sumOf { it.size }`,
+    afterCode: `// 彻底删除 demoSizes / demoCounts / demoCuratedProcesses / defaultModules
+// 完全根据当前已附加进程的真实 /proc/<pid>/maps VMA 列表实时聚合大小与段数`,
+  },
+  {
+    id: 'BUG-18',
+    severity: 'MEDIUM',
+    category: 'UI_INTERACTION',
+    file: 'ui/screen/SettingsScreen.kt & model/Settings.kt',
+    lines: 'SettingsScreen.kt:30-165 & Settings.kt:1-55',
+    title: '设置页包含多处未实现空壳开关 & 冻结间隔微秒/毫秒单位混用 Bug',
+    symptom: '设置页中“对游戏隐藏 GG”、“用于 ptrace 保护的旁路模式”、“反汇编/汇编引擎”、“跳过内存区域”、“快速冻结”等选项仅有 UI 无实际底层逻辑；且默认 freeze_interval = 33000 在 Session 中被 clamp 到 2000ms。',
+    rootCause: 'UI 原型阶段预留了未实现的防检测与反汇编占位项；freeze_interval 默认值按微秒 (33000) 填写却按毫秒读取。',
+    beforeCode: `// 包含“游戏保护设置”及未实现的“切换汇编引擎/跳过内存区域/快速冻结”等占位项
+"freeze_interval" to "33000" // 被 coerceIn(5L, 2000L) 错误截断为 2000ms`,
+    afterCode: `// 彻底移除所有未实现的设置项，仅保留已对接底层的真实设置（工作模式、自动暂停进程、冻结间隔等）
+// 统一 freeze_interval 默认值为 33ms 并自动兼容微秒输入转换`,
+  },
+  {
+    id: 'BUG-19',
+    severity: 'CRITICAL',
+    category: 'ENGINE_CORE',
+    file: 'cpp/MemEngine.cpp & engine/MemoryEngine.kt',
+    lines: 'MemEngine.cpp:128-315 & MemoryEngine.kt:540-620',
+    title: '内存区域划分与原版 GG 存在差异：Jh/J 混同、As 暴增至 128MB、Xa/Xs 混淆、B 与 O 颠倒 (3.5GB vs 151MB)',
+    symptom: '对比原版 GG：1) 部分 Java 内存被误判为 Jh；2) 原版 GG 的 As 仅 12KB 而 GGNext 识别出 128MB；3) Xa 与 Xs 各识别约 80MB（原版 Xa 16MB / Xs 151MB）；4) Bad (B) 与 Other (O) 颠倒（GGNext 将 3.5GB 归入 B，O 仅 151MB）。',
+    rootCause: '1) 旧逻辑未区分 ART 对象分配堆与内部元数据（bitmap/LinearAlloc/mark-stack/zygote space）；2) strncmp(p, "/memfd:", 7) 与 strstr(p, "ashmem") 将 128MB 的 Dalvik/JIT memfd 全部误判为 As；3) Dalvik/Anon 判断先于 executable (--xp) 判断，将系统 boot.oat 与应用 .odex 混淆；4) 将 !vma.isReadable() (---p 虚拟地址空间保护页，约 3.5GB~3.9GB) 归入了 B 而非 O。',
+    beforeCode: `if (!vma.isReadable()) return RegionFlag::B; // 3.5GB ---p 保护页被归入 B!
+if (strstr(p, "ashmem") || strncmp(p, "/memfd:", 7) == 0) return RegionFlag::AS; // 128MB memfd 误入 As!`,
+    afterCode: `// 1. B 仅匹配字体 (.ttf/.otf/.ttc)、ICU (icudt*.dat)、Binder/设备节点与 [vvar]/[vectors] (~137MB)
+// 2. 不可读 ---p 虚拟保留页全部归入 O (~3.9GB)
+// 3. 优先判定 executable (--xp)：/data/app|/data/user 归入 Xa，/system|/apex|/vendor|/memfd:jit-cache 归入 Xs
+// 4. Jh 仅匹配可写 main/alloc/region/large object space；LinearAlloc/bitmap/mark-stack/zygote/.art/.vdex 归入 J
+// 5. As 严格限定为非 Dalvik 的 /dev/ashmem*、[anon:ashmem*、/memfd:ashmem*`,
+  },
+  {
+    id: 'BUG-20',
+    severity: 'CRITICAL',
+    category: 'ENGINE_CORE',
+    file: 'cpp/MemEngine.cpp & cpp/RootDaemonMain.cpp',
+    lines: 'MemEngine.cpp:740-965 & RootDaemonMain.cpp:140-260',
+    title: '模糊搜索无法使用 & 搜索低熵数值 (0 或 1) 时无响应、后台内存暴涨导致系统卡顿',
+    symptom: '1) 模糊搜索点击后完全无法正常初筛和改善；2) 搜索 0 或 1 时点击“新搜索”界面无变化，随后后台占用剧增、其他应用出现严重卡顿。',
+    rootCause: '1) startUnknownSnapshot 对每个 4KB 页分配独立 std::vector<uint8_t> 并单线程逐条写入 CandidateStore，百万级候选导致海量小对象分配与锁竞争；2) 搜索 0 或 1 时命中数千万个地址，旧版无流式进度回调且一次性分配超大 vector 回传导致 IPC 阻塞与内存峰值暴涨。',
+    beforeCode: `// 单线程逐页分配 std::vector<uint8_t>，且将数千万个 0/1 命中全部塞入候选列表无流式节流`,
+    afterCode: `// 1. 重构 UnknownPageBlock 紧凑页快照 + ThreadPool 多线程 1MB 块并行扫描与筛选
+// 2. 守护进程新增 STATUS_PROGRESS (0x50475253) 实时流式推送进度、命中数与剩余时间 (ETA)
+// 3. 完整保留底层候选池与真实总命中数 totalFound，UI 层按 maxShow 切片展示而不丢弃底层候选`,
+  },
+  {
+    id: 'BUG-21',
+    severity: 'HIGH',
+    category: 'UI_INTERACTION',
+    file: 'core/Session.kt, ui/components/Bars.kt & ui/screen/*.kt',
+    lines: 'Session.kt:380-465 & Bars.kt:70-195 & SearchListScreen.kt:95-190',
+    title: '列表数值不实时刷新、显示上限丢弃后续结果、未勾选行透明度失效、地址颜色与输入体验等 9 项 UI 缺陷 (3.1–3.9)',
+    symptom: '3.1 列表数据不实时更新且点击刷新无效；3.2 输入框未自动全选；3.3 未勾选列表项与设置卡片背景 100% 不透明；3.4 超过显示上限的数据被永久丢弃且按钮未显示 (显示数/总数)；3.5 地址字符为灰黑色而非主题色；3.6 缺少长按全选/复制/粘贴菜单；3.7 蒙版搜索缺键盘按钮；3.8 模糊搜索多余“只有第N个结果”；3.9 导航栏/工具栏回弹生硬。',
+    rootCause: '缺少 CMD_BATCH_READ 批量实时重读循环；SearchResult 直接 take(maxShow) 覆盖了 rawResults；Rose.Row 未乘 bgOpacity；Motion 使用了 DampingRatioLowBouncy (0.68f) 导致过冲回弹。',
+    beforeCode: `val countButtonText = "(\${results.size})" // 丢弃了超出 maxShow 的结果
+val Fast = spring(dampingRatio = 0.68f) // 过冲回弹似撞墙`,
+    afterCode: `// 3.1 新增 CMD_BATCH_READ 批量读取 + 900ms 实时刷新循环 + 顶栏刷新按钮立即重读内存
+// 3.2 & 3.6 全弹窗输入框默认全选 (TextRange(0, len)) + 长按弹出「全选/复制/粘贴/剪切/清空」菜单
+// 3.3 & 3.5 未勾选行与设置卡片乘算 bgOpacity，搜索/保存/内存列表地址统一为 Rose.Primary 主题色
+// 3.4 & Other 2 保留全部搜索结果并显示 (20/1234)，进程栏下方新增非阻塞实时搜索进度条
+// 3.7–3.9 蒙版搜索补齐键盘按钮、移除模糊搜索“只有第N个结果”、采用 DampingRatioNoBouncy 丝滑动画`,
+  },
 ];
+
+export interface ProcessClassificationResult {
+  accepted: boolean;
+  basePkg: string;
+  category: 'USER' | 'SYSTEM' | 'REJECTED_DAEMON';
+  reason: string;
+}
+
+const NATIVE_DAEMON_PREFIXES = [
+  'android.hardware.',
+  'android.hidl.',
+  'android.system.',
+  'vendor.',
+  'media.',
+  'init',
+  'kthreadd',
+  'kworker',
+  'ksoftirqd',
+  'rcu_',
+  'surfaceflinger',
+  'servicemanager',
+  'hwservicemanager',
+  'vndservicemanager',
+  'vold',
+  'netd',
+  'zygote',
+  'zygote64',
+  'webview_zygote',
+  'logd',
+  'lmkd',
+  'statsd',
+  'installd',
+  'storaged',
+  'audioserver',
+  'cameraserver',
+  'mediaserver',
+  'drmserver',
+  'keystore2',
+  'gatekeeperd',
+  'tombstoned',
+  'traced',
+  'heapprofd',
+];
+
+export function classifyAndroidProcessCandidate(
+  rawCmdline: string,
+  uid: number,
+  hasInstalledApk: boolean,
+  isSystemFlag: boolean,
+  isUpdatedSystemFlag: boolean
+): ProcessClassificationResult {
+  const token = rawCmdline.trim().split(/\s+/)[0] ?? '';
+  if (!token || token.startsWith('[') || token.startsWith('/')) {
+    return { accepted: false, basePkg: '', category: 'REJECTED_DAEMON', reason: 'kernel thread or absolute binary path' };
+  }
+  const basePkg = token.split(':')[0].trim();
+  if (!basePkg.includes('.')) {
+    return { accepted: false, basePkg, category: 'REJECTED_DAEMON', reason: 'not a valid Java package name' };
+  }
+  const lower = basePkg.toLowerCase();
+  for (const prefix of NATIVE_DAEMON_PREFIXES) {
+    if (lower === prefix || lower.startsWith(prefix)) {
+      return { accepted: false, basePkg, category: 'REJECTED_DAEMON', reason: `native HAL/system daemon (${prefix})` };
+    }
+  }
+  if (!/^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$/.test(basePkg)) {
+    return { accepted: false, basePkg, category: 'REJECTED_DAEMON', reason: 'malformed package identifier' };
+  }
+  const appId = uid >= 0 ? uid % 100000 : -1;
+  const isRegularAppUid = appId >= 10000 && appId <= 19999;
+
+  if (!hasInstalledApk && !isRegularAppUid) {
+    return { accepted: false, basePkg, category: 'REJECTED_DAEMON', reason: 'native daemon UID without installed APK' };
+  }
+
+  if (hasInstalledApk) {
+    const isSystemApp = isSystemFlag && !isUpdatedSystemFlag;
+    return {
+      accepted: true,
+      basePkg,
+      category: isSystemApp ? 'SYSTEM' : 'USER',
+      reason: isSystemApp ? 'installed system package' : 'installed user package',
+    };
+  }
+
+  const isSystemPrefix =
+    basePkg.startsWith('com.android.') ||
+    basePkg.startsWith('android.') ||
+    basePkg.startsWith('com.google.android.ext.') ||
+    basePkg.startsWith('com.qualcomm.') ||
+    basePkg === 'system';
+
+  return {
+    accepted: true,
+    basePkg,
+    category: isSystemPrefix ? 'SYSTEM' : 'USER',
+    reason: isSystemPrefix ? 'fallback system app UID' : 'fallback user app UID (10000..19999)',
+  };
+}
+

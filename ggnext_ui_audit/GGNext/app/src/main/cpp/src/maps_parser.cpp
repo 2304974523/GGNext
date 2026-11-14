@@ -36,161 +36,188 @@ inline std::string stripDeleted(const std::string& raw) {
 } // anonymous namespace
 
 uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFileBackedPath) {
-    // 1. Unreadable or guard pages (---p) -> B (Bad)
-    if (!vma.readable || vma.length == 0) {
+    if (vma.length == 0) {
         return RegionFlag::B;
     }
 
     const std::string path = stripDeleted(vma.pathname);
 
-    // 2. PPSSPP Emulator Regions (Ps)
-    if (containsStr(path, "ppsspp") || containsStr(path, "PPSSPP") ||
+    // 1. PPSSPP Emulator Regions (Ps)
+    if (vma.readable && (containsStr(path, "ppsspp") || containsStr(path, "PPSSPP") ||
         containsStr(path, "psp_ram") || containsStr(path, "psp_vram") ||
-        startsWith(path, "/dev/shm/ppsspp")) {
+        startsWith(path, "/dev/shm/ppsspp"))) {
         return RegionFlag::PS;
     }
 
-    // 3. Bad / Guard / Font / Non-Memory Device Nodes (B)
-    if (endsWith(path, ".ttf") || endsWith(path, ".otf") || endsWith(path, ".ttc") ||
-        containsStr(path, "/system/fonts/") ||
-        path == "[vvar]" || path == "[vectors]" || path == "[sigpage]" || path == "[uprobes]" ||
+    // 2. Bad (B): Fonts, ICU/Hyphenation Data (~137 MB), Kernel Trap Pages, Binder & Special Device Nodes
+    // Checked BEFORE !vma.readable so ---p guard/reservation mappings (3.5+ GB) fall into O (Other) just like original GG,
+    // while genuine Bad mappings are tagged B (~137 MB). Both B and !vma.readable are skipped during scanning via isScanSafe().
+    if (endsWith(path, ".ttf") || endsWith(path, ".otf") || endsWith(path, ".ttc") || endsWith(path, ".woff") ||
+        containsStr(path, "/system/fonts/") || containsStr(path, "/product/fonts/") || containsStr(path, "/vendor/fonts/") ||
+        startsWith(path, "/system/usr/icu/") || startsWith(path, "/apex/com.android.i18n/etc/icu/") ||
+        (containsStr(path, "/icu/") && endsWith(path, ".dat")) ||
+        startsWith(path, "/system/usr/hyphen-data/") || endsWith(path, ".hyb") ||
+        path == "[vvar]" || path == "[vectors]" || path == "[sigpage]" || path == "[uprobes]" || path == "[kuserhelpers]" ||
         startsWith(path, "/dev/binder") || startsWith(path, "/dev/hwbinder") ||
-        startsWith(path, "/dev/vndbinder") || startsWith(path, "/dev/null") ||
-        startsWith(path, "/dev/zero") || startsWith(path, "/dev/urandom") ||
-        startsWith(path, "/dev/random") || startsWith(path, "/dev/cpuctl") ||
-        startsWith(path, "/dev/cpuset") || startsWith(path, "/dev/stune") ||
-        startsWith(path, "/dev/blkio") || startsWith(path, "/dev/__properties__") ||
-        startsWith(path, "/dev/event-log-tags") ||
-        startsWith(path, "[anon:GWP-ASan Guard") || containsStr(path, "guard")) {
+        startsWith(path, "/dev/vndbinder") || startsWith(path, "/dev/__properties__") ||
+        startsWith(path, "/dev/event-log-tags") || startsWith(path, "/dev/pmsg") ||
+        startsWith(path, "/dev/kmsg") || startsWith(path, "/dev/null") ||
+        startsWith(path, "/dev/urandom") || startsWith(path, "/dev/random") ||
+        startsWith(path, "/dev/cpuctl") || startsWith(path, "/dev/cpuset") ||
+        startsWith(path, "/dev/stune") || startsWith(path, "/dev/blkio") ||
+        startsWith(path, "[anon:GWP-ASan Guard") || startsWith(path, "[anon:guard")) {
         return RegionFlag::B;
     }
 
-    // 4. Video / GPU / DMA-BUF / ION / KGSL (V)
+    // 3. Unreadable / PROT_NONE virtual address reservations (---p) -> O (Other)
+    // Original GG counts ---p reservations in O (~3.9 GB), while VmaRegion::isScanSafe() skips !readable pages.
+    if (!vma.readable) {
+        return RegionFlag::O;
+    }
+
+    // 4. Video / GPU / DMA-BUF / ION / KGSL / Gralloc (V)
     if (startsWith(path, "/dev/kgsl") || containsStr(path, "kgsl-3d0") ||
         startsWith(path, "/dev/mali") || startsWith(path, "/dev/ion") ||
         startsWith(path, "/dev/dma_heap") || startsWith(path, "/dev/dri/") ||
         startsWith(path, "/dev/nvidia") || startsWith(path, "/dev/pvrsrvkm") ||
         startsWith(path, "/dev/galcore") || containsStr(path, "gralloc") ||
-        startsWith(path, "/dmabuf:")) {
+        startsWith(path, "/dmabuf:") || startsWith(path, "[anon:dmabuf")) {
         return RegionFlag::V;
     }
 
-    // 5. Stack (S)
-    if (path == "[stack]" || startsWith(path, "[stack:") || startsWith(path, "[anon:stack_and_tls")) {
+    // 5. Executable Code Regions: App Code (Xa) vs System Code (Xs)
+    // Original GG strictly separates app binaries (/data/app, /data/user, app dalvik-cache) into Xa (~16 MB)
+    // and all system/APEX/vendor libraries, boot/system dalvik-cache, [vdso], and ART JIT code-cache into Xs (~151 MB).
+    if (vma.executable) {
+        if (path == "[vdso]" || path == "[vsyscall]" ||
+            startsWith(path, "/memfd:jit-") ||
+            containsStr(path, "jit-code-cache") ||
+            containsStr(path, "jit-zygote-cache")) {
+            return RegionFlag::XS;
+        }
+        if (startsWith(path, "/data/dalvik-cache/")) {
+            if (containsStr(path, "data@app@") || containsStr(path, "mnt@expand@") || containsStr(path, "data@data@")) {
+                return RegionFlag::XA;
+            }
+            return RegionFlag::XS;
+        }
+        bool isAppExec = startsWith(path, "/data/app/") ||
+                         startsWith(path, "/data/data/") ||
+                         startsWith(path, "/data/user/") ||
+                         startsWith(path, "/data/user_de/") ||
+                         startsWith(path, "/mnt/asec/") ||
+                         startsWith(path, "/mnt/expand/") ||
+                         startsWith(path, "/sdcard/") ||
+                         startsWith(path, "/storage/") ||
+                         (path.empty() && vma.writable && vma.isPrivate);
+        return isAppExec ? RegionFlag::XA : RegionFlag::XS;
+    }
+
+    // 6. Stack (S)
+    if (path == "[stack]" || startsWith(path, "[stack:") ||
+        startsWith(path, "[anon:stack_and_tls") || startsWith(path, "[anon:thread signal stack")) {
         return RegionFlag::S;
     }
 
-    // 6. Native C/C++ Heap (Ch)
-    if (path == "[heap]" || startsWith(path, "[heap:")) {
+    // 7. Native C/C++ Heap (Ch)
+    if (path == "[heap]" || startsWith(path, "[heap:") || startsWith(path, "[anon:heap")) {
         return RegionFlag::CH;
     }
 
-    // 7. Java Heap (Jh) vs Java Runtime Structures (J)
+    // 8. Java Heap (Jh) vs Java Runtime Structures (J)
+    // Non-executable /memfd:jit-cache and /memfd:jit-zygote-cache belong to J (NOT As!).
+    if (startsWith(path, "/memfd:jit-")) {
+        return RegionFlag::J;
+    }
     if (containsStr(path, "dalvik-") || startsWith(path, "[anon:dalvik-") ||
-        startsWith(path, "/dev/ashmem/dalvik-") ||
+        startsWith(path, "/dev/ashmem/dalvik-") || startsWith(path, "/memfd:dalvik-") ||
         startsWith(path, "[anon:art_") ||
-        path == "[anon:main space]" || path == "[anon:alloc space]" ||
-        path == "[anon:region space]" || path == "[anon:large object space]" ||
-        path == "[anon:non moving space]" || startsWith(path, "[anon:zygote")) {
-        if (vma.executable) {
-            return RegionFlag::XA; // ART JIT Code Cache
-        }
-        bool isPrimaryJavaHeap =
+        containsStr(path, "main space") || containsStr(path, "alloc space") ||
+        containsStr(path, "region space") || containsStr(path, "large object space") ||
+        containsStr(path, "non moving space") || containsStr(path, "zygote space") ||
+        containsStr(path, "bump-pointer space") || containsStr(path, "rosalloc space") ||
+        containsStr(path, "dlmalloc space") || containsStr(path, "free list large") ||
+        containsStr(path, "image space")) {
+        bool isDalvikInternalMeta =
+            containsStr(path, "bitmap") ||
+            containsStr(path, "mark-stack") ||
+            containsStr(path, "allocation-stack") ||
+            containsStr(path, "live-stack") ||
+            containsStr(path, "card-table") ||
+            containsStr(path, "card table") ||
+            containsStr(path, "mod-union") ||
+            containsStr(path, "LinearAlloc") ||
+            containsStr(path, "indirect-ref") ||
+            containsStr(path, "reference table") ||
+            containsStr(path, "aux-structure") ||
+            containsStr(path, "CompilerMetadata") ||
+            containsStr(path, "jit") ||
+            containsStr(path, "zygote") ||
+            containsStr(path, "non moving") ||
+            containsStr(path, "image space") ||
+            containsStr(path, "intern table") ||
+            containsStr(path, "class table");
+
+        bool isJavaObjectAllocHeap =
             containsStr(path, "main space") ||
             containsStr(path, "alloc space") ||
             containsStr(path, "region space") ||
             containsStr(path, "large object") ||
-            containsStr(path, "non moving space") ||
-            containsStr(path, "zygote space") ||
-            containsStr(path, "free list large");
-        if (vma.writable && isPrimaryJavaHeap) {
+            containsStr(path, "bump-pointer") ||
+            containsStr(path, "rosalloc") ||
+            containsStr(path, "dlmalloc") ||
+            containsStr(path, "free list");
+
+        if (vma.writable && isJavaObjectAllocHeap && !isDalvikInternalMeta) {
             return RegionFlag::JH;
         }
         return RegionFlag::J;
     }
-    if (endsWith(path, ".vdex") || endsWith(path, ".dex") || containsStr(path, "classes.dex")) {
+    if (endsWith(path, ".art") || endsWith(path, ".vdex") || endsWith(path, ".dex") || containsStr(path, "classes.dex")) {
         return RegionFlag::J;
     }
 
-    // 8. C++ Allocator (Ca): Bionic libc_malloc, Scudo, Jemalloc, GWP-ASan
+    // 9. C++ Allocator (Ca): Bionic libc_malloc, Scudo, Jemalloc, GWP-ASan
     if (startsWith(path, "[anon:libc_malloc") ||
         startsWith(path, "[anon:scudo:") ||
         startsWith(path, "[anon:jemalloc") ||
         startsWith(path, "[anon:GWP-ASan") ||
         startsWith(path, "[anon:malloc") ||
-        startsWith(path, "[anon:bionic_alloc")) {
+        startsWith(path, "[anon:bionic_alloc") ||
+        startsWith(path, "[anon:mtk_malloc")) {
         return RegionFlag::CA;
     }
 
-    // 9. C++ .bss Segment (Cb)
-    if (path == "[anon:.bss]" || startsWith(path, "[anon:bss")) {
+    // 10. C++ .bss Segment (Cb)
+    if (path == "[anon:.bss]" || startsWith(path, "[anon:.bss") || startsWith(path, "[anon:bss")) {
         return RegionFlag::CB;
     }
-    // Note: On older kernels or specific linkers, a .so's .bss segment is an unnamed anonymous
-    // rw-p VMA immediately following the .so's rw-p .data VMA.
     if (path.empty() && vma.writable && !vma.executable && vma.isPrivate && !prevFileBackedPath.empty()) {
         if (endsWith(prevFileBackedPath, ".so") || containsStr(prevFileBackedPath, ".so!")) {
             return RegionFlag::CB;
         }
     }
 
-    // 10. Ashmem & Memfd Shared Memory (As)
-    if (startsWith(path, "/dev/ashmem") || startsWith(path, "[anon:ashmem") ||
-        startsWith(path, "/memfd:")) {
-        if (vma.executable) {
-            return RegionFlag::XA; // JIT cache in memfd
-        }
+    // 11. C++ .data Segment (Cd): Writable private segment of an ELF shared library (.so / .oat / .odex)
+    if (vma.writable && vma.isPrivate &&
+        (endsWith(path, ".so") || containsStr(path, ".so!") || endsWith(path, ".oat") || endsWith(path, ".odex"))) {
+        return RegionFlag::CD;
+    }
+
+    // 12. Ashmem Shared Memory (As)
+    // Strictly genuine Ashmem (/dev/ashmem excluding dalvik/jit/gralloc, [anon:ashmem, /memfd:ashmem).
+    if ((startsWith(path, "/dev/ashmem") && !containsStr(path, "dalvik") &&
+         !containsStr(path, "jit") && !containsStr(path, "gralloc") && !containsStr(path, "GFX")) ||
+        startsWith(path, "[anon:ashmem") || startsWith(path, "/memfd:ashmem")) {
         return RegionFlag::AS;
     }
 
-    // 11. Pure Anonymous Memory (A) or Anonymous Executable JIT (Xa)
+    // 13. Pure Anonymous Memory (A)
     if (path.empty() || startsWith(path, "[anon:")) {
-        if (vma.executable) {
-            return RegionFlag::XA;
-        }
-        if (vma.writable) {
+        if (vma.writable && vma.isPrivate) {
             return RegionFlag::A;
         }
         return RegionFlag::O;
-    }
-
-    // 12. System Special Executable ([vdso], [vsyscall]) -> Xs
-    if (path == "[vdso]" || path == "[vsyscall]") {
-        return RegionFlag::XS;
-    }
-
-    // 13. File-Backed Mappings (System vs App Code & Data)
-    bool isSystemPath = startsWith(path, "/system/") ||
-                        startsWith(path, "/apex/") ||
-                        startsWith(path, "/vendor/") ||
-                        startsWith(path, "/product/") ||
-                        startsWith(path, "/system_ext/") ||
-                        startsWith(path, "/odm/") ||
-                        startsWith(path, "/usr/lib") ||
-                        startsWith(path, "/lib/");
-
-    bool isAppPath = startsWith(path, "/data/app/") ||
-                     startsWith(path, "/data/data/") ||
-                     startsWith(path, "/data/user/") ||
-                     startsWith(path, "/data/user_de/") ||
-                     startsWith(path, "/mnt/expand/");
-
-    bool isSharedLibOrExec = endsWith(path, ".so") || containsStr(path, ".so!") ||
-                             endsWith(path, ".oat") || endsWith(path, ".odex") ||
-                             vma.executable;
-
-    if (vma.executable) {
-        if (isSystemPath && !isAppPath) {
-            return RegionFlag::XS;
-        }
-        return RegionFlag::XA;
-    }
-
-    // Writable private file-backed segment of an ELF binary or .so/.art -> Cd (.data)
-    if (vma.writable && vma.isPrivate && (isSharedLibOrExec || isAppPath || isSystemPath || path[0] == '/')) {
-        if (endsWith(path, ".so") || containsStr(path, ".so") || endsWith(path, ".art") || vma.inode > 0) {
-            return RegionFlag::CD;
-        }
     }
 
     return RegionFlag::O;

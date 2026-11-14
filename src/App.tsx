@@ -24,20 +24,21 @@ import { GGNextWorkbench } from './GGNextWorkbench';
 type TabId = 'ggnext' | 'benchmarks' | 'audit' | 'architecture' | 'files';
 
 const VMA_CLASSIFICATION_RULES = [
-  { tag: 'Jh', flag: '1 << 0', name: 'Java / ART Heap', rule: '[anon:dalvik-*], [anon:main space], [anon:region space], [anon:large object space], [anon:zygote*]' },
-  { tag: 'Ch', flag: '1 << 1', name: 'C/C++ Native Heap', rule: '[heap], [heap:*] brk/sbrk segment' },
-  { tag: 'Ca', flag: '1 << 2', name: 'C++ Allocator', rule: '[anon:libc_malloc], [anon:scudo:*], [anon:jemalloc*], [anon:GWP-ASan*], [anon:bionic_alloc*]' },
-  { tag: 'Cd', flag: '1 << 3', name: 'C++ .data Segment', rule: 'rw-p private file-backed ELF / .so / .art data segment' },
-  { tag: 'Cb', flag: '1 << 4', name: 'C++ .bss Segment', rule: '[anon:.bss] or unnamed rw-p VMA immediately following a file-backed .so mapping' },
-  { tag: 'A',  flag: '1 << 5', name: 'Anonymous RW', rule: 'Unnamed rw-p mappings and generic [anon:*] regions' },
-  { tag: 'S',  flag: '1 << 6', name: 'Thread / Main Stack', rule: '[stack], [stack:tid], [anon:stack_and_tls:*]' },
-  { tag: 'As', flag: '1 << 7', name: 'Ashmem / Memfd', rule: '/dev/ashmem*, [anon:ashmem*], /memfd:* non-executable shared memory' },
-  { tag: 'Xa', flag: '1 << 8', name: 'Code App (r-xp)', rule: '/data/app/**.so, .odex, .oat, ART JIT cache, anonymous executable JIT pages' },
-  { tag: 'Xs', flag: '1 << 9', name: 'Code System (r-xp)', rule: '/system/**, /apex/**, /vendor/**, /product/**, [vdso], [vsyscall]' },
-  { tag: 'V',  flag: '1 << 10', name: 'Video / GPU / DMA', rule: '/dev/kgsl-3d0, /dev/mali*, /dev/ion, /dev/dma_heap/*, /dev/dri/*, /dmabuf:*' },
-  { tag: 'Ps', flag: '1 << 11', name: 'PPSSPP Emulator RAM', rule: '/dev/shm/ppsspp*, ppsspp_ram, psp_vram mappings' },
-  { tag: 'B',  flag: '1 << 12', name: 'Bad / Guard / Device', rule: 'PROT_NONE (---p), [anon:GWP-ASan Guard], .ttf/.otf/.ttc fonts, /dev/binder*, [vvar]' },
-  { tag: 'O',  flag: '1 << 13', name: 'Other Readable', rule: 'Read-only resource tables, .dex/.apk/.jar mapped data, ICU .dat files' }
+  { tag: 'Jh', flag: '1 << 0', name: 'Java Heap (Alloc)', rule: 'Writable ART object spaces ONLY: [anon:dalvik-main space], [anon:dalvik-alloc space], [anon:dalvik-region space], [anon:dalvik-large object space], rosalloc/dlmalloc' },
+  { tag: 'J',  flag: '1 << 14', name: 'Java Runtime / VM', rule: 'ART non-heap metadata & read-only spaces: LinearAlloc, mark-stack, live-stack, bitmap, card-table, zygote space, non moving space, .art, .dex, .vdex' },
+  { tag: 'Ch', flag: '1 << 1', name: 'C/C++ Native Heap', rule: '[heap], [anon:heap*], [anon:libc_malloc] brk/sbrk & legacy malloc segments' },
+  { tag: 'Ca', flag: '1 << 2', name: 'C++ Allocator', rule: '[anon:scudo:*], [anon:jemalloc*], [anon:GWP-ASan*], [anon:bionic_alloc*], writable /dev/zero' },
+  { tag: 'Cd', flag: '1 << 3', name: 'C++ .data Segment', rule: 'rw-p private file-backed ELF / .so / .odex / .oat data segment' },
+  { tag: 'Cb', flag: '1 << 4', name: 'C++ .bss Segment', rule: '[anon:.bss] or unnamed rw-p VMA immediately following a file-backed .so/.odex/.oat mapping' },
+  { tag: 'A',  flag: '1 << 5', name: 'Anonymous RW', rule: 'Unnamed rw-p mappings and generic writable [anon:*] regions' },
+  { tag: 'S',  flag: '1 << 6', name: 'Thread / Main Stack', rule: '[stack], [stack:tid], [anon:stack_and_tls:*], [anon:thread signal stack]' },
+  { tag: 'As', flag: '1 << 7', name: 'Ashmem Shared', rule: 'Strictly /dev/ashmem* (excluding dalvik/jit), [anon:ashmem*], /memfd:ashmem* (~12 KB–few MB, never generic memfd)' },
+  { tag: 'Xa', flag: '1 << 8', name: 'Code App (r-xp)', rule: 'Evaluated BEFORE Dalvik/Anon: executable (--xp) in /data/app/**, /data/user/**, /mnt/expand/**, user dalvik-cache, or rwxp JIT pages' },
+  { tag: 'Xs', flag: '1 << 9', name: 'Code System (r-xp)', rule: 'Evaluated BEFORE Dalvik/Anon: executable (--xp) in /system/**, /apex/**, /vendor/**, /memfd:jit-cache, [vdso]' },
+  { tag: 'V',  flag: '1 << 10', name: 'Video / GPU / DMA', rule: '/dev/kgsl-3d0, /dev/mali*, /dev/pvrsrvkm, /dev/nvmap, /dev/dri/*, gralloc, GFX' },
+  { tag: 'Ps', flag: '1 << 11', name: 'PPSSPP Emulator RAM', rule: 'PPSSPP / ppsspp shared memory and PSP VRAM mappings' },
+  { tag: 'B',  flag: '1 << 12', name: 'Bad (Fonts/ICU/Dev)', rule: '.ttf/.otf/.ttc/.woff fonts, /system/usr/icu/*, icudt*.dat, /dev/binder*, /dev/__properties__, [vvar], [vectors] (~137 MB)' },
+  { tag: 'O',  flag: '1 << 13', name: 'Other & Guard (---p)', rule: 'Unreadable PROT_NONE (---p) guard/reservation pages (~3.9 GB) + read-only .apk/.so/.dex resource mappings' }
 ];
 
 const NATIVE_SOURCE_MANIFEST = [

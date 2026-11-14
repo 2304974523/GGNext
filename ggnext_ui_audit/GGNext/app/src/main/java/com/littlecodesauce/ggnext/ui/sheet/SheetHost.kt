@@ -107,8 +107,8 @@ private const val CHANGELOG_TEXT = """GGNext v0.4 更新日志：
 
 private fun aboutText(ui: Ui): String = """GGNext  v0.4
 基于 GameGuardian 深度重制的现代化高性能内存调试工具
-技术栈：Kotlin 2.0 + Jetpack Compose + Material 3
+技术栈：Kotlin 2.0 + Jetpack Compose + C++20 MemEngine (NEON SIMD)
 
 当前目标进程：${ui.target?.label ?: "未选择"}
-工作模式：${if (ui.simulated) "沙盒模拟引擎（UI与检索完整可用）" else "Root 直读 /proc/<pid>/mem"}
+工作模式：${ui.workMode.title} (${if (ui.attachedOk) "已成功附加跨进程通道" else "未附加"})
 已选内存范围：${ui.selectedRegions.joinToString(", ")}"""

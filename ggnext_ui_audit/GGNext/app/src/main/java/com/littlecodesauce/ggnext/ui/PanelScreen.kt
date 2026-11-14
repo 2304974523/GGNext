@@ -206,12 +206,14 @@ fun PanelScreen(
                     onPick = { Session.openSheet(Sheet.PROCESS) },
                     onCountClick = { Session.openSheet(Sheet.FILTER) },
                     onRefresh = {
-                        refreshRequested = true
-                        Session.toast("已刷新列表")
+                        Session.refreshLiveValues(manual = true)
                     },
                     onPause = { Session.toggleProcessPause() }
                 )
                 Hairline()
+                AnimatedVisibility(visible = ui.busy) {
+                    com.littlecodesauce.ggnext.ui.components.InlineSearchProgressBar(ui = ui)
+                }
 
                 AnimatedContent(
                     targetState = ui.tab,

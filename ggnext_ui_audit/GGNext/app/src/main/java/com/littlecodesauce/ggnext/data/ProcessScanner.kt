@@ -4,319 +4,471 @@ import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.os.Process
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import com.littlecodesauce.ggnext.core.Session
 import com.littlecodesauce.ggnext.core.WorkMode
 import com.littlecodesauce.ggnext.engine.Shell
 import com.littlecodesauce.ggnext.model.TargetProcess
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 进程扫描器（已修复 TargetProcess 构造参数不匹配 Bug，并集成原生 /proc 实时无缓存遍历）：
- * - 修复原版 `icon = null` 与 `rssBytes = rss` 导致的编译错误（对齐 Models.kt 中的 `sizeBytes` 与 `hasIcon`）；
- * - 支持多用户 UID 判定 (appId = uid % 100000 in 10000..19999 或系统 UID 1000..2999)，保留多进程子实例 (:remote, :push)；
- * - 在 ROOT 与 NO_ROOT 模式下优先直接遍历 `/proc/[pid]/cmdline` 与 `/proc/[pid]/status` 获取真实运行中进程与 VmRSS。
+ * 真实进程扫描器（已彻底移除演示模式与全部硬编码假进程）：
+ *
+ * 1. Root 模式 (`WorkMode.ROOT`)：
+ *    - 通过 `su` 执行 `ps -A -w -o UID,PID,PPID,RSS,ARGS`，获取完整无截断的包名/进程名、
+ *      真实 UID、PPID 与物理内存 RSS；
+ * 2. 免 Root 模式 (`WorkMode.NO_ROOT`)：
+ *    - 扫描当前应用可读的 `/proc` 进程项及 `ActivityManager.runningAppProcesses`（共享 UID / 双开沙箱环境）；
+ * 3. 严格过滤 Linux 内核线程与原生 HAL/守护进程：
+ *    - 彻底过滤 `media.codec`、`media.metrics`、`android.hardware.*`、`vendor.qti.*`、`surfaceflinger` 等 Linux 原生守护进程；
+ *    - 结合 `PackageManager` 已安装应用表 (`pkgMap` + `uidMap`) 精确区分「用户」应用 (`system = false`) 与「系统」应用 (`system = true`)。
  */
 object ProcessScanner {
 
-    suspend fun scan(context: Context, mode: WorkMode = WorkMode.ROOT): List<TargetProcess> = withContext(Dispatchers.IO) {
+    private val NATIVE_DAEMON_PREFIXES = listOf(
+        "android.hardware.",
+        "vendor.",
+        "media.",
+        "init.",
+        "zygote",
+        "webview_zygote",
+        "usap32",
+        "usap64",
+        "surfaceflinger",
+        "servicemanager",
+        "hwservicemanager",
+        "vndservicemanager",
+        "audioserver",
+        "cameraserver",
+        "mediaserver",
+        "drmserver",
+        "keystore",
+        "credstore",
+        "logd",
+        "netd",
+        "lmkd",
+        "statsd",
+        "installd",
+        "storaged",
+        "vold",
+        "wificond",
+        "traced",
+        "incidentd",
+        "tombstoned",
+        "apexd",
+        "adbd",
+        "mdnsd",
+        "gatekeeperd",
+        "healthd",
+        "thermalservice",
+        "cnss-daemon",
+        "imsdaemon",
+        "rild",
+        "qcrild"
+    )
+
+    private val SYSTEM_PKG_PREFIXES = listOf(
+        "com.android.",
+        "android.",
+        "com.google.android.ext.",
+        "com.google.android.overlay.",
+        "com.google.android.providers.",
+        "com.google.android.networkstack",
+        "com.google.android.permissioncontroller",
+        "com.google.android.packageinstaller",
+        "com.qualcomm.",
+        "com.qti.",
+        "org.codeaurora.",
+        "com.mediatek.",
+        "com.samsung.android."
+    )
+
+    private val VALID_JAVA_PKG_REGEX = Regex("^[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+(:[a-zA-Z0-9_.-]+)?$")
+
+    fun scan(context: Context): List<TargetProcess> {
         val pm = context.packageManager
-        val selfPkg = context.packageName
-        val selfPid = Process.myPid()
-        val result = ArrayList<TargetProcess>(128)
-        val seenPids = HashSet<Int>()
+        val mode = Session.ui.value.workMode
+        val myUid = Process.myUid()
+        val myPid = Process.myPid()
 
-        // 1. 演示模式：直接返回精选演示进程 + 已安装用户应用
-        if (mode == WorkMode.DEMO) {
-            result.addAll(demoCuratedProcesses())
-            seenPids.addAll(result.map { it.pid })
-        } else {
-            // 2. ROOT 或 NO_ROOT 模式：优先直接扫描 /proc 目录下的可读进程（免 Root 虚拟空间/共享 UID 下同样可读）
-            val directProcList = scanProcDirectly(pm, selfPkg, selfPid)
-            for (p in directProcList) {
-                if (seenPids.add(p.pid)) {
-                    result.add(p)
-                }
-            }
+        // 预先构建已安装应用的包名映射与 UID 映射，解决 Android 11+ 及长包名截断问题
+        val installedApps = runCatching {
+            pm.getInstalledApplications(PackageManager.GET_META_DATA)
+        }.getOrDefault(emptyList())
 
-            // 3. 若处于 ROOT 模式且拿到 Root 权限，补充通过 su ps 扫描被 hidepid 隐藏的跨 UID 进程
-            if (mode == WorkMode.ROOT && Shell.hasRoot()) {
-                val rootList = scanFromProcViaRoot(pm, selfPkg, selfPid)
-                for (p in rootList) {
-                    if (seenPids.add(p.pid)) {
-                        result.add(p)
-                    }
-                }
-            }
+        val pkgMap = HashMap<String, ApplicationInfo>(installedApps.size * 2)
+        val uidMap = HashMap<Int, MutableList<ApplicationInfo>>(installedApps.size)
+        for (app in installedApps) {
+            pkgMap[app.packageName] = app
+            uidMap.getOrPut(app.uid) { ArrayList(1) }.add(app)
         }
 
-        // 4. ActivityManager runningAppProcesses 补充
-        runCatching {
-            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-            am?.runningAppProcesses?.forEach { proc ->
-                if (seenPids.contains(proc.pid)) return@forEach
-                val pkg = proc.pkgList?.firstOrNull() ?: proc.processName.substringBefore(':')
-                val info = runCatching { pm.getApplicationInfo(pkg, 0) }.getOrNull()
-                val labelBase = info?.let { pm.getApplicationLabel(it).toString() } ?: pkg
-                val subSuffix = if (proc.processName.contains(':')) ":" + proc.processName.substringAfter(':') else ""
-                val system = info != null && (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-                val x64 = info?.nativeLibraryDir?.contains("64") ?: true
-                val rss = readProcVmRssBytes(proc.pid).takeIf { it > 0L } ?: (96L * 1024 * 1024)
-                seenPids.add(proc.pid)
-                result.add(
-                    TargetProcess(
-                        pid = proc.pid,
-                        packageName = pkg,
-                        label = labelBase + subSuffix,
-                        x64 = x64,
-                        uid = proc.uid,
-                        sizeBytes = rss,
-                        running = true,
-                        system = system,
-                        isSelf = pkg == selfPkg || proc.pid == selfPid,
-                        hasIcon = info != null
-                    )
-                )
-            }
+        val out = LinkedHashMap<Int, TargetProcess>()
+
+        // 1. Root 模式下通过 su 获取全系统真实运行中的 Android 应用进程
+        if (mode == WorkMode.ROOT && Shell.hasRoot()) {
+            scanViaRootProc(context, pm, pkgMap, uidMap, myPid, out)
         }
 
-        // 5. 若因 Android 11+ 包可见性或权限限制仍为空，补充本机已安装应用与精选演示目标
-        if (result.size <= 1) {
-            for (d in demoCuratedProcesses()) {
-                if (seenPids.add(d.pid)) {
-                    result.add(d)
-                }
-            }
-            val apps = runCatching { pm.getInstalledApplications(PackageManager.GET_META_DATA) }
-                .getOrDefault(emptyList())
-            val seenPkgs = result.map { it.packageName }.toHashSet()
-            for (info in apps) {
-                val pkg = info.packageName
-                if (seenPkgs.contains(pkg)) continue
-                val label = runCatching { pm.getApplicationLabel(info).toString() }.getOrDefault(pkg)
-                val system = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
-                    (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
-                val x64 = info.nativeLibraryDir?.contains("64") ?: true
-                val syntheticPid = 10000 + (pkg.hashCode() and 0x7FFF)
-                val rss = ((pkg.hashCode().toLong() and 0xFFL) + 48L) * 1024L * 1024L
-                result.add(
-                    TargetProcess(
-                        pid = syntheticPid,
-                        packageName = pkg,
-                        label = label,
-                        x64 = x64,
-                        uid = info.uid,
-                        sizeBytes = rss,
-                        running = false,
-                        system = system,
-                        isSelf = pkg == selfPkg,
-                        hasIcon = true
-                    )
-                )
-            }
+        // 2. 免 Root 模式（或 Root 扫描补充）：扫描当前权限可读的 /proc 与 ActivityManager
+        if (out.isEmpty()) {
+            scanProcDirectly(context, pm, pkgMap, uidMap, myUid, myPid, mode, out)
+            scanFromActivityManager(context, pm, pkgMap, uidMap, myPid, out)
         }
 
-        result.sortedWith(
-            compareBy<TargetProcess> { it.isSelf }
-                .thenByDescending { it.running }
-                .thenBy { it.system }
+        return out.values.sortedWith(
+            compareBy<TargetProcess> { it.system }
                 .thenByDescending { it.sizeBytes }
-                .thenBy { it.label.lowercase() }
+                .thenBy { it.pid }
         )
     }
 
     /**
-     * 直接遍历 /proc/[pid]（无需 fork shell，实时无缓存）
+     * 通过 Root 权限执行宽列不截断 `ps -A -w -o UID,PID,PPID,RSS,ARGS`，
+     * 保证包名 100% 不被截断且拥有准确的 UID。
+     */
+    private fun scanViaRootProc(
+        context: Context,
+        pm: PackageManager,
+        pkgMap: Map<String, ApplicationInfo>,
+        uidMap: Map<Int, List<ApplicationInfo>>,
+        myPid: Int,
+        out: MutableMap<Int, TargetProcess>
+    ) {
+        val script = "ps -A -w -o UID,PID,PPID,RSS,ARGS 2>/dev/null || ps -A -o UID,PID,PPID,RSS,ARGS"
+        val lines = Shell.suLines(script)
+
+        for (raw in lines.drop(1)) {
+            val parts = raw.trim().split(Regex("\\s+"), limit = 5)
+            if (parts.size < 5) continue
+            val uid = parseAndroidUid(parts[0])
+            val pid = parts[1].toIntOrNull() ?: continue
+            val ppid = parts[2].toIntOrNull() ?: 0
+            val rss = parts[3].toLongOrNull() ?: 0L
+            val cmdRaw = parts[4].trim()
+
+            if (pid <= 1 || pid == myPid || ppid == 2 || rss <= 0L) continue
+            val cmd = cmdRaw.split(' ').firstOrNull()?.trim().orEmpty()
+            if (cmd.isEmpty()) continue
+
+            addCandidateIfAndroidApp(
+                context = context,
+                pm = pm,
+                pkgMap = pkgMap,
+                uidMap = uidMap,
+                pid = pid,
+                uid = uid,
+                ppid = ppid,
+                rssKb = rss,
+                rawProcessName = cmd,
+                out = out
+            )
+        }
+    }
+
+    /**
+     * 直接扫描 `/proc` 目录（免 Root 模式下获取自身与相同共享 UID 沙箱内的应用进程）
      */
     private fun scanProcDirectly(
+        context: Context,
         pm: PackageManager,
-        selfPkg: String,
-        selfPid: Int
-    ): List<TargetProcess> {
-        val out = ArrayList<TargetProcess>(64)
+        pkgMap: Map<String, ApplicationInfo>,
+        uidMap: Map<Int, List<ApplicationInfo>>,
+        myUid: Int,
+        myPid: Int,
+        mode: WorkMode,
+        out: MutableMap<Int, TargetProcess>
+    ) {
         val procDir = File("/proc")
-        val entries = procDir.listFiles() ?: return out
-
+        val entries = procDir.listFiles() ?: return
         for (entry in entries) {
             val pid = entry.name.toIntOrNull() ?: continue
-            if (pid <= 1) continue
+            if (pid <= 1 || pid == myPid || out.containsKey(pid)) continue
 
             val cmdline = runCatching {
-                val bytes = File(entry, "cmdline").readBytes()
-                val end = bytes.indexOf(0.toByte()).let { if (it >= 0) it else bytes.size }
-                String(bytes, 0, end, Charsets.UTF_8).trim()
-            }.getOrNull() ?: continue
-
-            if (cmdline.isEmpty() || cmdline.startsWith("[")) continue
+                File(entry, "cmdline").readBytes()
+                    .takeWhile { it != 0.toByte() }
+                    .toByteArray()
+                    .toString(Charsets.UTF_8)
+                    .trim()
+            }.getOrDefault("")
+            if (cmdline.isEmpty()) continue
 
             var uid = -1
             var ppid = 0
-            var vmSizeKb = 0L
-            var vmRssKb = 0L
+            var rssKb = 0L
             runCatching {
                 File(entry, "status").forEachLine { line ->
                     when {
                         line.startsWith("Uid:") -> {
-                            val parts = line.substringAfter("Uid:").trim().split(Regex("\\s+"))
-                            uid = parts.firstOrNull()?.toIntOrNull() ?: -1
+                            uid = line.substringAfter("Uid:").trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull() ?: -1
                         }
                         line.startsWith("PPid:") -> {
                             ppid = line.substringAfter("PPid:").trim().toIntOrNull() ?: 0
                         }
-                        line.startsWith("VmSize:") -> {
-                            vmSizeKb = line.substringAfter("VmSize:").trim().substringBefore(" ").toLongOrNull() ?: 0L
-                        }
                         line.startsWith("VmRSS:") -> {
-                            vmRssKb = line.substringAfter("VmRSS:").trim().substringBefore(" ").toLongOrNull() ?: 0L
+                            rssKb = line.substringAfter("VmRSS:").trim().split(Regex("\\s+")).firstOrNull()?.toLongOrNull() ?: 0L
                         }
                     }
                 }
             }
 
-            // 排除内核线程 (PPid == 2 或 VmSize == 0)
-            if (ppid == 2 || vmSizeKb == 0L) continue
+            if (ppid == 2 || rssKb <= 0L) continue
+            if (mode == WorkMode.NO_ROOT && uid != -1 && uid != myUid) continue
 
-            val basePkg = cmdline.substringBefore(':').substringBefore(' ')
-            val isAndroidPkg = basePkg.contains('.') && !basePkg.startsWith('/')
-            val appId = if (uid >= 0) uid % 100000 else -1
-            val isAppUid = appId in 10000..19999 || appId in 90000..99999 || uid == 1000
-            if (!isAndroidPkg && !isAppUid) continue
-
-            val info = runCatching { pm.getApplicationInfo(basePkg, 0) }.getOrNull()
-            val labelBase = info?.let { pm.getApplicationLabel(it).toString() } ?: basePkg
-            val subSuffix = if (cmdline.contains(':')) ":" + cmdline.substringAfter(':') else ""
-            val system = if (info != null) {
-                (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
-                    (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
-            } else {
-                appId in 1000..9999
-            }
-            val x64 = info?.nativeLibraryDir?.contains("64") ?: true
-
-            out.add(
-                TargetProcess(
-                    pid = pid,
-                    packageName = basePkg,
-                    label = labelBase + subSuffix,
-                    x64 = x64,
-                    uid = if (uid >= 0) uid else (info?.uid ?: 0),
-                    sizeBytes = vmRssKb * 1024L,
-                    running = true,
-                    system = system,
-                    isSelf = basePkg == selfPkg || pid == selfPid,
-                    hasIcon = info != null
-                )
+            addCandidateIfAndroidApp(
+                context = context,
+                pm = pm,
+                pkgMap = pkgMap,
+                uidMap = uidMap,
+                pid = pid,
+                uid = uid,
+                ppid = ppid,
+                rssKb = rssKb,
+                rawProcessName = cmdline,
+                out = out
             )
         }
-        return out
     }
 
-    private fun scanFromProcViaRoot(
+    private fun scanFromActivityManager(
+        context: Context,
         pm: PackageManager,
-        selfPkg: String,
-        selfPid: Int
-    ): List<TargetProcess> {
-        val out = ArrayList<TargetProcess>(128)
-        val lines = Shell.suLines("ps -A -o PID,RSS,ARGS 2>/dev/null || ps -o PID,RSS,ARGS")
-        for (line in lines.drop(1)) {
-            val parts = line.trim().split(Regex("\\s+"), limit = 3)
-            if (parts.size < 3) continue
-            val pid = parts[0].toIntOrNull() ?: continue
-            val rssKb = parts[1].toLongOrNull() ?: 0L
-            val cmd = parts[2].trim()
-            if (!cmd.contains('.') || cmd.startsWith("[") || cmd.startsWith("/")) continue
-            val pkg = cmd.substringBefore(':')
-            val info = runCatching { pm.getApplicationInfo(pkg, 0) }.getOrNull()
-            val labelBase = info?.let { runCatching { pm.getApplicationLabel(it).toString() }.getOrNull() } ?: pkg
-            val subSuffix = if (cmd.contains(':')) ":" + cmd.substringAfter(':') else ""
-            val system = info != null &&
-                (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
-                (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
-            val x64 = info?.nativeLibraryDir?.contains("64") ?: true
-            out.add(
-                TargetProcess(
-                    pid = pid,
-                    packageName = pkg,
-                    label = labelBase + subSuffix,
-                    x64 = x64,
-                    uid = info?.uid ?: 0,
-                    sizeBytes = rssKb * 1024L,
-                    running = true,
-                    system = system,
-                    isSelf = pkg == selfPkg || pid == selfPid,
-                    hasIcon = info != null
+        pkgMap: Map<String, ApplicationInfo>,
+        uidMap: Map<Int, List<ApplicationInfo>>,
+        myPid: Int,
+        out: MutableMap<Int, TargetProcess>
+    ) {
+        runCatching {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            am?.runningAppProcesses?.forEach { proc ->
+                if (proc.pid <= 1 || proc.pid == myPid || out.containsKey(proc.pid)) return@forEach
+                val rawName = proc.processName ?: return@forEach
+                val rss = readRssFromProc(proc.pid)
+                addCandidateIfAndroidApp(
+                    context = context,
+                    pm = pm,
+                    pkgMap = pkgMap,
+                    uidMap = uidMap,
+                    pid = proc.pid,
+                    uid = proc.uid,
+                    ppid = 0,
+                    rssKb = if (rss > 0L) rss else 64_000L,
+                    rawProcessName = rawName,
+                    out = out
                 )
-            )
-        }
-        return out
-    }
-
-    private fun readProcVmRssBytes(pid: Int): Long {
-        if (pid <= 0) return 0L
-        return runCatching {
-            File("/proc/$pid/status").useLines { seq ->
-                val line = seq.firstOrNull { it.startsWith("VmRSS:") } ?: return@useLines 0L
-                val kb = line.substringAfter("VmRSS:").trim().substringBefore(" ").toLongOrNull() ?: 0L
-                kb * 1024L
             }
-        }.getOrDefault(0L)
+        }
     }
 
-    private fun demoCuratedProcesses(): List<TargetProcess> = listOf(
-        TargetProcess(
-            pid = 14820,
-            packageName = "com.DefaultCompany.Shooter Demo",
-            label = "Shooter Demo (Unity IL2CPP)",
-            x64 = true,
-            uid = 10248,
-            sizeBytes = 412L * 1024 * 1024,
+    /**
+     * 核心过滤与分类逻辑：
+     * - 严格拦截 Linux 原生进程、HAL 服务 (`android.hardware.*`, `vendor.qti.*`, `media.codec`, `media.metrics`)；
+     * - 严格校验进程必须对应已安装的 Android APK 或属于标准 Android 应用 UID 区间 (`10000..19999`)；
+     * - 准确标记 `system = false`（用户应用）与 `system = true`（系统应用）。
+     */
+    private fun addCandidateIfAndroidApp(
+        context: Context,
+        pm: PackageManager,
+        pkgMap: Map<String, ApplicationInfo>,
+        uidMap: Map<Int, List<ApplicationInfo>>,
+        pid: Int,
+        uid: Int,
+        ppid: Int,
+        rssKb: Long,
+        rawProcessName: String,
+        out: MutableMap<Int, TargetProcess>
+    ) {
+        if (ppid == 2 || rssKb <= 0L) return
+        val cleanCmd = rawProcessName.trim()
+        if (cleanCmd.isEmpty() || cleanCmd.startsWith("[") || cleanCmd.startsWith("/")) return
+        if (cleanCmd.contains('@') || cleanCmd.contains('/')) return
+
+        // 拦截所有已知的 Linux / HAL / 守护进程前缀
+        val lowerCmd = cleanCmd.lowercase()
+        for (prefix in NATIVE_DAEMON_PREFIXES) {
+            if (lowerCmd == prefix || lowerCmd.startsWith(prefix)) {
+                return
+            }
+        }
+
+        val basePkg = cleanCmd.substringBefore(':')
+        if (!basePkg.contains('.')) return
+        if (!VALID_JAVA_PKG_REGEX.matches(cleanCmd)) return
+        if (basePkg == context.packageName) return
+
+        // 1. 优先从 PackageManager 已安装应用映射表中匹配
+        var appInfo: ApplicationInfo? = pkgMap[basePkg]
+            ?: runCatching { pm.getApplicationInfo(basePkg, 0) }.getOrNull()
+
+        // 2. 若 ps 输出因过长被截断或进程名自定义，通过数值 UID 反查已安装的 ApplicationInfo
+        if (appInfo == null && uid >= 10000) {
+            val candidatesForUid = uidMap[uid]
+                ?: runCatching {
+                    pm.getPackagesForUid(uid)?.mapNotNull { p -> pkgMap[p] ?: runCatching { pm.getApplicationInfo(p, 0) }.getOrNull() }
+                }.getOrNull()
+            if (!candidatesForUid.isNullOrEmpty()) {
+                appInfo = candidatesForUid.firstOrNull { basePkg.startsWith(it.packageName) || it.packageName.startsWith(basePkg) }
+                    ?: candidatesForUid.first()
+            }
+        }
+
+        val appId = if (uid >= 0) (uid % 100000) else -1
+        val isAppUidRange = appId in 10000..19999 || appId in 90000..99999
+
+        // 关键准入门槛：
+        // 如果既不是已安装的 Android APK (appInfo == null)，又不在标准 Android 应用 UID 范围内 (10000..19999)，
+        // 则它必然是运行在 root/system/media/nobody UID 下的 Linux 原生进程（如 media.codec, vendor.qti 等），直接丢弃！
+        if (appInfo == null && !isAppUidRange) {
+            return
+        }
+
+        val resolvedPkg = appInfo?.packageName ?: basePkg
+
+        // 再次检查解析后的包名是否属于 HAL/原生守护进程
+        val lowerPkg = resolvedPkg.lowercase()
+        for (prefix in NATIVE_DAEMON_PREFIXES) {
+            if (lowerPkg.startsWith(prefix)) return
+        }
+
+        // 精确判定「系统应用 (system = true)」与「用户应用 (system = false)」
+        val isSystemApp = if (appInfo != null) {
+            val flagSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+            val flagUpdated = (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+            val src = appInfo.sourceDir.orEmpty()
+            val inSystemPartition = src.startsWith("/system/") ||
+                src.startsWith("/product/") ||
+                src.startsWith("/system_ext/") ||
+                src.startsWith("/vendor/") ||
+                src.startsWith("/apex/") ||
+                src.startsWith("/oem/")
+            (flagSystem && !flagUpdated) || inSystemPartition || (uid in 0 until 10000)
+        } else {
+            SYSTEM_PKG_PREFIXES.any { resolvedPkg.startsWith(it) } || (uid in 0 until 10000)
+        }
+
+        val baseLabel = appInfo?.let {
+            runCatching { pm.getApplicationLabel(it).toString() }.getOrNull()
+        }?.takeIf { it.isNotBlank() } ?: cleanCmd
+
+        val finalLabel = if (cleanCmd.contains(':') && !baseLabel.contains(':')) {
+            "$baseLabel (${cleanCmd.substringAfter(':')})"
+        } else {
+            baseLabel
+        }
+
+        val x64 = detectProcess64Bit(pid, appInfo)
+
+        out[pid] = TargetProcess(
+            pid = pid,
+            packageName = resolvedPkg,
+            label = finalLabel,
+            x64 = x64,
+            uid = if (uid >= 0) uid else (appInfo?.uid ?: 0),
+            sizeBytes = rssKb * 1024L,
             running = true,
-            system = false,
+            system = isSystemApp,
             isSelf = false,
-            hasIcon = false
-        ),
-        TargetProcess(
-            pid = 18392,
-            packageName = "com.miHoYo.Yuanshen",
-            label = "原神 (Genshin Impact)",
-            x64 = true,
-            uid = 10285,
-            sizeBytes = 1840L * 1024 * 1024,
-            running = true,
-            system = false,
-            isSelf = false,
-            hasIcon = false
-        ),
-        TargetProcess(
-            pid = 21044,
-            packageName = "com.tencent.tmgp.sgame",
-            label = "王者荣耀",
-            x64 = true,
-            uid = 10291,
-            sizeBytes = 1290L * 1024 * 1024,
-            running = true,
-            system = false,
-            isSelf = false,
-            hasIcon = false
-        ),
-        TargetProcess(
-            pid = 24910,
-            packageName = "org.ppsspp.ppsspp",
-            label = "PPSSPP Gold Emulator",
-            x64 = true,
-            uid = 10312,
-            sizeBytes = 520L * 1024 * 1024,
-            running = true,
-            system = false,
-            isSelf = false,
-            hasIcon = false
+            hasIcon = appInfo != null
         )
-    )
+    }
+
+    /**
+     * 解析 Android `ps` 输出的 UID 字段：
+     * 支持纯数字 (`10245`)、`u0_a245` (`10245`)、`u10_a245` (`1010245`)、`system` (`1000`)、`root` (`0`) 等格式。
+     */
+    private fun parseAndroidUid(token: String): Int {
+        val clean = token.trim()
+        clean.toIntOrNull()?.let { return it }
+        if (clean == "root") return 0
+        if (clean == "system") return 1000
+        if (clean == "shell") return 2000
+        if (clean.startsWith("u") && clean.contains("_")) {
+            val userPart = clean.substringAfter('u').substringBefore('_').toIntOrNull() ?: 0
+            val rest = clean.substringAfter('_')
+            return when {
+                rest.startsWith("a") -> {
+                    val appOffset = rest.removePrefix("a").toIntOrNull() ?: return -1
+                    userPart * 100000 + 10000 + appOffset
+                }
+                rest.startsWith("i") -> {
+                    val isoOffset = rest.removePrefix("i").toIntOrNull() ?: return -1
+                    userPart * 100000 + 99000 + isoOffset
+                }
+                else -> -1
+            }
+        }
+        return -1
+    }
+
+    private fun detectProcess64Bit(pid: Int, appInfo: ApplicationInfo?): Boolean {
+        appInfo?.nativeLibraryDir?.let { dir ->
+            if (dir.contains("arm64") || dir.contains("x86_64")) return true
+            if (dir.contains("arm/") || dir.endsWith("/arm") || dir.contains("x86")) return false
+        }
+        val exeLink = runCatching { File("/proc/$pid/exe").canonicalPath }.getOrNull()
+        if (!exeLink.isNullOrEmpty()) {
+            if (exeLink.contains("64")) return true
+            if (exeLink.endsWith("app_process32")) return false
+        }
+        return true
+    }
+
+    private fun readRssFromProc(pid: Int): Long {
+        return try {
+            val status = File("/proc/$pid/status").readText()
+            val line = status.lineSequence().firstOrNull { it.startsWith("VmRSS:") } ?: return 0L
+            line.replace("VmRSS:", "").replace("kB", "").trim().toLongOrNull() ?: 0L
+        } catch (_: Throwable) {
+            0L
+        }
+    }
 
     fun sizeText(bytes: Long): String {
-        if (bytes <= 0) return "0 MB"
-        val mb = bytes / (1024.0 * 1024.0)
-        return if (mb >= 100) "${mb.toInt()} MB" else String.format(java.util.Locale.US, "%.1f MB", mb)
+        if (bytes <= 0) return "0 B"
+        val kb = bytes / 1024.0
+        val mb = kb / 1024.0
+        val gb = mb / 1024.0
+        return when {
+            gb >= 1.0 -> String.format(Locale.US, "%.2f GB", gb)
+            mb >= 1.0 -> String.format(Locale.US, "%.1f MB", mb)
+            else -> String.format(Locale.US, "%.0f KB", kb)
+        }
+    }
+}
+
+/** 进程应用图标缓存 */
+object AppIconCache {
+    private val cache = ConcurrentHashMap<String, ImageBitmap>()
+
+    fun get(context: Context, packageName: String): ImageBitmap? {
+        cache[packageName]?.let { return it }
+        return try {
+            val d: Drawable = context.packageManager.getApplicationIcon(packageName)
+            val bmp = drawableToBitmap(d).asImageBitmap()
+            cache[packageName] = bmp
+            bmp
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun drawableToBitmap(d: Drawable): Bitmap {
+        if (d is BitmapDrawable && d.bitmap != null) return d.bitmap
+        val w = d.intrinsicWidth.coerceAtLeast(1)
+        val h = d.intrinsicHeight.coerceAtLeast(1)
+        val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        d.setBounds(0, 0, c.width, c.height)
+        d.draw(c)
+        return b
     }
 }

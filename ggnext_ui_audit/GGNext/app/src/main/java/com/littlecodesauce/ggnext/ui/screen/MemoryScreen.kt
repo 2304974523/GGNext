@@ -143,7 +143,7 @@ private fun MemoryMiniBar(
         Box(
             Modifier
                 .scale(addrScale)
-                .background(Rose.CardHigh, RoundedCornerShape(6.dp))
+                .background(Rose.CardHigh.copy(alpha = ui.metrics.bgOpacity.coerceIn(0.25f, 1.0f)), RoundedCornerShape(6.dp))
                 .clickableWithTooltip(
                     onPressChange = { addrPressed = it },
                     onClick = onLocateAddress
@@ -153,7 +153,7 @@ private fun MemoryMiniBar(
         ) {
             Text(
                 text = addrHexText,
-                style = monoStyle(12, Rose.Green, weight = FontWeight.SemiBold)
+                style = monoStyle(12, Rose.Primary, weight = FontWeight.SemiBold)
             )
         }
     }
@@ -166,6 +166,7 @@ private fun MemoryRow(
     isJumpTarget: Boolean
 ) {
     val currentItem by rememberUpdatedState(item)
+    val bgOpacity = com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics.current.bgOpacity.coerceIn(0.25f, 1.0f)
     val accent = remember(item.flags) { typeColor(item.flags) }
     val hexColor = remember(item.pointer) { pointerColor(item.pointer) }
     val ptrLabel = remember(item.pointer) { pointerTypeLabel(item.pointer) }
@@ -180,7 +181,7 @@ private fun MemoryRow(
         isJumpTarget && item.checked -> Rose.JumpHighlight.copy(alpha = 0.42f)
         isJumpTarget -> Rose.JumpHighlight
         item.checked -> Rose.Primary.copy(alpha = if (Rose.IsDark) 0.18f else 0.22f)
-        else -> Rose.Row
+        else -> Rose.Row.copy(alpha = (bgOpacity * 0.88f).coerceIn(0.18f, 1.0f))
     }
 
     Row(
@@ -209,7 +210,7 @@ private fun MemoryRow(
             text = item.cachedAddressHex,
             style = monoStyle(
                 size = 13,
-                color = Rose.Green,
+                color = Rose.Primary,
                 weight = if (isJumpTarget) FontWeight.Bold else FontWeight.Normal
             )
         )

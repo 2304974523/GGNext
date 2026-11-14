@@ -10,25 +10,30 @@ import java.io.File
 import java.io.RandomAccessFile
 import kotlin.math.abs
 import kotlin.math.min
-import kotlin.random.Random
 
 /**
- * 内存引擎（已深度集成 C++20 MemEngine JNI 后端，并修复全部已知缺陷）：
+ * 工业级真实跨进程内存检索引擎（已彻底移除全部演示/模拟模式与假数据）：
  *
- * 1. 原生 C++20 优先通道 (NativeMemBridge)：
- *    - 优先通过 `process_vm_readv` / `process_vm_writev` 零拷贝系统调用读写目标进程内存，
- *      受限时无缝回退 `/proc/<pid>/mem` (pread64/pwrite64)，支持 16KB / 4KB 动态页对齐与 EFAULT 保护页跳过；
- *    - 支持 ARM64 NEON SIMD 向量化扫描、MmapCandidateStore 零 OOM 磁盘溢出存储及 ValueLocker 独立锁值线程；
- * 2. 修复免 Root 共享 UID / 虚拟空间模式 (`WorkMode.NO_ROOT`) 被强制降级为沙盒随机数的 Bug：
- *    - 只要未强制指定演示模式 (`forceDemo = false`)，均优先尝试 Native C++20 附加与直接 `/proc/<pid>/mem` 附加；
- * 3. 修复有符号整数与 IEEE-754 浮点数比较时误用 `Long.compareUnsigned` 的严重算术 Bug；
- * 4. 完整支持精确单值、自适应 AUTO、范围 (A~B / A~~B)、文本 ('utf8' / "utf16le")、
- *    联合/结构体搜索 (A;B;C:512 无序 / A;B;C::64 有序)、异或 (AXK)、蒙版搜索与指针链扫描；
- * 5. 修复 `copyMemory` 逐字节系统调用瓶颈，改为 64KB 块缓冲批量读写。
+ * 1. Root C++20 守护通道 (`RootMemDaemon` -> `su` + `libmem_engine_root.so`)：
+ *    - 在 `uid=0` Root 进程内直接运行 C++20 `MemEngine`，彻底解决 Android 普通应用进程 (`u0_aXXX`)
+ *      因内核 `ptrace_may_access` 与 SELinux 限制无法直接打开其他应用 `/proc/<pid>/mem` 的问题；
+ *    - 100% 真实解析目标进程 `/proc/<pid>/maps` 全部 VMA 内存段，按 15 类区域精确统计真实大小与段数；
+ *    - 100% 真实执行 ARM64 NEON SIMD 向量化扫描、改善 (Refine)、模糊搜索、联合搜索、读写与高频锁值；
+ * 2. 免 Root 共享 UID / 虚拟空间 JNI 通道 (`NativeMemBridge` -> `libmem_engine_jni.so`)：
+ *    - 针对同 UID 双开沙箱或自身进程，直接在 JNI 层调用 `process_vm_readv` / `process_vm_writev` 与 `/proc/<pid>/mem`；
+ * 3. 无权限时诚实返回空结果与 0 字节区域，绝不回退任何硬编码模拟数据。
  */
 class MemoryEngine {
 
-    data class SearchResult(val items: List<MemoryItem>)
+    data class SearchResult(
+        val items: List<MemoryItem>,
+        val totalFound: Long = items.size.toLong()
+    )
+
+    companion object {
+        /** Kotlin 层缓存的最大候选条目数（避免 maxShow=2000 时丢弃后续搜索结果，同时 C++ 层保留 2,000,000 条全量候选） */
+        const val MAX_CACHED_CANDIDATES = 25000
+    }
 
     data class Criteria(
         val type: Int = ValueType.DWORD,
@@ -45,7 +50,7 @@ class MemoryEngine {
         val area: Int = 512,
         val memoryFrom: Long = 0L,
         val memoryTo: Long = Long.MAX_VALUE,
-        val limit: Int = 5000,
+        val limit: Int = MAX_CACHED_CANDIDATES,
         val rawExpression: String = "",
         val encryptedXor: Boolean = false,
         val selectedRegions: Set<String> = RegionCatalog.DEFAULT_SELECTED,
@@ -61,117 +66,150 @@ class MemoryEngine {
     var x64: Boolean = true
         private set
 
-    var simulated: Boolean = true
+    var attachedOk: Boolean = false
+        private set
+
+    var rootDaemonActive: Boolean = false
         private set
 
     var nativeBackendActive: Boolean = false
         private set
 
+    private var isRootModeActive: Boolean = false
+    private var appContextRef: Context? = null
     private var nativeHandle: Long = 0L
-    private val simCells = LinkedHashMap<Long, MemoryItem>(2048)
-    private var simRegions: List<MemoryRegion> = emptyList()
+    @Volatile
+    private var cachedRegions: List<MemoryRegion> = emptyList()
 
     /**
      * 附加到目标进程：
-     * - forceDemo = true 时直接进入纯沙盒演示模式；
-     * - ROOT 或 NO_ROOT 模式下优先通过 C++20 NativeMemBridge (process_vm_readv + /proc/<pid>/mem) 附加；
-     * - 若处于 ROOT 模式且 `/proc/<pid>/mem` 仅对 su 可读，自动尝试 chmod 辅助打开；
-     * - 仅当全部真实跨进程通道均无权限时才回退至沙盒模拟环境。
+     * - Root 模式下优先通过 `RootMemDaemon` (`su` + `libmem_engine_root.so`) 以 `uid=0` 附加；
+     * - 免 Root 模式下通过 `NativeMemBridge` (`libmem_engine_jni.so`) 或 JVM 直接访问 `/proc/<pid>/mem`；
+     * - 若无权限访问目标进程（例如取消了 Root 授权又去附加其他 UID 的应用），诚实返回 `false` 并清空区域与结果。
      */
     fun attach(
         targetPid: Int,
         targetX64: Boolean = true,
         isRootMode: Boolean = true,
-        context: Context? = null,
-        forceDemo: Boolean = false
+        context: Context? = null
     ): Boolean {
+        clearNativeFreezes()
         pid = targetPid
         x64 = targetX64
-        simCells.clear()
+        isRootModeActive = isRootMode
+        if (context != null) {
+            appContextRef = context.applicationContext ?: context
+        }
+        rootDaemonActive = false
         nativeBackendActive = false
+        attachedOk = false
+        cachedRegions = emptyList()
 
-        if (forceDemo || targetPid <= 0) {
-            simulated = true
-            buildSimulatedProcess(targetPid)
-            AppLog.i("Engine", "Attached pid=$targetPid (Demo Sandbox Mode)")
-            return true
+        if (targetPid <= 0) {
+            return false
         }
 
-        // 1. 尝试通过 C++20 NativeMemBridge 附加 (支持 process_vm_readv 与 /proc/<pid>/mem)
+        // 1. Root 模式：优先通过持久化 su C++20 守护进程 (libmem_engine_root.so) 附加
+        if (isRootMode && Shell.hasRoot()) {
+            if (RootMemDaemon.attach(appContextRef, targetPid)) {
+                rootDaemonActive = true
+                attachedOk = true
+                cachedRegions = RootMemDaemon.getRegions()
+                if (cachedRegions.isEmpty()) {
+                    cachedRegions = parseMapsFromProc(targetPid, allowRoot = true)
+                }
+                AppLog.i("Engine", "Attached pid=$targetPid via RootMemDaemon (uid=0 C++20 MemEngine, regions=${cachedRegions.size})")
+                return true
+            }
+        }
+
+        // 2. 免 Root 模式（或同 UID 进程）：尝试进程内 C++20 NativeMemBridge (process_vm_readv + /proc/<pid>/mem)
         if (NativeMemBridge.isLoaded) {
             val handle = NativeMemBridge.ensureHandle()
             if (handle != 0L) {
-                var rc = NativeMemBridge.nativeAttach(handle, targetPid)
-                if (rc != 0 && isRootMode && Shell.hasRoot()) {
-                    Shell.su("chmod 666 /proc/$targetPid/mem /proc/$targetPid/maps 2>/dev/null || true")
-                    rc = NativeMemBridge.nativeAttach(handle, targetPid)
-                }
+                val rc = NativeMemBridge.nativeAttach(handle, targetPid)
                 if (rc == 0) {
                     nativeHandle = handle
                     nativeBackendActive = true
-                    simulated = false
-                    AppLog.i("Engine", "Attached pid=$targetPid via C++20 MemEngine (process_vm_readv / pread64)")
+                    attachedOk = true
+                    cachedRegions = parseMapsFromProc(targetPid, allowRoot = false)
+                    AppLog.i("Engine", "Attached pid=$targetPid via in-process C++20 NativeMemBridge (regions=${cachedRegions.size})")
                     return true
                 }
             }
         }
 
-        // 2. JVM 层直接探测 /proc/<pid>/maps 与 /proc/<pid>/mem（支持 NO_ROOT 共享 UID 及 ROOT）
-        val mapsFile = File("/proc/$targetPid/maps")
-        if (!mapsFile.canRead() && isRootMode && Shell.hasRoot()) {
-            Shell.su("chmod 644 /proc/$targetPid/maps 2>/dev/null || true")
-        }
-        val canReadMaps = mapsFile.exists() && mapsFile.canRead()
-        val memCheck = runCatching {
-            RandomAccessFile("/proc/$targetPid/mem", "r").use { true }
+        // 3. JVM / Shell 回退探测：验证是否真正可读目标进程的内存与映射表
+        val regions = parseMapsFromProc(targetPid, allowRoot = isRootMode && Shell.hasRoot())
+        val canReadMem = runCatching {
+            RandomAccessFile("/proc/$targetPid/mem", "r").use { f ->
+                val firstReadable = regions.firstOrNull { it.perms.startsWith("r") && it.size > 0 }
+                if (firstReadable != null) {
+                    f.seek(firstReadable.start)
+                    val buf = ByteArray(4)
+                    f.read(buf, 0, 4) >= 0
+                } else {
+                    false
+                }
+            }
         }.getOrDefault(false)
 
-        simulated = !(canReadMaps && memCheck)
-        if (simulated) {
-            buildSimulatedProcess(targetPid)
-            AppLog.i("Engine", "Attached pid=$targetPid (Fallback Sandbox Mode)")
-        } else {
-            AppLog.i("Engine", "Attached pid=$targetPid (JVM /proc/$targetPid/mem Direct Mode)")
+        if (regions.isNotEmpty() && canReadMem) {
+            attachedOk = true
+            cachedRegions = regions
+            AppLog.i("Engine", "Attached pid=$targetPid via direct /proc/$targetPid/mem (regions=${regions.size})")
+            return true
         }
-        return true
+
+        AppLog.w("Engine", "Attach failed for pid=$targetPid (isRootMode=$isRootMode, hasRoot=${Shell.hasRoot()}): Permission denied")
+        return false
     }
 
     fun detach() {
         clearNativeFreezes()
         pid = 0
+        attachedOk = false
+        rootDaemonActive = false
         nativeBackendActive = false
-        simulated = true
+        cachedRegions = emptyList()
     }
 
-    /** 读取指定进程的 15 类细分内存区间（对齐原版 GG RegionCatalog.ALL） */
-    fun regions(selectedCodes: Set<String> = RegionCatalog.ALL.map { it.code }.toSet()): List<MemoryRegion> {
-        if (simulated) return simRegions
+    /**
+     * 读取当前附加进程的全部真实 VMA 内存段列表（供内存区域统计与模块列表展示）。
+     * 若未附加或无权限，返回空列表（绝不返回硬编码演示数据）。
+     */
+    fun regions(): List<MemoryRegion> {
+        if (!attachedOk || pid <= 0) return emptyList()
 
-        if (nativeBackendActive && nativeHandle != 0L) {
-            val mask = NativeMemBridge.buildRegionMask(selectedCodes)
-            NativeMemBridge.nativeSetRegionMask(nativeHandle, mask)
-            val totals = NativeMemBridge.nativeGetRegionTotals(nativeHandle, pid)
-            if (totals != null && totals.size >= 30) {
-                return RegionCatalog.ALL.mapIndexed { idx, rt ->
-                    val sz = totals[idx]
-                    val base = totals[15 + idx]
-                    MemoryRegion(
-                        start = base,
-                        end = if (sz > 0) base + sz else base,
-                        perms = if (rt.code == "Xa" || rt.code == "Xs") "r-xp" else "rw-p",
-                        path = rt.name,
-                        code = rt.code,
-                        system = (rt.code == "Xs" || rt.code == "O")
-                    )
-                }.filter { it.size > 0L }
+        if (rootDaemonActive) {
+            val fresh = RootMemDaemon.getRegions()
+            if (fresh.isNotEmpty()) {
+                cachedRegions = fresh
+                return fresh
             }
         }
 
-        val lines = runCatching { File("/proc/$pid/maps").readLines() }
-            .getOrElse { Shell.suLines("cat /proc/$pid/maps") }
+        val fresh = parseMapsFromProc(pid, allowRoot = isRootModeActive && Shell.hasRoot())
+        if (fresh.isNotEmpty()) {
+            cachedRegions = fresh
+        }
+        return cachedRegions
+    }
+
+    private fun parseMapsFromProc(targetPid: Int, allowRoot: Boolean): List<MemoryRegion> {
+        if (targetPid <= 0) return emptyList()
+        val lines = runCatching {
+            val f = File("/proc/$targetPid/maps")
+            if (f.canRead()) f.readLines() else emptyList()
+        }.getOrDefault(emptyList()).let { direct ->
+            if (direct.isNotEmpty()) direct
+            else if (allowRoot) Shell.suLines("cat /proc/$targetPid/maps 2>/dev/null")
+            else emptyList()
+        }
+        if (lines.isEmpty()) return emptyList()
+
         val out = ArrayList<MemoryRegion>(lines.size)
         var prevFileBackedPath = ""
-
         for (line in lines) {
             val seg = parseMapLine(line, prevFileBackedPath) ?: continue
             prevFileBackedPath = seg.prevPathNext
@@ -182,7 +220,7 @@ class MemoryEngine {
                     perms = seg.perms,
                     path = seg.path,
                     code = seg.code,
-                    system = seg.code == "Xs"
+                    system = (seg.code == "Xs" || seg.code == "O")
                 )
             )
         }
@@ -192,72 +230,64 @@ class MemoryEngine {
     /** 查询指定虚拟地址所属的细分内存区域代码 (Jh, Ch, Ca, Cd, Cb, Xa 等) */
     fun regionCodeAt(address: Long): String {
         val cleanAddr = address and 0x00FFFFFFFFFFFFFFL
-        if (simulated) {
-            simCells[address]?.let { return it.region }
-            for (r in simRegions) {
-                if (r.size > 0 && cleanAddr >= r.start && cleanAddr < r.end) {
-                    return r.code
-                }
+        val regs = cachedRegions
+        // 二分查找或线性查找当前缓存的真实 VMA 列表
+        var lo = 0
+        var hi = regs.size - 1
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            val r = regs[mid]
+            if (java.lang.Long.compareUnsigned(cleanAddr, r.start) < 0) {
+                hi = mid - 1
+            } else if (java.lang.Long.compareUnsigned(cleanAddr, r.end) >= 0) {
+                lo = mid + 1
+            } else {
+                return r.code
             }
-            return "Ca"
         }
         if (nativeBackendActive && nativeHandle != 0L) {
             NativeMemBridge.nativeGetRegionCodeAt(nativeHandle, cleanAddr)?.let {
                 if (it.isNotEmpty()) return it
             }
         }
-        return "Ca"
+        return "O"
     }
 
     /**
-     * 根据当前进程 VMA 映射表对候选值进行指针属性分类 (忽略 ARM64 TBI 高 8 位标签)：
+     * 根据当前进程真实 VMA 映射表对候选值进行指针属性分类 (忽略 ARM64 TBI 高 8 位标签)：
      * 返回值对应 FilterState.pointers 掩码位：
      * 0 = 非指针, 1 = 可写且可执行 (WX), 2 = 只读可执行 (X), 4 = 可读 (R), 8 = 只读 (RO), 16 = 可写 (W)
      */
     fun classifyPointer(ptrValue: Long): Int {
         val cleanPtr = ptrValue and 0x00FFFFFFFFFFFFFFL
         if (cleanPtr <= 0x10000L) return 0
-        if (simulated) {
-            for (r in simRegions) {
-                if (r.size > 0 && cleanPtr >= r.start && cleanPtr < r.end) {
-                    return when (r.code) {
-                        "Xa" -> if (r.perms.contains('w')) 1 else 2
-                        "Xs" -> 2
-                        "Cd", "O" -> 8
-                        else -> 16
-                    }
+
+        val regs = cachedRegions
+        var lo = 0
+        var hi = regs.size - 1
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            val r = regs[mid]
+            if (java.lang.Long.compareUnsigned(cleanPtr, r.start) < 0) {
+                hi = mid - 1
+            } else if (java.lang.Long.compareUnsigned(cleanPtr, r.end) >= 0) {
+                lo = mid + 1
+            } else {
+                val read = r.perms.contains('r')
+                val write = r.perms.contains('w')
+                val exec = r.perms.contains('x')
+                if (!read) return 0
+                return when {
+                    write && exec -> 1
+                    exec -> 2
+                    write -> 16
+                    else -> 8
                 }
             }
-            if (cleanPtr in 0x79F0000000L..0x79FFFFFFFFL) {
-                return when (((cleanPtr ushr 12) and 3L).toInt()) {
-                    0 -> 16
-                    1 -> 8
-                    2 -> 2
-                    else -> 1
-                }
-            }
-            return 0
         }
 
         if (nativeBackendActive && nativeHandle != 0L) {
             return NativeMemBridge.nativeClassifyPointer(nativeHandle, cleanPtr)
-        }
-
-        val lines = runCatching { File("/proc/$pid/maps").readLines() }.getOrDefault(emptyList())
-        for (line in lines) {
-            val seg = parseMapLine(line) ?: continue
-            if (cleanPtr >= seg.start && cleanPtr < seg.end) {
-                val r = seg.perms.contains('r')
-                val w = seg.perms.contains('w')
-                val x = seg.perms.contains('x')
-                if (!r) return 0
-                return when {
-                    w && x -> 1
-                    x -> 2
-                    w -> 16
-                    else -> 8
-                }
-            }
         }
         return 0
     }
@@ -267,42 +297,38 @@ class MemoryEngine {
 
     /** 读取单个地址的值（小端序） */
     fun read(address: Long, size: Int): Long {
-        if (simulated) {
-            simCells[address]?.let { return it.value }
-            val aligned = address and -4L
-            simCells[aligned]?.let { base ->
-                val shift = ((address - aligned).toInt() and 3) * 8
-                return (base.value ushr shift) and maskForSize(size)
-            }
-            return syntheticValueAt(address, size)
-        }
-
-        val bytes = readBlock(address, size.coerceIn(1, 8))
+        if (!attachedOk || pid <= 0) return 0L
+        val safeSize = size.coerceIn(1, 8)
+        val bytes = readBlock(address, safeSize)
         var v = 0L
-        for (i in 0 until min(size, bytes.size)) {
+        for (i in 0 until min(safeSize, bytes.size)) {
             v = v or ((bytes[i].toLong() and 0xFFL) shl (i * 8))
         }
         return v
     }
 
+    /**
+     * 批量实时读取一组离散地址的最新内存值（单次 IPC 往返，供搜索列表/保存列表实时刷新使用）
+     */
+    fun batchReadRawValues(items: List<Pair<Long, Int>>): Map<Long, Long> {
+        if (!attachedOk || pid <= 0 || items.isEmpty()) return emptyMap()
+        if (rootDaemonActive) {
+            return RootMemDaemon.batchReadValues(items)
+        }
+        val out = HashMap<Long, Long>(items.size)
+        for ((addr, sz) in items) {
+            out[addr] = read(addr, sz.coerceIn(1, 8))
+        }
+        return out
+    }
+
     /** 批量读取连续字节块（供内存浏览器及偏移计算器使用） */
     fun readBlock(baseAddress: Long, length: Int): ByteArray {
         val safeLen = length.coerceIn(1, 16 * 1024 * 1024)
-        if (simulated) {
-            val out = ByteArray(safeLen)
-            var i = 0
-            while (i < safeLen) {
-                val addr = baseAddress + i
-                val cell = simCells[addr]
-                val v = cell?.value ?: syntheticValueAt(addr, 4)
-                for (b in 0 until 4) {
-                    if (i + b < safeLen) {
-                        out[i + b] = ((v ushr (b * 8)) and 0xFF).toByte()
-                    }
-                }
-                i += 4
-            }
-            return out
+        if (!attachedOk || pid <= 0) return ByteArray(safeLen)
+
+        if (rootDaemonActive) {
+            RootMemDaemon.readBlock(baseAddress, safeLen)?.let { return it }
         }
 
         if (nativeBackendActive && nativeHandle != 0L) {
@@ -323,33 +349,15 @@ class MemoryEngine {
 
     /** 写入一个地址的值 */
     fun write(address: Long, size: Int, value: Long): Boolean {
-        if (simulated) {
-            val existing = simCells[address]
-            if (existing != null) {
-                existing.previousValue = existing.value
-                existing.value = value and maskForSize(size)
-            } else {
-                val flags = when (size) {
-                    1 -> ValueType.BYTE
-                    2 -> ValueType.WORD
-                    4 -> ValueType.DWORD
-                    else -> ValueType.QWORD
-                }
-                simCells[address] = MemoryItem(
-                    address = address,
-                    value = value and maskForSize(size),
-                    previousValue = read(address, size),
-                    flags = flags,
-                    region = regionCodeAt(address)
-                )
-            }
-            return true
-        }
-
+        if (!attachedOk || pid <= 0) return false
         val safeSize = size.coerceIn(1, 8)
         val buf = ByteArray(safeSize)
         for (i in 0 until safeSize) {
             buf[i] = ((value ushr (i * 8)) and 0xFF).toByte()
+        }
+
+        if (rootDaemonActive) {
+            if (RootMemDaemon.writeBlock(address, buf)) return true
         }
 
         if (nativeBackendActive && nativeHandle != 0L) {
@@ -372,22 +380,28 @@ class MemoryEngine {
 
     /** 设置或取消指定地址的冻结锁值（同步到 C++20 ValueLocker 独立高频锁值线程） */
     fun setFreeze(address: Long, flags: Int, value: Long, enabled: Boolean) {
+        if (!attachedOk) return
+        val sz = ValueType.sizeOf(flags).coerceIn(1, 8)
+        val buf = ByteArray(sz)
+        for (i in 0 until sz) {
+            buf[i] = ((value ushr (i * 8)) and 0xFF).toByte()
+        }
+
+        if (rootDaemonActive) {
+            if (enabled) RootMemDaemon.lockAddress(address, buf)
+            else RootMemDaemon.unlockAddress(address)
+            return
+        }
+
         if (nativeBackendActive && nativeHandle != 0L) {
-            if (enabled) {
-                val sz = ValueType.sizeOf(flags).coerceIn(1, 8)
-                val buf = ByteArray(sz)
-                for (i in 0 until sz) {
-                    buf[i] = ((value ushr (i * 8)) and 0xFF).toByte()
-                }
-                NativeMemBridge.nativeLockAddress(nativeHandle, address, buf)
-            } else {
-                NativeMemBridge.nativeUnlockAddress(nativeHandle, address)
-            }
+            if (enabled) NativeMemBridge.nativeLockAddress(nativeHandle, address, buf)
+            else NativeMemBridge.nativeUnlockAddress(nativeHandle, address)
         }
     }
 
     /** 定时维持已保存列表中的冻结项（支持普通冻结、递增、递减与范围冻结） */
     fun tickFreeze(savedList: List<MemoryItem>) {
+        if (!attachedOk || pid <= 0) return
         for (item in savedList) {
             if (!item.freeze) continue
             val nextVal = when (item.freezeType) {
@@ -408,6 +422,9 @@ class MemoryEngine {
     }
 
     fun clearNativeFreezes() {
+        if (rootDaemonActive) {
+            RootMemDaemon.unlockAll()
+        }
         if (nativeBackendActive && nativeHandle != 0L) {
             NativeMemBridge.nativeUnlockAll(nativeHandle)
         }
@@ -415,13 +432,19 @@ class MemoryEngine {
 
     /**
      * 将起始地址 [fromAddress] 长度为 [bytesCount] 的内存块批量复制到 [toAddress]：
-     * 修复原版逐字节读写 (1600万次系统调用) 的性能瓶颈，改为 64KB 块缓冲复制。
+     * 采用 64KB 块缓冲复制。
      */
     fun copyMemory(fromAddress: Long, toAddress: Long, bytesCount: Long): Boolean {
+        if (!attachedOk || pid <= 0) return false
         val safeLen = bytesCount.coerceIn(0L, 16L * 1024L * 1024L).toInt()
         if (safeLen <= 0) return false
 
-        if (!simulated && nativeBackendActive && nativeHandle != 0L) {
+        if (rootDaemonActive) {
+            val copied = RootMemDaemon.copyMemory(fromAddress, toAddress, safeLen.toLong())
+            if (copied > 0L) return true
+        }
+
+        if (nativeBackendActive && nativeHandle != 0L) {
             val copied = NativeMemBridge.nativeCopyMemory(nativeHandle, fromAddress, toAddress, safeLen.toLong())
             if (copied > 0L) return true
         }
@@ -431,26 +454,13 @@ class MemoryEngine {
         while (offset < safeLen) {
             val step = min(chunkSize, safeLen - offset)
             val data = readBlock(fromAddress + offset, step)
-            if (simulated) {
-                var i = 0
-                while (i < step) {
-                    var v = 0L
-                    val elemLen = min(4, step - i)
-                    for (b in 0 until elemLen) {
-                        v = v or ((data[i + b].toLong() and 0xFFL) shl (b * 8))
-                    }
-                    write(toAddress + offset + i, elemLen, v)
-                    i += elemLen
+            try {
+                RandomAccessFile("/proc/$pid/mem", "rw").use { f ->
+                    f.seek(toAddress + offset)
+                    f.write(data, 0, step)
                 }
-            } else {
-                try {
-                    RandomAccessFile("/proc/$pid/mem", "rw").use { f ->
-                        f.seek(toAddress + offset)
-                        f.write(data, 0, step)
-                    }
-                } catch (_: Throwable) {
-                    return offset > 0
-                }
+            } catch (_: Throwable) {
+                return offset > 0
             }
             offset += step
         }
@@ -461,6 +471,7 @@ class MemoryEngine {
      * 导出指定区间 [startAddr, endAddr) 的内存数据到指定文件路径 [fullPath]
      */
     fun dumpMemory(startAddr: Long, endAddr: Long, fullPath: String): Boolean {
+        if (!attachedOk || pid <= 0) return false
         val total = (endAddr - startAddr).coerceIn(0L, 64L * 1024L * 1024L)
         if (total <= 0L) return false
         val outFile = runCatching {
@@ -471,7 +482,12 @@ class MemoryEngine {
             File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", fullPath.substringAfterLast('/'))
         }
 
-        if (!simulated && nativeBackendActive && nativeHandle != 0L) {
+        if (rootDaemonActive) {
+            val dumped = RootMemDaemon.dumpMemory(startAddr, endAddr, outFile.absolutePath)
+            if (dumped > 0L) return true
+        }
+
+        if (nativeBackendActive && nativeHandle != 0L) {
             val dumped = NativeMemBridge.nativeDumpMemory(nativeHandle, startAddr, endAddr, outFile.absolutePath)
             if (dumped > 0L) return true
         }
@@ -496,21 +512,29 @@ class MemoryEngine {
     /**
      * 搜索：previous == null 时全量扫描；previous != null 时在已有候选集基础上改善 (Refine)
      */
-    fun search(criteria: Criteria, previous: List<MemoryItem>? = null): SearchResult {
-        val newSearch = previous == null || previous.isEmpty()
+    fun search(
+        criteria: Criteria,
+        previous: List<MemoryItem>? = null,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): SearchResult {
+        if (!attachedOk || pid <= 0) return SearchResult(emptyList(), 0L)
+        val newSearch = previous == null
         val current = previous.orEmpty()
-        val items = when {
-            simulated -> searchSimulated(criteria, criteria.selectedRegions, current, newSearch, criteria.limit)
-            nativeBackendActive && nativeHandle != 0L -> searchViaNativeBridge(criteria, criteria.selectedRegions, current, newSearch, criteria.limit)
-            else -> searchRealJvmFallback(criteria, criteria.selectedRegions, current, newSearch, criteria.limit)
+        val fetchCap = criteria.limit.coerceIn(2000, MAX_CACHED_CANDIDATES)
+        return when {
+            rootDaemonActive -> searchViaRootDaemon(criteria, criteria.selectedRegions, current, newSearch, fetchCap, onProgress)
+            nativeBackendActive && nativeHandle != 0L -> searchViaNativeBridge(criteria, criteria.selectedRegions, current, newSearch, fetchCap)
+            else -> {
+                val items = searchRealJvmFallback(criteria, criteria.selectedRegions, current, newSearch, fetchCap)
+                SearchResult(items, items.size.toLong())
+            }
         }
-        return SearchResult(items)
     }
 
     /**
      * 模糊搜索：
-     * - previous == null 时进行初始采样
-     * - previous != null 时对比每个候选地址的新旧数值并按 sign 与 delta 过滤
+     * - initial == true 时进行初始未知值快照采样
+     * - initial == false 时对比每个候选地址的新旧数值并按 sign 与 delta 过滤
      */
     fun fuzzySearch(
         type: Int,
@@ -519,75 +543,59 @@ class MemoryEngine {
         onlyNth: Int = 0,
         previous: List<MemoryItem>? = null,
         selectedRegions: Set<String> = RegionCatalog.DEFAULT_SELECTED,
-        limit: Int = 5000,
+        limit: Int = MAX_CACHED_CANDIDATES,
         memoryFrom: Long = 0L,
-        memoryTo: Long = Long.MAX_VALUE
+        memoryTo: Long = Long.MAX_VALUE,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
     ): SearchResult {
-        val initial = previous == null || previous.isEmpty()
+        if (!attachedOk || pid <= 0) return SearchResult(emptyList(), 0L)
+        val initial = previous == null
         val current = previous.orEmpty()
         val hasDelta = delta != 0L
+        val fetchCap = limit.coerceIn(2000, MAX_CACHED_CANDIDATES)
         val dummyCriteria = Criteria(
             type = type,
             sign = sign,
             memoryFrom = memoryFrom,
             memoryTo = memoryTo,
             selectedRegions = selectedRegions,
-            limit = limit
+            limit = fetchCap
         )
 
-        if (simulated) {
-            val targetType = if (type == ValueType.AUTO) ValueType.DWORD else type
-            val candidates = if (initial) {
-                simCells.values
-                    .filter { it.region in selectedRegions && (type == ValueType.AUTO || (it.flags and targetType) != 0) }
-                    .filter { addressMatchesRangeAndMask(it.address, dummyCriteria) }
-                    .map { it.copy(previousValue = it.value) }
-            } else {
-                // 推进模拟内存中的动态变化，让用户体验真实的增加/减少/无变化筛选
-                val rng = Random(System.nanoTime())
-                simCells.values.forEach { cell ->
-                    cell.previousValue = cell.value
-                    when (rng.nextInt(4)) {
-                        0 -> {
-                            val step = if (hasDelta) abs(delta) else rng.nextInt(1, 25).toLong()
-                            cell.value = addTypedValue(cell.value, step, cell.flags)
-                        }
-                        1 -> {
-                            val step = if (hasDelta) -abs(delta) else -rng.nextInt(1, 25).toLong()
-                            cell.value = addTypedValue(cell.value, step, cell.flags)
-                        }
-                        else -> Unit
-                    }
-                }
-                var matchCounter = 0
-                current.mapNotNull { oldItem ->
-                    val live = simCells[oldItem.address] ?: return@mapNotNull null
-                    val oldVal = oldItem.value
-                    val newVal = live.value
-                    val itemType = oldItem.flags and 0x7F
-                    val pass = matchesFuzzyChange(newVal, oldVal, itemType, sign, delta, hasDelta)
-                    if (!pass) return@mapNotNull null
-                    matchCounter++
-                    if (onlyNth > 0 && (matchCounter % onlyNth) != 0) return@mapNotNull null
-                    oldItem.copy(
-                        value = newVal,
-                        previousValue = oldVal,
-                        pointer = classifyPointer(newVal)
-                    )
-                }
-            }
-            return SearchResult(candidates.take(limit))
-        }
-
-        // 真实进程模式 (Native C++20 或 JVM /proc/<pid>/mem)
         val targetType = if (type == ValueType.AUTO) ValueType.DWORD else type
         val size = ValueType.sizeOf(targetType)
+        val nativeDt = NativeMemBridge.toNativeDataType(targetType)
+
         if (initial) {
+            if (rootDaemonActive) {
+                val mask = NativeMemBridge.buildRegionMask(selectedRegions)
+                RootMemDaemon.setRegionMask(mask)
+                val totalFound = RootMemDaemon.startUnknownSnapshot(nativeDt, onProgress)
+                val cands = RootMemDaemon.getCandidates(0, fetchCap)
+                val out = ArrayList<MemoryItem>(cands.size)
+                for (c in cands) {
+                    val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((c.meta ushr 8) and 0xFFFF))
+                    if (addressMatchesRangeAndMask(c.address, dummyCriteria)) {
+                        out.add(
+                            MemoryItem(
+                                address = c.address,
+                                value = c.rawValue,
+                                previousValue = c.rawValue,
+                                flags = targetType,
+                                region = regCode,
+                                pointer = classifyPointer(c.rawValue)
+                            )
+                        )
+                    }
+                }
+                return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
+            }
+
             if (nativeBackendActive && nativeHandle != 0L) {
                 val mask = NativeMemBridge.buildRegionMask(selectedRegions)
                 NativeMemBridge.nativeSetRegionMask(nativeHandle, mask)
-                NativeMemBridge.nativeStartUnknownSnapshot(nativeHandle, NativeMemBridge.toNativeDataType(targetType))
-                val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, limit)
+                val totalFound = NativeMemBridge.nativeStartUnknownSnapshot(nativeHandle, nativeDt)
+                val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap)
                 if (packed != null && packed.isNotEmpty()) {
                     val out = ArrayList<MemoryItem>(packed.size / 3)
                     var i = 0
@@ -597,15 +605,83 @@ class MemoryEngine {
                         val meta = packed[i + 2].toInt()
                         val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((meta ushr 8) and 0xFFFF))
                         if (addressMatchesRangeAndMask(addr, dummyCriteria)) {
-                            out.add(MemoryItem(address = addr, value = v, previousValue = v, flags = targetType, region = regCode, pointer = classifyPointer(v)))
+                            out.add(
+                                MemoryItem(
+                                    address = addr,
+                                    value = v,
+                                    previousValue = v,
+                                    flags = targetType,
+                                    region = regCode,
+                                    pointer = classifyPointer(v)
+                                )
+                            )
                         }
                         i += 3
                     }
-                    if (out.isNotEmpty()) return SearchResult(out)
+                    return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
                 }
             }
             val c = dummyCriteria.copy(type = targetType, sign = ValueType.SIGN_EQUAL)
-            return SearchResult(searchRealJvmFallback(c, selectedRegions, emptyList(), newSearch = true, maxResults = limit))
+            val fallback = searchRealJvmFallback(c, selectedRegions, emptyList(), newSearch = true, maxResults = fetchCap)
+            return SearchResult(fallback, fallback.size.toLong())
+        }
+
+        // 若使用 C++20 引擎快照并且未启用 onlyNth 跳步过滤，优先调用 C++20 refineFuzzy 在全量候选集上筛选
+        if (onlyNth <= 0 && (rootDaemonActive || (nativeBackendActive && nativeHandle != 0L))) {
+            val deltaOp = when {
+                hasDelta -> NativeMemBridge.OP_DELTA_EXACT
+                (sign and ValueType.SIGN_MASK) == ValueType.SIGN_NOT_EQUAL -> NativeMemBridge.OP_CHANGED
+                (sign and ValueType.SIGN_MASK) == ValueType.SIGN_GREATER_EQ -> NativeMemBridge.OP_INCREASED
+                (sign and ValueType.SIGN_MASK) == ValueType.SIGN_LESS_EQ -> NativeMemBridge.OP_DECREASED
+                else -> NativeMemBridge.OP_UNCHANGED
+            }
+            if (rootDaemonActive) {
+                val totalFound = RootMemDaemon.refineFuzzy(deltaOp, delta, delta.toDouble(), 1e-4, onProgress)
+                val cands = RootMemDaemon.getCandidates(0, fetchCap)
+                val prevMap = current.associate { it.address to it.value }
+                val out = ArrayList<MemoryItem>(cands.size)
+                for (c in cands) {
+                    if (!addressMatchesRangeAndMask(c.address, dummyCriteria)) continue
+                    val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((c.meta ushr 8) and 0xFFFF))
+                    out.add(
+                        MemoryItem(
+                            address = c.address,
+                            value = c.rawValue,
+                            previousValue = prevMap[c.address] ?: c.rawValue,
+                            flags = targetType,
+                            region = regCode,
+                            pointer = classifyPointer(c.rawValue)
+                        )
+                    )
+                }
+                return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
+            } else if (nativeBackendActive && nativeHandle != 0L) {
+                val totalFound = NativeMemBridge.nativeRefineFuzzy(nativeHandle, deltaOp, delta, delta.toDouble(), 1e-4)
+                val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap) ?: LongArray(0)
+                val prevMap = current.associate { it.address to it.value }
+                val out = ArrayList<MemoryItem>(packed.size / 3)
+                var i = 0
+                while (i + 2 < packed.size) {
+                    val addr = packed[i]
+                    val v = packed[i + 1]
+                    val meta = packed[i + 2].toInt()
+                    val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((meta ushr 8) and 0xFFFF))
+                    if (addressMatchesRangeAndMask(addr, dummyCriteria)) {
+                        out.add(
+                            MemoryItem(
+                                address = addr,
+                                value = v,
+                                previousValue = prevMap[addr] ?: v,
+                                flags = targetType,
+                                region = regCode,
+                                pointer = classifyPointer(v)
+                            )
+                        )
+                    }
+                    i += 3
+                }
+                return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
+            }
         }
 
         var matchCounter = 0
@@ -622,10 +698,10 @@ class MemoryEngine {
                 pointer = classifyPointer(now)
             )
         }
-        return SearchResult(refined.take(limit))
+        return SearchResult(refined.take(fetchCap), refined.size.toLong())
     }
 
-    /** 地址蒙版搜索 */
+    /** 地址蒙版搜索：在选定内存区域或已有候选集中匹配 `(address & maskBits) == (addressPattern & maskBits)` */
     fun maskSearch(
         addressPattern: Long,
         maskBits: Long,
@@ -633,44 +709,52 @@ class MemoryEngine {
         sign: Int,
         previous: List<MemoryItem>? = null,
         selectedRegions: Set<String> = RegionCatalog.DEFAULT_SELECTED,
-        limit: Int = 5000
+        limit: Int = MAX_CACHED_CANDIDATES
     ): SearchResult {
+        if (!attachedOk || pid <= 0) return SearchResult(emptyList(), 0L)
         val targetType = if (type == ValueType.AUTO) ValueType.DWORD else type
-        val newSearch = previous == null || previous.isEmpty()
-        val pool = if (newSearch) {
-            if (simulated) simCells.values.toList()
-            else searchRealJvmFallback(
-                Criteria(type = targetType, selectedRegions = selectedRegions, limit = limit),
-                selectedRegions,
-                emptyList(),
-                newSearch = true,
-                maxResults = limit
-            )
-        } else previous.orEmpty()
+        val size = ValueType.sizeOf(targetType).coerceAtLeast(1)
+        val newSearch = previous == null
+        val fetchCap = limit.coerceIn(2000, MAX_CACHED_CANDIDATES)
 
-        val matched = pool.filter { item ->
-            item.region in selectedRegions && ((item.address and maskBits) == (addressPattern and maskBits))
-        }.take(limit).toMutableList()
+        if (!newSearch) {
+            val matched = previous.orEmpty().filter { item ->
+                item.region in selectedRegions && ((item.address and maskBits) == (addressPattern and maskBits))
+            }.map { item ->
+                val v = read(item.address, ValueType.sizeOf(item.flags and 0x7F))
+                item.copy(value = v, previousValue = item.value, pointer = classifyPointer(v))
+            }
+            return SearchResult(matched.take(fetchCap), matched.size.toLong())
+        }
 
-        if (simulated && newSearch && matched.isEmpty()) {
-            val reg = selectedRegions.firstOrNull() ?: "Ca"
-            for (k in 0 until 6) {
-                val baseAddr = (addressPattern and maskBits) or ((k.toLong() shl 12) and maskBits.inv())
-                val aligned = baseAddr and -4L
-                val v = 100L + k * 25L
-                val item = MemoryItem(
-                    address = aligned,
-                    value = v,
-                    previousValue = v,
-                    flags = targetType,
-                    region = reg,
-                    pointer = classifyPointer(v)
-                )
-                simCells[aligned] = item
-                matched.add(item)
+        val targetMasked = addressPattern and maskBits
+        val out = ArrayList<MemoryItem>(min(fetchCap, 2048))
+        var totalFound = 0L
+        val regs = regions().filter { it.code in selectedRegions && it.perms.startsWith("r") && it.size > 0 }
+        for (reg in regs) {
+            var addr = reg.start
+            val end = minOf(reg.end, reg.start + 16L * 1024 * 1024)
+            while (addr + size <= end) {
+                if ((addr and maskBits) == targetMasked) {
+                    totalFound++
+                    if (out.size < fetchCap) {
+                        val v = read(addr, size)
+                        out.add(
+                            MemoryItem(
+                                address = addr,
+                                value = v,
+                                previousValue = v,
+                                flags = targetType,
+                                region = reg.code,
+                                pointer = classifyPointer(v)
+                            )
+                        )
+                    }
+                }
+                addr += size
             }
         }
-        return SearchResult(matched)
+        return SearchResult(out, totalFound)
     }
 
     /** 指针链搜索：查找值指向 [targetAddress - maxOffset, targetAddress + maxOffset] 的指针条目 */
@@ -680,89 +764,247 @@ class MemoryEngine {
         type: Int,
         previous: List<MemoryItem>? = null,
         selectedRegions: Set<String> = RegionCatalog.DEFAULT_SELECTED,
-        limit: Int = 5000
+        limit: Int = MAX_CACHED_CANDIDATES,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
     ): SearchResult {
+        if (!attachedOk || pid <= 0) return SearchResult(emptyList(), 0L)
         val ptrType = if (type == ValueType.AUTO || type == ValueType.DWORD) {
             if (x64) ValueType.QWORD else ValueType.DWORD
         } else type
         val cleanTarget = targetAddress and 0x00FFFFFFFFFFFFFFL
         val lo = (cleanTarget - maxOffset.coerceAtLeast(0L)).coerceAtLeast(0L)
         val hi = cleanTarget + maxOffset.coerceAtLeast(0L)
+        val fetchCap = limit.coerceIn(2000, MAX_CACHED_CANDIDATES)
 
-        if (!simulated && nativeBackendActive && nativeHandle != 0L && (previous == null || previous.isEmpty())) {
-            val mask = NativeMemBridge.buildRegionMask(selectedRegions)
-            NativeMemBridge.nativeSetRegionMask(nativeHandle, mask)
-            NativeMemBridge.nativeSearchRange(
-                nativeHandle,
-                NativeMemBridge.toNativeDataType(ptrType),
-                lo,
-                hi,
-                lo.toDouble(),
-                hi.toDouble(),
-                false,
-                true
-            )
-            val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, limit)
-            if (packed != null && packed.isNotEmpty()) {
-                val out = ArrayList<MemoryItem>(packed.size / 3)
-                var i = 0
-                while (i + 2 < packed.size) {
-                    val addr = packed[i]
-                    val rawVal = packed[i + 1]
-                    val meta = packed[i + 2].toInt()
-                    val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((meta ushr 8) and 0xFFFF))
+        if (previous == null) {
+            if (rootDaemonActive) {
+                val mask = NativeMemBridge.buildRegionMask(selectedRegions)
+                RootMemDaemon.setRegionMask(mask)
+                val totalFound = RootMemDaemon.searchRange(
+                    NativeMemBridge.toNativeDataType(ptrType),
+                    lo,
+                    hi,
+                    lo.toDouble(),
+                    hi.toDouble(),
+                    true,
+                    true,
+                    onProgress
+                )
+                val cands = RootMemDaemon.getCandidates(0, fetchCap)
+                val out = ArrayList<MemoryItem>(cands.size)
+                for (c in cands) {
+                    val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((c.meta ushr 8) and 0xFFFF))
                     out.add(
                         MemoryItem(
-                            address = addr,
-                            value = rawVal,
-                            previousValue = rawVal,
+                            address = c.address,
+                            value = c.rawValue,
+                            previousValue = c.rawValue,
                             flags = ptrType,
                             region = regCode,
-                            pointer = classifyPointer(rawVal)
+                            pointer = classifyPointer(c.rawValue)
                         )
                     )
-                    i += 3
                 }
-                if (out.isNotEmpty()) return SearchResult(out)
+                return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
             }
-        }
 
-        val pool = if (previous != null && previous.isNotEmpty()) {
-            previous
-        } else if (simulated) {
-            simCells.values.toList()
-        } else {
-            emptyList()
-        }
-        val matched = pool.filter { item ->
-            val cleanVal = item.value and 0x00FFFFFFFFFFFFFFL
-            item.region in selectedRegions && cleanVal in lo..hi
-        }.take(limit).toMutableList()
-
-        if (simulated && matched.isEmpty()) {
-            val reg = selectedRegions.firstOrNull() ?: "Ca"
-            val offsets = longArrayOf(0L, 0x10L, 0x24L, 0x48L, -0x18L, 0x80L)
-            for ((idx, off) in offsets.withIndex()) {
-                if (abs(off) > maxOffset) continue
-                val holderAddr = (0x79F1720000L + idx * 0x18L) and -8L
-                val pointedVal = (cleanTarget + off).coerceAtLeast(0x10000L)
-                val item = MemoryItem(
-                    address = holderAddr,
-                    value = pointedVal,
-                    previousValue = pointedVal,
-                    flags = ptrType,
-                    region = reg,
-                    pointer = 16
+            if (nativeBackendActive && nativeHandle != 0L) {
+                val mask = NativeMemBridge.buildRegionMask(selectedRegions)
+                NativeMemBridge.nativeSetRegionMask(nativeHandle, mask)
+                val totalFound = NativeMemBridge.nativeSearchRange(
+                    nativeHandle,
+                    NativeMemBridge.toNativeDataType(ptrType),
+                    lo,
+                    hi,
+                    lo.toDouble(),
+                    hi.toDouble(),
+                    true,
+                    true
                 )
-                simCells[holderAddr] = item
-                matched.add(item)
+                val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap)
+                if (packed != null && packed.isNotEmpty()) {
+                    val out = ArrayList<MemoryItem>(packed.size / 3)
+                    var i = 0
+                    while (i + 2 < packed.size) {
+                        val addr = packed[i]
+                        val rawVal = packed[i + 1]
+                        val meta = packed[i + 2].toInt()
+                        val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((meta ushr 8) and 0xFFFF))
+                        out.add(
+                            MemoryItem(
+                                address = addr,
+                                value = rawVal,
+                                previousValue = rawVal,
+                                flags = ptrType,
+                                region = regCode,
+                                pointer = classifyPointer(rawVal)
+                            )
+                        )
+                        i += 3
+                    }
+                    return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
+                }
             }
         }
-        return SearchResult(matched)
+
+        val matched = previous.orEmpty().mapNotNull { item ->
+            val v = read(item.address, ValueType.sizeOf(ptrType))
+            val cleanVal = v and 0x00FFFFFFFFFFFFFFL
+            if (item.region in selectedRegions && cleanVal in lo..hi) {
+                item.copy(value = v, previousValue = item.value, pointer = classifyPointer(v))
+            } else null
+        }
+        return SearchResult(matched.take(fetchCap), matched.size.toLong())
     }
 
     /**
-     * 通过 C++20 MemEngine JNI 执行高性能多线程 + SIMD 检索
+     * 通过持久化 Root C++20 守护进程 (`RootMemDaemon`) 执行全速跨进程扫描与改善
+     */
+    private fun searchViaRootDaemon(
+        c: Criteria,
+        regions: Set<String>,
+        current: List<MemoryItem>,
+        newSearch: Boolean,
+        maxResults: Int,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): SearchResult {
+        val regMask = NativeMemBridge.buildRegionMask(regions)
+        RootMemDaemon.setRegionMask(regMask)
+
+        val nativeDt = NativeMemBridge.toNativeDataType(c.type)
+        val fVal1 = when (c.type and 0x7F) {
+            ValueType.FLOAT -> Float.fromBits(c.from.toInt()).toDouble()
+            ValueType.DOUBLE -> Double.fromBits(c.from)
+            else -> c.from.toDouble()
+        }
+        val fVal2 = when (c.type and 0x7F) {
+            ValueType.FLOAT -> Float.fromBits(c.to.toInt()).toDouble()
+            ValueType.DOUBLE -> Double.fromBits(c.to)
+            else -> c.to.toDouble()
+        }
+
+        val totalFound: Long = if (newSearch) {
+            when {
+                c.isText && c.textBytes.isNotEmpty() -> {
+                    val maskStr = "x".repeat(c.textBytes.size)
+                    RootMemDaemon.searchPattern(c.textBytes, maskStr, onProgress)
+                }
+                c.orderedGroup.size > 1 -> {
+                    val count = c.orderedGroup.size
+                    val typesArr = IntArray(count) { i ->
+                        NativeMemBridge.toNativeDataType(c.groupTypes.getOrElse(i) { c.type })
+                    }
+                    val intArr = LongArray(count) { i -> c.orderedGroup[i] }
+                    val fltArr = DoubleArray(count) { i ->
+                        val gt = c.groupTypes.getOrElse(i) { c.type } and 0x7F
+                        val raw = c.orderedGroup[i]
+                        when (gt) {
+                            ValueType.FLOAT -> Float.fromBits(raw.toInt()).toDouble()
+                            ValueType.DOUBLE -> Double.fromBits(raw)
+                            else -> raw.toDouble()
+                        }
+                    }
+                    RootMemDaemon.searchGroup(
+                        typesArr,
+                        intArr,
+                        fltArr,
+                        c.area.coerceIn(16, 65536),
+                        c.ordered,
+                        true,
+                        onProgress
+                    )
+                }
+                c.xorKey != 0L -> {
+                    RootMemDaemon.searchEncoded(
+                        nativeDt,
+                        NativeMemBridge.ENC_XOR_STATIC,
+                        c.value,
+                        fVal1,
+                        c.xorKey,
+                        true,
+                        onProgress
+                    )
+                }
+                c.encryptedXor -> {
+                    RootMemDaemon.searchEncoded(
+                        nativeDt,
+                        if ((c.type and 0x7F) == ValueType.QWORD || (c.type and 0x7F) == ValueType.DOUBLE) {
+                            NativeMemBridge.ENC_XOR_PAIR_64
+                        } else {
+                            NativeMemBridge.ENC_XOR_PAIR_32
+                        },
+                        c.value,
+                        fVal1,
+                        0L,
+                        true,
+                        onProgress
+                    )
+                }
+                c.isRange && !c.notRange -> {
+                    RootMemDaemon.searchRange(
+                        nativeDt,
+                        minOf(c.from, c.to),
+                        maxOf(c.from, c.to),
+                        minOf(fVal1, fVal2),
+                        maxOf(fVal1, fVal2),
+                        true,
+                        true,
+                        onProgress
+                    )
+                }
+                (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL -> {
+                    RootMemDaemon.searchExact(
+                        nativeDt,
+                        c.value,
+                        fVal1,
+                        1e-4,
+                        true,
+                        onProgress
+                    )
+                }
+                else -> {
+                    val fallback = searchRealJvmFallback(c, regions, current, true, maxResults)
+                    return SearchResult(fallback, fallback.size.toLong())
+                }
+            }
+        } else {
+            if (!c.isRange && !c.isText && c.orderedGroup.size <= 1 &&
+                c.xorKey == 0L && !c.encryptedXor &&
+                (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL
+            ) {
+                RootMemDaemon.refineExact(nativeDt, c.value, fVal1, 1e-4, onProgress)
+            } else {
+                val refined = refineLoadedCandidates(c, current, maxResults)
+                return SearchResult(refined, refined.size.toLong())
+            }
+        }
+
+        val cands = RootMemDaemon.getCandidates(0, maxResults)
+        val out = ArrayList<MemoryItem>(cands.size)
+        val hasAddrFilter = (c.memoryFrom != 0L || c.memoryTo != Long.MAX_VALUE)
+        for (cand in cands) {
+            val dt = NativeMemBridge.fromNativeDataType(cand.meta and 0xFF)
+            val regFlag = (cand.meta ushr 8) and 0xFFFF
+            val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl regFlag)
+            if (addressMatchesRangeAndMask(cand.address, c)) {
+                out.add(
+                    MemoryItem(
+                        address = cand.address,
+                        value = cand.rawValue,
+                        previousValue = cand.rawValue,
+                        flags = if (c.type == ValueType.AUTO) dt else c.type,
+                        region = regCode,
+                        pointer = classifyPointer(cand.rawValue)
+                    )
+                )
+            }
+        }
+        val reportedTotal = if (hasAddrFilter) out.size.toLong() else totalFound.coerceAtLeast(out.size.toLong())
+        return SearchResult(out, reportedTotal)
+    }
+
+    /**
+     * 通过进程内 C++20 MemEngine JNI (`NativeMemBridge`) 执行多线程 + SIMD 检索
      */
     private fun searchViaNativeBridge(
         c: Criteria,
@@ -770,7 +1012,7 @@ class MemoryEngine {
         current: List<MemoryItem>,
         newSearch: Boolean,
         maxResults: Int
-    ): List<MemoryItem> {
+    ): SearchResult {
         val regMask = NativeMemBridge.buildRegionMask(regions)
         NativeMemBridge.nativeSetRegionMask(nativeHandle, regMask)
 
@@ -786,7 +1028,7 @@ class MemoryEngine {
             else -> c.to.toDouble()
         }
 
-        if (newSearch) {
+        val totalFound: Long = if (newSearch) {
             when {
                 c.isText && c.textBytes.isNotEmpty() -> {
                     val maskStr = "x".repeat(c.textBytes.size)
@@ -855,7 +1097,7 @@ class MemoryEngine {
                         true
                     )
                 }
-                (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL && c.mask == -1L && c.memoryFrom == 0L && c.memoryTo == Long.MAX_VALUE -> {
+                (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL -> {
                     NativeMemBridge.nativeSearchExact(
                         nativeHandle,
                         nativeDt,
@@ -866,15 +1108,25 @@ class MemoryEngine {
                     )
                 }
                 else -> {
-                    return searchRealJvmFallback(c, regions, current, true, maxResults)
+                    val fallback = searchRealJvmFallback(c, regions, current, true, maxResults)
+                    return SearchResult(fallback, fallback.size.toLong())
                 }
             }
         } else {
-            return searchRealJvmFallback(c, regions, current, false, maxResults)
+            if (!c.isRange && !c.isText && c.orderedGroup.size <= 1 &&
+                c.xorKey == 0L && !c.encryptedXor &&
+                (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL
+            ) {
+                NativeMemBridge.nativeRefineExact(nativeHandle, nativeDt, c.value, fVal1, 1e-4)
+            } else {
+                val refined = refineLoadedCandidates(c, current, maxResults)
+                return SearchResult(refined, refined.size.toLong())
+            }
         }
 
         val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, maxResults) ?: LongArray(0)
         val out = ArrayList<MemoryItem>(packed.size / 3)
+        val hasAddrFilter = (c.memoryFrom != 0L || c.memoryTo != Long.MAX_VALUE)
         var idx = 0
         while (idx + 2 < packed.size) {
             val addr = packed[idx]
@@ -897,6 +1149,32 @@ class MemoryEngine {
                 )
             }
             idx += 3
+        }
+        val reportedTotal = if (hasAddrFilter) out.size.toLong() else totalFound.coerceAtLeast(out.size.toLong())
+        return SearchResult(out, reportedTotal)
+    }
+
+    private fun refineLoadedCandidates(
+        criteria: Criteria,
+        current: List<MemoryItem>,
+        maxResults: Int
+    ): List<MemoryItem> {
+        val out = ArrayList<MemoryItem>(min(maxResults, current.size))
+        val prevMap = current.associate { it.address to it.value }
+        for (item in current) {
+            if (!addressMatchesRangeAndMask(item.address, criteria)) continue
+            val itemSize = ValueType.sizeOf(item.flags and 0x7F)
+            val v = read(item.address, itemSize)
+            if (matches(v, criteria.copy(type = item.flags and 0x7F), prevMap, item.address)) {
+                out.add(
+                    item.copy(
+                        value = v,
+                        previousValue = item.value,
+                        pointer = classifyPointer(v)
+                    )
+                )
+                if (out.size >= maxResults) break
+            }
         }
         return out
     }
@@ -943,67 +1221,146 @@ class MemoryEngine {
         val writable = perms.length > 1 && perms[1] == 'w'
         val executable = perms.length > 2 && perms[2] == 'x'
         val isPrivate = perms.length > 3 && perms[3] == 'p'
+        val p = path
 
-        if (!readable) return "B"
-        val p = path.lowercase()
-
-        if ("ppsspp" in p || "psp_ram" in p || "psp_vram" in p) return "Ps"
-        if (p.endsWith(".ttf") || p.endsWith(".otf") || p.endsWith(".ttc") ||
-            "/system/fonts/" in p || p == "[vvar]" || p == "[vectors]" ||
-            p.startsWith("/dev/binder") || p.startsWith("/dev/hwbinder") ||
-            "guard" in p
-        ) return "B"
-
-        if ("kgsl" in p || "/dev/mali" in p || "/dev/ion" in p ||
-            "/dev/dma_heap" in p || "/dev/dri" in p || "gralloc" in p
-        ) return "V"
-
-        if (p == "[stack]" || p.startsWith("[stack:") || p.startsWith("[anon:stack_and_tls")) return "S"
-        if (p == "[heap]" || p.startsWith("[heap:")) return "Ch"
-
-        if ("dalvik-" in p || p.startsWith("[anon:art_") ||
-            "main space" in p || "alloc space" in p || "region space" in p ||
-            "large object space" in p || "zygote" in p
-        ) {
-            if (executable) return "Xa"
-            val isMainHeap = "main space" in p || "alloc space" in p ||
-                "region space" in p || "large object" in p ||
-                "non moving space" in p || "zygote space" in p
-            return if (writable && isMainHeap) "Jh" else "J"
+        // 1. PPSSPP 模拟器专属内存 (Ps)
+        if (p.contains("PPSSPP", true) || p.contains("psp_ram", true) || p.contains("psp_vram", true)) {
+            return "Ps"
         }
-        if (p.endsWith(".vdex") || p.endsWith(".dex")) return "J"
 
-        if ("libc_malloc" in p || "scudo" in p || "jemalloc" in p || "gwp-asan" in p || "bionic_alloc" in p) {
+        // 2. Bad (B - 危险/字体/ICU/Binder/内核特殊映射) 与 Other (O - 含 ---p 保留地址段)
+        if (p.endsWith(".ttf", true) || p.endsWith(".otf", true) ||
+            p.endsWith(".ttc", true) || p.endsWith(".woff", true) ||
+            "/fonts/" in p || "/system/usr/icu/" in p ||
+            "/apex/com.android.i18n/etc/icu/" in p || "icudt" in p ||
+            "hyphen-data" in p || p.endsWith(".hyb", true) ||
+            p == "[vvar]" || p == "[vectors]" || p == "[sigpage]" ||
+            p == "[uprobes]" || p == "[kuserhelpers]" ||
+            p.startsWith("/dev/binder") || p.startsWith("/dev/hwbinder") ||
+            p.startsWith("/dev/vndbinder") || p.startsWith("/dev/__properties__") ||
+            p.startsWith("/dev/event-log-tags") || p.startsWith("/dev/pmsg") ||
+            p.startsWith("/dev/kmsg") || p.startsWith("/dev/null") ||
+            p.startsWith("/dev/urandom") || p.startsWith("/dev/random") ||
+            p.startsWith("/dev/cpuctl") || p.startsWith("/dev/cpuset") ||
+            p.startsWith("/dev/stune") || p.startsWith("/dev/blkio") ||
+            p.startsWith("[anon:GWP-ASan Guard")
+        ) {
+            return "B"
+        }
+        if (!readable) {
+            return "O"
+        }
+
+        // 3. Video / GPU 显存与图形缓冲区 (V)
+        if ("kgsl" in p || "/dev/mali" in p || "/dev/pvr" in p ||
+            "/dev/nvhost" in p || "/dev/ion" in p || "/dev/dma_heap" in p ||
+            "/dev/dri/" in p || "gralloc" in p || "/dev/ashmem/GFX" in p ||
+            "dmabuf" in p || "[anon:gralloc" in p
+        ) {
+            return "V"
+        }
+
+        // 4. 可执行代码段优先分类 (Xa vs Xs)
+        if (executable) {
+            if (p == "[vdso]" || p == "[vsyscall]" ||
+                p.startsWith("/memfd:jit-cache") || p.startsWith("/memfd:jit-zygote-cache") ||
+                "jit-code-cache" in p || "jit-zygote-cache" in p
+            ) {
+                return "Xs"
+            }
+            if (p.startsWith("/data/dalvik-cache/")) {
+                val isUserAppDalvik = "data@app@" in p || "mnt@expand@" in p || "data@data@" in p
+                return if (isUserAppDalvik) "Xa" else "Xs"
+            }
+            val isAppCode = p.startsWith("/data/app/") || p.startsWith("/data/data/") ||
+                p.startsWith("/data/user/") || p.startsWith("/data/user_de/") ||
+                p.startsWith("/mnt/asec/") || p.startsWith("/mnt/expand/") ||
+                p.startsWith("/sdcard/") || p.startsWith("/storage/")
+            if (isAppCode) return "Xa"
+            if (p.isEmpty() || p.startsWith("[anon:")) {
+                return if (writable) "Xa" else "Xs"
+            }
+            return "Xs"
+        }
+
+        // 5. Stack 线程栈与主栈 (S)
+        if (p == "[stack]" || p.startsWith("[stack:") ||
+            p.startsWith("[anon:stack_and_tls") || p.startsWith("[anon:thread signal stack") ||
+            p.startsWith("[anon:bionic_tls")
+        ) {
+            return "S"
+        }
+
+        // 6. C++ Traditional Brk Heap (Ch)
+        if (p == "[heap]" || p.startsWith("[heap:")) {
+            return "Ch"
+        }
+
+        // 7. Java Heap (Jh) vs Java Runtime (J)
+        if ("dalvik-" in p || p.startsWith("[anon:dalvik-") ||
+            p.startsWith("/dev/ashmem/dalvik-") || p.startsWith("/memfd:dalvik-") ||
+            p.startsWith("[anon:art_") || p.startsWith("/memfd:jit-")
+        ) {
+            val isJavaMetadataOrJit = "bitmap" in p || "mark-stack" in p ||
+                "allocation-stack" in p || "live-stack" in p ||
+                "card-table" in p || "card table" in p ||
+                "mod-union" in p || "LinearAlloc" in p ||
+                "indirect-ref" in p || "reference table" in p ||
+                "aux-structure" in p || "CompilerMetadata" in p ||
+                "jit" in p || "zygote" in p || "non moving" in p ||
+                "image space" in p || "intern table" in p || "class table" in p
+            if (isJavaMetadataOrJit) return "J"
+
+            val isObjectAllocHeap = "main space" in p || "alloc space" in p ||
+                "region space" in p || "large object" in p ||
+                "bump-pointer" in p || "rosalloc" in p ||
+                "dlmalloc" in p || "free list" in p
+            return if (writable && isObjectAllocHeap) "Jh" else "J"
+        }
+
+        if (p.endsWith(".art") || p.endsWith(".vdex") || p.endsWith(".dex") || p.endsWith(".jar")) {
+            return "J"
+        }
+
+        // 8. C++ Alloc (Ca)
+        if ("libc_malloc" in p || "scudo:" in p || "jemalloc" in p ||
+            "GWP-ASan" in p || "bionic_alloc" in p || "malloc" in p
+        ) {
             return "Ca"
         }
 
-        if (p == "[anon:.bss]" || p.startsWith("[anon:bss")) return "Cb"
-        if (p.isEmpty() && writable && !executable && isPrivate &&
-            (prevFileBackedPath.endsWith(".so") || ".so!" in prevFileBackedPath)
-        ) {
+        // 9. C++ .bss (Cb)
+        if (p == "[anon:.bss]" || p.startsWith("[anon:.bss") || p.startsWith("[anon:bss")) {
+            return "Cb"
+        }
+        val prevIsNativeElf = prevFileBackedPath.isNotEmpty() &&
+            (prevFileBackedPath.endsWith(".so") || ".so!" in prevFileBackedPath ||
+                prevFileBackedPath.startsWith("/system/bin/") || prevFileBackedPath.startsWith("/apex/")) &&
+            !prevFileBackedPath.endsWith(".art") && !prevFileBackedPath.endsWith(".oat") &&
+            !prevFileBackedPath.endsWith(".dex") && !prevFileBackedPath.endsWith(".vdex") &&
+            !prevFileBackedPath.endsWith(".apk")
+        if (p.isEmpty() && writable && isPrivate && prevIsNativeElf) {
             return "Cb"
         }
 
-        if ("ashmem" in p || p.startsWith("/memfd:")) {
-            return if (executable) "Xa" else "As"
+        // 10. Ashmem (As) — 严格匹配真实 Android 匿名共享内存
+        if ((p.startsWith("/dev/ashmem") && "dalvik" !in p && "jit" !in p) ||
+            p.startsWith("[anon:ashmem") || p.startsWith("/memfd:ashmem")
+        ) {
+            return "As"
         }
 
+        // 11. Anonymous (A)
         if (p.isEmpty() || p.startsWith("[anon:")) {
-            if (executable) return "Xa"
-            return if (writable) "A" else "O"
+            return if (writable && isPrivate) "A" else "O"
         }
 
-        if (p == "[vdso]" || p == "[vsyscall]") return "Xs"
-
-        val isSys = p.startsWith("/system/") || p.startsWith("/apex/") ||
-            p.startsWith("/vendor/") || p.startsWith("/product/")
-        val isApp = p.startsWith("/data/app/") || p.startsWith("/data/data/") || p.startsWith("/data/user/")
-
-        if (executable) {
-            return if (isSys && !isApp) "Xs" else "Xa"
-        }
-
-        if (writable && isPrivate && (p.endsWith(".so") || ".so" in p || p.endsWith(".art") || inode > 0)) {
+        // 12. C++ .data (Cd)
+        val isNativeElfData = (p.endsWith(".so") || ".so!" in p ||
+            p.startsWith("/system/bin/") || p.startsWith("/vendor/bin/") || p.startsWith("/apex/")) &&
+            !p.endsWith(".art") && !p.endsWith(".oat") && !p.endsWith(".dex") &&
+            !p.endsWith(".vdex") && !p.endsWith(".apk") && !p.endsWith(".jar")
+        if (writable && isPrivate && isNativeElfData) {
             return "Cd"
         }
 
@@ -1017,36 +1374,16 @@ class MemoryEngine {
         newSearch: Boolean,
         maxResults: Int
     ): List<MemoryItem> {
+        if (!newSearch && current.isNotEmpty()) {
+            return refineLoadedCandidates(criteria, current, maxResults)
+        }
+
         val targetType = if (criteria.type == ValueType.AUTO) ValueType.DWORD else criteria.type
         val size = ValueType.sizeOf(targetType)
         val out = ArrayList<MemoryItem>(min(maxResults, 2048))
 
-        if (!newSearch && current.isNotEmpty()) {
-            val prevMap = current.associate { it.address to it.value }
-            for (item in current) {
-                if (!addressMatchesRangeAndMask(item.address, criteria)) continue
-                val itemSize = ValueType.sizeOf(item.flags and 0x7F)
-                val v = read(item.address, itemSize)
-                if (matches(v, criteria.copy(type = item.flags and 0x7F), prevMap, item.address)) {
-                    out.add(
-                        item.copy(
-                            value = v,
-                            previousValue = item.value,
-                            pointer = classifyPointer(v)
-                        )
-                    )
-                }
-            }
-            return out
-        }
-
-        val lines = runCatching { File("/proc/$pid/maps").readLines() }.getOrDefault(emptyList())
-        var prevPath = ""
-        val segs = lines.mapNotNull {
-            val s = parseMapLine(it, prevPath)
-            if (s != null) prevPath = s.prevPathNext
-            s
-        }.filter { it.code in regions && it.perms.startsWith("r") && (it.end - it.start) <= 64L * 1024 * 1024 }
+        val segs = regions()
+            .filter { it.code in regions && it.perms.startsWith("r") && it.size in 1L..(64L * 1024 * 1024) }
 
         val buffer = ByteArray(64 * 1024 + 16)
         runCatching {
@@ -1130,229 +1467,6 @@ class MemoryEngine {
         return out
     }
 
-    // ---------------- 模拟环境构建与检索（支持全部高级语法） ----------------
-
-    private fun buildSimulatedProcess(targetPid: Int) {
-        val rng = Random(targetPid.toLong() xor 0x5DEECE66DL)
-        val regionCodes = listOf("Jh", "Ch", "Ca", "Cd", "Cb", "A", "S", "As", "J", "Ps", "Xa", "Xs")
-        simRegions = RegionCatalog.ALL.mapIndexed { idx, rt ->
-            val base = 0x79F1000000L + idx * 0x00200000L
-            val sz = when (rt.code) {
-                "Jh" -> 96L * 1024 * 1024
-                "Ca" -> 64L * 1024 * 1024
-                "Ch" -> 32L * 1024 * 1024
-                "Cd" -> 18L * 1024 * 1024
-                "Cb" -> 12L * 1024 * 1024
-                "A"  -> 84L * 1024 * 1024
-                "J"  -> 24L * 1024 * 1024
-                "S"  -> 8L * 1024 * 1024
-                "As" -> 16L * 1024 * 1024
-                "Ps" -> if (targetPid == 24910) 64L * 1024 * 1024 else 0L
-                "V"  -> 48L * 1024 * 1024
-                "Xa" -> 42L * 1024 * 1024
-                "Xs" -> 110L * 1024 * 1024
-                "O"  -> 22L * 1024 * 1024
-                else -> 0L
-            }
-            val perms = when (rt.code) {
-                "Xa", "Xs" -> "r-xp"
-                "B" -> "---p"
-                else -> "rw-p"
-            }
-            MemoryRegion(
-                start = base,
-                end = base + sz,
-                perms = perms,
-                path = rt.name,
-                code = rt.code,
-                system = rt.code == "Xs"
-            )
-        }
-
-        val presetValues = longArrayOf(
-            100L, 100L, 150L, 200L, 250L, 300L, 500L, 999L,
-            1000L, 1000L, 1500L, 2000L, 5000L, 9999L, 10000L,
-            12345L, 50000L, 65535L, 100000L, 999999L,
-            0L, 1L, 2L, 3L, 5L, 10L, 50L, 64L, 128L, 255L, 512L, 1024L
-        )
-        var base = 0x79F1497000L
-        for (i in 0 until 720) {
-            base += rng.nextLong(4L, 64L) and -4L
-            val region = regionCodes[i % 8]
-            val typeChoice = when (i % 10) {
-                0, 1, 2, 3, 4 -> ValueType.DWORD
-                5, 6 -> ValueType.FLOAT
-                7 -> ValueType.QWORD
-                8 -> ValueType.WORD
-                else -> ValueType.BYTE
-            }
-            val v = when (typeChoice) {
-                ValueType.FLOAT -> {
-                    val f = listOf(1.0f, 1.5f, 2.0f, 10.0f, 50.0f, 100.0f, 250.0f, 999.0f, 1000.0f)[i % 9]
-                    f.toRawBits().toLong() and 0xFFFFFFFFL
-                }
-                else -> {
-                    if (i < presetValues.size * 5) presetValues[i % presetValues.size]
-                    else rng.nextLong(0, 100_000)
-                }
-            }
-            simCells[base] = MemoryItem(
-                address = base,
-                value = v,
-                previousValue = v,
-                flags = typeChoice,
-                region = region,
-                pointer = if (i % 7 == 0) (1 shl (i % 5)) else 0
-            )
-        }
-    }
-
-    private fun searchSimulated(
-        c: Criteria,
-        regions: Set<String>,
-        current: List<MemoryItem>,
-        newSearch: Boolean,
-        maxResults: Int
-    ): List<MemoryItem> {
-        val prevMap = current.associate { it.address to it.value }
-        val pool = if (newSearch) simCells.values.toList() else current.mapNotNull { simCells[it.address] ?: it }
-
-        // 1. 文本搜索 ('abc' / "abc")
-        if (c.isText && c.textBytes.isNotEmpty()) {
-            val out = ArrayList<MemoryItem>()
-            var packedVal = 0L
-            for (b in 0 until min(8, c.textBytes.size)) {
-                packedVal = packedVal or ((c.textBytes[b].toLong() and 0xFFL) shl (b * 8))
-            }
-            val anchor = (0x79F1520000L + (c.textBytes.contentHashCode().toLong() and 0xFFFFL)) and -4L
-            val item = MemoryItem(
-                address = anchor,
-                value = packedVal,
-                previousValue = packedVal,
-                flags = if (c.textUtf16) ValueType.WORD else ValueType.BYTE,
-                region = regions.firstOrNull() ?: "Ca"
-            )
-            simCells[anchor] = item
-            out.add(item)
-            return out
-        }
-
-        // 2. 联合搜索 (Group Search: A;B;C:512 或 A;B;C::64)
-        if (c.orderedGroup.size > 1 && newSearch) {
-            val out = ArrayList<MemoryItem>()
-            val sorted = pool.filter { it.region in regions && addressMatchesRangeAndMask(it.address, c) }
-                .sortedBy { it.address }
-            val radius = c.area.coerceIn(16, 65536).toLong()
-
-            for (i in sorted.indices) {
-                val anchor = sorted[i]
-                val windowItems = ArrayList<MemoryItem>()
-                var j = i
-                while (j < sorted.size && (sorted[j].address - anchor.address) <= radius) {
-                    windowItems.add(sorted[j])
-                    j++
-                }
-                if (windowItems.size < c.orderedGroup.size) continue
-
-                val matchedGroup = matchGroupInWindow(windowItems, c.orderedGroup, c.groupTypes, c.type, c.ordered)
-                if (matchedGroup != null) {
-                    for (m in matchedGroup) {
-                        if (out.none { it.address == m.address }) {
-                            out.add(m.copy())
-                        }
-                    }
-                    if (out.size >= maxResults) break
-                }
-            }
-
-            if (out.isEmpty()) {
-                val structBase = 0x79F1580000L + ((c.orderedGroup.hashCode().toLong() and 0xFFFL) * 16L)
-                val reg = regions.firstOrNull() ?: "Ca"
-                for (idx in c.orderedGroup.indices) {
-                    val addr = structBase + idx * 4L
-                    val gType = c.groupTypes.getOrElse(idx) { if (c.type == ValueType.AUTO) ValueType.DWORD else c.type }
-                    val gVal = c.orderedGroup[idx]
-                    val item = MemoryItem(
-                        address = addr,
-                        value = gVal,
-                        previousValue = gVal,
-                        flags = gType,
-                        region = reg,
-                        pointer = classifyPointer(gVal)
-                    )
-                    simCells[addr] = item
-                    out.add(item)
-                }
-            }
-            return out.take(maxResults)
-        }
-
-        // 3. 常规单值 / AUTO / 范围 / 异或 / 加密搜索
-        val filtered = pool.filter { item ->
-            val inRegion = item.region in regions
-            val typeOk = c.type == ValueType.AUTO || (item.flags and c.type) != 0
-            val addrOk = addressMatchesRangeAndMask(item.address, c)
-            val evalType = if (c.type == ValueType.AUTO) (item.flags and 0x7F) else (c.type and 0x7F)
-            val valOk = matches(item.value, c.copy(type = evalType), prevMap, item.address)
-            inRegion && typeOk && addrOk && valOk
-        }.take(maxResults).map { it.copy(pointer = classifyPointer(it.value)) }.toMutableList()
-
-        if (newSearch && filtered.isEmpty() && !c.isRange && (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL) {
-            val targetType = if (c.type == ValueType.AUTO) ValueType.DWORD else c.type
-            val baseAddr = 0x79F1600000L + ((c.value and 0xFFFL) * 16L)
-            val reg = regions.firstOrNull() ?: "Ca"
-            for (k in 0 until 8) {
-                val addr = (baseAddr + k * 0x24L) and -4L
-                if (!addressMatchesRangeAndMask(addr, c)) continue
-                val storedVal = if (c.xorKey != 0L) (c.value xor c.xorKey) else c.value
-                val item = MemoryItem(
-                    address = addr,
-                    value = storedVal,
-                    previousValue = storedVal,
-                    flags = targetType,
-                    region = reg,
-                    pointer = classifyPointer(storedVal)
-                )
-                simCells[addr] = item
-                filtered.add(item)
-            }
-        }
-
-        return filtered
-    }
-
-    private fun matchGroupInWindow(
-        window: List<MemoryItem>,
-        groupValues: List<Long>,
-        groupTypes: List<Int>,
-        defaultType: Int,
-        ordered: Boolean
-    ): List<MemoryItem>? {
-        val result = ArrayList<MemoryItem>(groupValues.size)
-        var startIdx = 0
-        for (gIdx in groupValues.indices) {
-            val targetVal = groupValues[gIdx]
-            val targetType = groupTypes.getOrElse(gIdx) {
-                if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType
-            } and 0x7F
-
-            var foundIdx = -1
-            val searchRange = if (ordered) (startIdx until window.size) else window.indices
-            for (wIdx in searchRange) {
-                val candidate = window[wIdx]
-                if (result.any { it.address == candidate.address }) continue
-                if (compareTypedValues(candidate.value, targetVal, targetType) == 0) {
-                    foundIdx = wIdx
-                    result.add(candidate)
-                    break
-                }
-            }
-            if (foundIdx < 0) return null
-            if (ordered) startIdx = foundIdx + 1
-        }
-        return result
-    }
-
     private fun addressMatchesRangeAndMask(addr: Long, c: Criteria): Boolean {
         if (c.memoryFrom != 0L && java.lang.Long.compareUnsigned(addr, c.memoryFrom) < 0) return false
         if (c.memoryTo != Long.MAX_VALUE && java.lang.Long.compareUnsigned(addr, c.memoryTo) > 0) return false
@@ -1360,7 +1474,7 @@ class MemoryEngine {
     }
 
     /**
-     * 核心数值匹配函数（已修复有符号整数与 IEEE-754 浮点数比较时误用 compareUnsigned 的 Bug）：
+     * 核心数值匹配函数（支持有符号整数与 IEEE-754 浮点数精确与范围比较）：
      */
     private fun matches(v: Long, c: Criteria, prevMap: Map<Long, Long>, addr: Long): Boolean {
         val logicalVal = when {
@@ -1467,17 +1581,5 @@ class MemoryEngine {
             ValueType.DWORD, ValueType.XOR -> ((raw.toInt() + delta.toInt()).toLong() and 0xFFFFFFFFL)
             else -> raw + delta
         }
-    }
-
-    private fun maskForSize(size: Int): Long = when (size) {
-        1 -> 0xFFL
-        2 -> 0xFFFFL
-        4 -> 0xFFFFFFFFL
-        else -> -1L
-    }
-
-    private fun syntheticValueAt(address: Long, size: Int): Long {
-        val mixed = (address xor (address ushr 17)) * 0x27D4EB2FL
-        return mixed and maskForSize(size)
     }
 }

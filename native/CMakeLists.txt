@@ -41,7 +41,7 @@ target_include_directories(mem_engine_core PUBLIC
 )
 target_link_libraries(mem_engine_core PUBLIC Threads::Threads)
 
-# Shared JNI library for Android NDK integration
+# Shared JNI library + Root helper daemon executable (packaged as libmem_engine_root.so) for Android NDK integration
 if(MEMENGINE_BUILD_JNI)
     add_library(mem_engine_jni SHARED
         ${MEMENGINE_CORE_SOURCES}
@@ -51,9 +51,31 @@ if(MEMENGINE_BUILD_JNI)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     )
     target_link_libraries(mem_engine_jni PUBLIC Threads::Threads)
+
+    add_executable(mem_engine_root
+        ${MEMENGINE_CORE_SOURCES}
+        src/root_helper_main.cpp
+    )
+    target_include_directories(mem_engine_root PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    target_compile_options(mem_engine_root PRIVATE -fPIE)
+    target_link_options(mem_engine_root PRIVATE -pie)
+    target_link_libraries(mem_engine_root PRIVATE Threads::Threads)
+    set_target_properties(mem_engine_root PROPERTIES
+        OUTPUT_NAME "mem_engine_root.so"
+        PREFIX "lib"
+    )
+    if(DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+        set_target_properties(mem_engine_root PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        )
+    endif()
+
     if(ANDROID)
         find_library(log-lib log)
         target_link_libraries(mem_engine_jni PUBLIC ${log-lib})
+        target_link_libraries(mem_engine_root PRIVATE ${log-lib})
     endif()
 endif()
 

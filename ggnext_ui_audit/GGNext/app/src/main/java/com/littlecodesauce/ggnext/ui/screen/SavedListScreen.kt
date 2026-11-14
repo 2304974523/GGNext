@@ -100,11 +100,13 @@ fun SavedListScreen(ui: Ui) {
 @Composable
 private fun SavedRow(item: MemoryItem, mask: Int, index: Int) {
     val currentItem by rememberUpdatedState(item)
+    val bgOpacity = com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics.current.bgOpacity.coerceIn(0.25f, 1.0f)
     val accent = remember(item.flags) { typeColor(item.flags) }
     val regColor = remember(item.region) { regionColor(item.region) }
     val shortType = remember(item.flags) { ValueType.shortName(item.flags) }
     val rowBg by animateColorAsState(
-        if (item.checked) Rose.Primary.copy(alpha = if (Rose.IsDark) 0.18f else 0.22f) else Rose.Row,
+        if (item.checked) Rose.Primary.copy(alpha = if (Rose.IsDark) 0.18f else 0.22f)
+        else Rose.Row.copy(alpha = (bgOpacity * 0.88f).coerceIn(0.18f, 1.0f)),
         Motion.ColorFast,
         label = "savedRowBg"
     )
@@ -116,7 +118,7 @@ private fun SavedRow(item: MemoryItem, mask: Int, index: Int) {
             item.freeze -> 1.08f
             else -> 1.0f
         },
-        animationSpec = spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessMedium),
+        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium),
         label = "lockScale"
     )
     val lockTint by animateColorAsState(
@@ -163,10 +165,10 @@ private fun SavedRow(item: MemoryItem, mask: Int, index: Int) {
             }
             Spacer(Modifier.width(6.dp))
 
-            // 3. 地址区域（轻点切换勾选，长按打开上下文菜单）
+            // 3. 地址区域（轻点切换勾选，长按打开上下文菜单，颜色跟随当前主题色）
             Text(
                 text = item.cachedAddressHex,
-                style = monoStyle(14, Rose.Green),
+                style = monoStyle(14, Rose.Primary),
                 modifier = Modifier.clickableLongPress(
                     onClick = { Session.toggle(currentItem) },
                     onLongPress = { Session.openSheet(Sheet.CONTEXT, currentItem) }

@@ -1,337 +1,356 @@
 #include "mem_engine/maps_parser.hpp"
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cctype>
 #include <fstream>
 #include <sstream>
+#include <cstring>
+#include <cstdlib>
+#include <algorithm>
+#include <cctype>
 
 namespace mem_engine {
 
 namespace {
 
-inline bool startsWith(const std::string& s, const char* prefix) noexcept {
-    size_t plen = std::strlen(prefix);
-    return s.size() >= plen && std::memcmp(s.data(), prefix, plen) == 0;
+inline bool startsWith(std::string_view str, std::string_view prefix) noexcept {
+    return str.size() >= prefix.size() && str.compare(0, prefix.size(), prefix) == 0;
 }
 
-inline bool containsStr(const std::string& s, const char* sub) noexcept {
-    return s.find(sub) != std::string::npos;
+inline bool endsWith(std::string_view str, std::string_view suffix) noexcept {
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-inline bool endsWith(const std::string& s, const char* suffix) noexcept {
-    size_t slen = std::strlen(suffix);
-    return s.size() >= slen && std::memcmp(s.data() + s.size() - slen, suffix, slen) == 0;
+inline bool containsStr(std::string_view str, std::string_view sub) noexcept {
+    return str.find(sub) != std::string_view::npos;
 }
 
-inline std::string stripDeleted(const std::string& raw) {
-    const char* delSuffix = " (deleted)";
-    size_t dlen = std::strlen(delSuffix);
-    if (raw.size() >= dlen && raw.compare(raw.size() - dlen, dlen, delSuffix) == 0) {
-        return raw.substr(0, raw.size() - dlen);
+inline bool isAppExecutablePath(std::string_view path) noexcept {
+    if (startsWith(path, "/data/app/") ||
+        startsWith(path, "/data/user/") ||
+        startsWith(path, "/data/user_de/") ||
+        startsWith(path, "/data/data/") ||
+        startsWith(path, "/mnt/asec/") ||
+        startsWith(path, "/mnt/expand/") ||
+        startsWith(path, "/sdcard/") ||
+        startsWith(path, "/storage/")) {
+        return true;
     }
-    return raw;
+    if (startsWith(path, "/data/dalvik-cache/")) {
+        return containsStr(path, "/data@app@") || containsStr(path, "/mnt@expand@");
+    }
+    return false;
 }
 
-} // anonymous namespace
-
-uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFileBackedPath) {
-    // 1. Unreadable or guard pages (---p) -> B (Bad)
-    if (!vma.readable || vma.length == 0) {
-        return RegionFlag::B;
+inline bool isFontOrIcuBadPath(std::string_view path) noexcept {
+    if (startsWith(path, "/system/fonts/") ||
+        startsWith(path, "/product/fonts/") ||
+        startsWith(path, "/system_ext/fonts/") ||
+        startsWith(path, "/vendor/fonts/") ||
+        startsWith(path, "/data/fonts/") ||
+        startsWith(path, "/system/usr/icu/") ||
+        startsWith(path, "/system/usr/hyphen-data/") ||
+        startsWith(path, "/apex/com.android.i18n/")) {
+        return true;
     }
-
-    const std::string path = stripDeleted(vma.pathname);
-
-    // 2. PPSSPP Emulator Regions (Ps)
-    if (containsStr(path, "ppsspp") || containsStr(path, "PPSSPP") ||
-        containsStr(path, "psp_ram") || containsStr(path, "psp_vram") ||
-        startsWith(path, "/dev/shm/ppsspp")) {
-        return RegionFlag::PS;
+    if (endsWith(path, ".ttf") || endsWith(path, ".otf") ||
+        endsWith(path, ".ttc") || endsWith(path, ".woff") ||
+        endsWith(path, ".hyb")) {
+        return true;
     }
+    if (endsWith(path, ".dat") && (containsStr(path, "icudt") || containsStr(path, "/icu/"))) {
+        return true;
+    }
+    return false;
+}
 
-    // 3. Bad / Guard / Font / Non-Memory Device Nodes (B)
-    if (endsWith(path, ".ttf") || endsWith(path, ".otf") || endsWith(path, ".ttc") ||
-        containsStr(path, "/system/fonts/") ||
-        path == "[vvar]" || path == "[vectors]" || path == "[sigpage]" || path == "[uprobes]" ||
-        startsWith(path, "/dev/binder") || startsWith(path, "/dev/hwbinder") ||
-        startsWith(path, "/dev/vndbinder") || startsWith(path, "/dev/null") ||
-        startsWith(path, "/dev/zero") || startsWith(path, "/dev/urandom") ||
-        startsWith(path, "/dev/random") || startsWith(path, "/dev/cpuctl") ||
-        startsWith(path, "/dev/cpuset") || startsWith(path, "/dev/stune") ||
-        startsWith(path, "/dev/blkio") || startsWith(path, "/dev/__properties__") ||
+inline bool isDangerousDeviceOrKernelMapping(std::string_view path) noexcept {
+    if (path == "[vvar]" || path == "[vectors]" || path == "[sigpage]" ||
+        path == "[uprobes]" || path == "[kuserhelpers]") {
+        return true;
+    }
+    if (startsWith(path, "/dev/binder") ||
+        startsWith(path, "/dev/hwbinder") ||
+        startsWith(path, "/dev/vndbinder") ||
+        startsWith(path, "/dev/__properties__") ||
         startsWith(path, "/dev/event-log-tags") ||
-        startsWith(path, "[anon:GWP-ASan Guard") || containsStr(path, "guard")) {
-        return RegionFlag::B;
+        startsWith(path, "/dev/pmsg") ||
+        startsWith(path, "/dev/kmsg") ||
+        startsWith(path, "/dev/ion") ||
+        startsWith(path, "/dev/dma_heap")) {
+        return true;
     }
+    return false;
+}
 
-    // 4. Video / GPU / DMA-BUF / ION / KGSL (V)
-    if (startsWith(path, "/dev/kgsl") || containsStr(path, "kgsl-3d0") ||
-        startsWith(path, "/dev/mali") || startsWith(path, "/dev/ion") ||
-        startsWith(path, "/dev/dma_heap") || startsWith(path, "/dev/dri/") ||
-        startsWith(path, "/dev/nvidia") || startsWith(path, "/dev/pvrsrvkm") ||
-        startsWith(path, "/dev/galcore") || containsStr(path, "gralloc") ||
-        startsWith(path, "/dmabuf:")) {
+inline bool isDalvikInternalRuntimeOrMetadata(std::string_view path) noexcept {
+    return containsStr(path, "bitmap") ||
+           containsStr(path, "mark-stack") ||
+           containsStr(path, "allocation-stack") ||
+           containsStr(path, "live-stack") ||
+           containsStr(path, "card-table") ||
+           containsStr(path, "card table") ||
+           containsStr(path, "mod-union") ||
+           containsStr(path, "LinearAlloc") ||
+           containsStr(path, "indirect-ref") ||
+           containsStr(path, "indirect ref") ||
+           containsStr(path, "aux-structure") ||
+           containsStr(path, "CompilerMetadata") ||
+           containsStr(path, "jit-code-cache") ||
+           containsStr(path, "jit-cache") ||
+           containsStr(path, "jit-zygote") ||
+           containsStr(path, "zygote space") ||
+           containsStr(path, "image space") ||
+           containsStr(path, "boot-image") ||
+           containsStr(path, "ReserveAppImage") ||
+           containsStr(path, "non moving space") ||
+           containsStr(path, "classes.vdex") ||
+           endsWith(path, ".art") ||
+           endsWith(path, ".dex") ||
+           endsWith(path, ".vdex");
+}
+
+inline bool isDalvikObjectHeapSpace(std::string_view path) noexcept {
+    return containsStr(path, "main space") ||
+           containsStr(path, "region space") ||
+           containsStr(path, "alloc space") ||
+           containsStr(path, "large object") ||
+           containsStr(path, "los") ||
+           containsStr(path, "bump-pointer") ||
+           containsStr(path, "rosalloc") ||
+           containsStr(path, "dlmalloc") ||
+           containsStr(path, "free list");
+}
+
+inline bool isNativeLibPath(std::string_view path) noexcept {
+    return containsStr(path, ".so") ||
+           containsStr(path, "/lib/") ||
+           containsStr(path, "/lib64/") ||
+           startsWith(path, "/system/bin/") ||
+           startsWith(path, "/apex/");
+}
+
+} // namespace
+
+RegionFlag MapsParser::classifyVma(const VmaRegion& vma, std::string_view prevPath) noexcept {
+    const std::string_view path = vma.path;
+
+    if (containsStr(path, "kgsl") ||
+        containsStr(path, "mali") ||
+        containsStr(path, "pvrsrvkm") ||
+        containsStr(path, "nvmap") ||
+        containsStr(path, "tegra") ||
+        containsStr(path, "/dev/dri/") ||
+        containsStr(path, " gralloc") ||
+        containsStr(path, "gralloc") ||
+        containsStr(path, "GFX")) {
         return RegionFlag::V;
     }
 
-    // 5. Stack (S)
-    if (path == "[stack]" || startsWith(path, "[stack:") || startsWith(path, "[anon:stack_and_tls")) {
+    if (containsStr(path, "PPSSPP") || containsStr(path, "ppsspp")) {
+        return RegionFlag::PS;
+    }
+
+    if (isFontOrIcuBadPath(path) || isDangerousDeviceOrKernelMapping(path)) {
+        return RegionFlag::B;
+    }
+    if (!vma.readable) {
+        return RegionFlag::O;
+    }
+
+    if (vma.executable) {
+        if (path == "[vdso]" ||
+            startsWith(path, "/memfd:jit-cache") ||
+            startsWith(path, "/memfd:jit-zygote-cache") ||
+            containsStr(path, "dalvik-jit-code-cache")) {
+            return RegionFlag::XS;
+        }
+        if (isAppExecutablePath(path)) {
+            return RegionFlag::XA;
+        }
+        if (path.empty() && vma.writable) {
+            return RegionFlag::XA;
+        }
+        return RegionFlag::XS;
+    }
+
+    if (startsWith(path, "[stack") ||
+        startsWith(path, "[anon:stack") ||
+        containsStr(path, "stack_and_tls")) {
         return RegionFlag::S;
     }
 
-    // 6. Native C/C++ Heap (Ch)
-    if (path == "[heap]" || startsWith(path, "[heap:")) {
+    if (path == "[heap]" ||
+        startsWith(path, "[anon:heap") ||
+        containsStr(path, "libc_malloc")) {
         return RegionFlag::CH;
     }
 
-    // 7. Java Heap (Jh) vs Java Runtime Structures (J)
-    if (containsStr(path, "dalvik-") || startsWith(path, "[anon:dalvik-") ||
-        startsWith(path, "/dev/ashmem/dalvik-") ||
-        startsWith(path, "[anon:art_") ||
-        path == "[anon:main space]" || path == "[anon:alloc space]" ||
-        path == "[anon:region space]" || path == "[anon:large object space]" ||
-        path == "[anon:non moving space]" || startsWith(path, "[anon:zygote")) {
-        if (vma.executable) {
-            return RegionFlag::XA; // ART JIT Code Cache
+    if (startsWith(path, "[anon:scudo:") ||
+        startsWith(path, "[anon:GWP-ASan") ||
+        startsWith(path, "[anon:jemalloc") ||
+        containsStr(path, "scudo:") ||
+        containsStr(path, "jemalloc")) {
+        return RegionFlag::CA;
+    }
+
+    if (containsStr(path, "dalvik-") ||
+        containsStr(path, "art-") ||
+        startsWith(path, "/memfd:jit-cache") ||
+        startsWith(path, "/memfd:jit-zygote-cache") ||
+        startsWith(path, "/memfd:dalvik-") ||
+        endsWith(path, ".art")) {
+        if (isDalvikInternalRuntimeOrMetadata(path) || !vma.writable) {
+            return RegionFlag::J;
         }
-        bool isPrimaryJavaHeap =
-            containsStr(path, "main space") ||
-            containsStr(path, "alloc space") ||
-            containsStr(path, "region space") ||
-            containsStr(path, "large object") ||
-            containsStr(path, "non moving space") ||
-            containsStr(path, "zygote space") ||
-            containsStr(path, "free list large");
-        if (vma.writable && isPrimaryJavaHeap) {
+        if (isDalvikObjectHeapSpace(path)) {
             return RegionFlag::JH;
         }
         return RegionFlag::J;
     }
-    if (endsWith(path, ".vdex") || endsWith(path, ".dex") || containsStr(path, "classes.dex")) {
-        return RegionFlag::J;
-    }
 
-    // 8. C++ Allocator (Ca): Bionic libc_malloc, Scudo, Jemalloc, GWP-ASan
-    if (startsWith(path, "[anon:libc_malloc") ||
-        startsWith(path, "[anon:scudo:") ||
-        startsWith(path, "[anon:jemalloc") ||
-        startsWith(path, "[anon:GWP-ASan") ||
-        startsWith(path, "[anon:malloc") ||
-        startsWith(path, "[anon:bionic_alloc")) {
-        return RegionFlag::CA;
-    }
-
-    // 9. C++ .bss Segment (Cb)
-    if (path == "[anon:.bss]" || startsWith(path, "[anon:bss")) {
+    if (startsWith(path, "[anon:.bss") || containsStr(path, ".bss")) {
         return RegionFlag::CB;
     }
-    // Note: On older kernels or specific linkers, a .so's .bss segment is an unnamed anonymous
-    // rw-p VMA immediately following the .so's rw-p .data VMA.
-    if (path.empty() && vma.writable && !vma.executable && vma.isPrivate && !prevFileBackedPath.empty()) {
-        if (endsWith(prevFileBackedPath, ".so") || containsStr(prevFileBackedPath, ".so!")) {
-            return RegionFlag::CB;
-        }
+    if (path.empty() && vma.writable && !vma.executable && isNativeLibPath(prevPath)) {
+        return RegionFlag::CB;
     }
 
-    // 10. Ashmem & Memfd Shared Memory (As)
-    if (startsWith(path, "/dev/ashmem") || startsWith(path, "[anon:ashmem") ||
-        startsWith(path, "/memfd:")) {
-        if (vma.executable) {
-            return RegionFlag::XA; // JIT cache in memfd
-        }
+    if (startsWith(path, "/dev/ashmem") ||
+        startsWith(path, "[anon:ashmem") ||
+        startsWith(path, "/memfd:ashmem")) {
         return RegionFlag::AS;
     }
 
-    // 11. Pure Anonymous Memory (A) or Anonymous Executable JIT (Xa)
-    if (path.empty() || startsWith(path, "[anon:")) {
-        if (vma.executable) {
-            return RegionFlag::XA;
+    if (startsWith(path, "/dev/")) {
+        if (startsWith(path, "/dev/zero")) {
+            return vma.writable ? RegionFlag::CA : RegionFlag::O;
         }
-        if (vma.writable) {
+        return RegionFlag::B;
+    }
+
+    if (path.empty() || path == "[anon]" || startsWith(path, "[anon:")) {
+        if (vma.writable && !vma.executable) {
             return RegionFlag::A;
         }
         return RegionFlag::O;
     }
 
-    // 12. System Special Executable ([vdso], [vsyscall]) -> Xs
-    if (path == "[vdso]" || path == "[vsyscall]") {
-        return RegionFlag::XS;
-    }
-
-    // 13. File-Backed Mappings (System vs App Code & Data)
-    bool isSystemPath = startsWith(path, "/system/") ||
-                        startsWith(path, "/apex/") ||
-                        startsWith(path, "/vendor/") ||
-                        startsWith(path, "/product/") ||
-                        startsWith(path, "/system_ext/") ||
-                        startsWith(path, "/odm/") ||
-                        startsWith(path, "/usr/lib") ||
-                        startsWith(path, "/lib/");
-
-    bool isAppPath = startsWith(path, "/data/app/") ||
-                     startsWith(path, "/data/data/") ||
-                     startsWith(path, "/data/user/") ||
-                     startsWith(path, "/data/user_de/") ||
-                     startsWith(path, "/mnt/expand/");
-
-    bool isSharedLibOrExec = endsWith(path, ".so") || containsStr(path, ".so!") ||
-                             endsWith(path, ".oat") || endsWith(path, ".odex") ||
-                             vma.executable;
-
-    if (vma.executable) {
-        if (isSystemPath && !isAppPath) {
-            return RegionFlag::XS;
-        }
-        return RegionFlag::XA;
-    }
-
-    // Writable private file-backed segment of an ELF binary or .so/.art -> Cd (.data)
-    if (vma.writable && vma.isPrivate && (isSharedLibOrExec || isAppPath || isSystemPath || path[0] == '/')) {
-        if (endsWith(path, ".so") || containsStr(path, ".so") || endsWith(path, ".art") || vma.inode > 0) {
+    if (isNativeLibPath(path)) {
+        if (vma.writable && !vma.executable) {
             return RegionFlag::CD;
         }
+        return RegionFlag::O;
     }
 
     return RegionFlag::O;
 }
 
-std::vector<VmaRegion> MapsParser::parseMapsContent(const std::string& content, uint32_t filterMask, bool skipUnreadable) {
-    std::vector<VmaRegion> regions;
-    regions.reserve(512);
+bool MapsParser::parseLine(std::string_view line, std::string_view prevPath, VmaRegion& outRegion) noexcept {
+    if (line.empty()) return false;
 
-    std::string prevFileBackedPath;
+    const char* begin = line.data();
+    const char* end = begin + line.size();
+    char* nextPtr = nullptr;
+
+    uint64_t startAddr = std::strtoull(begin, &nextPtr, 16);
+    if (nextPtr == begin || nextPtr >= end || *nextPtr != '-') return false;
+
+    const char* dashAfter = nextPtr + 1;
+    uint64_t endAddr = std::strtoull(dashAfter, &nextPtr, 16);
+    if (nextPtr == dashAfter || nextPtr >= end || endAddr <= startAddr) return false;
+
+    const char* p = nextPtr;
+    while (p < end && *p == ' ') ++p;
+    if (end - p < 4) return false;
+
+    outRegion.start = startAddr;
+    outRegion.end = endAddr;
+    outRegion.readable   = (p[0] == 'r');
+    outRegion.writable   = (p[1] == 'w');
+    outRegion.executable = (p[2] == 'x');
+    outRegion.isPrivate  = (p[3] == 'p');
+    p += 4;
+
+    while (p < end && *p == ' ') ++p;
+    outRegion.offset = std::strtoull(p, &nextPtr, 16);
+    if (nextPtr == p) return false;
+    p = nextPtr;
+
+    while (p < end && *p == ' ') ++p;
+    const char* devStart = p;
+    while (p < end && *p != ' ') ++p;
+    outRegion.device.assign(devStart, static_cast<size_t>(p - devStart));
+
+    while (p < end && *p == ' ') ++p;
+    outRegion.inode = std::strtoull(p, &nextPtr, 10);
+    if (nextPtr == p) return false;
+    p = nextPtr;
+
+    while (p < end && *p == ' ') ++p;
+    if (p < end) {
+        size_t len = static_cast<size_t>(end - p);
+        while (len > 0 && (p[len - 1] == '\n' || p[len - 1] == '\r' || p[len - 1] == ' ')) {
+            --len;
+        }
+        outRegion.path.assign(p, len);
+    } else {
+        outRegion.path.clear();
+    }
+
+    outRegion.regionFlag = classifyVma(outRegion, prevPath);
+    return true;
+}
+
+std::vector<VmaRegion> MapsParser::parseContent(std::string_view content, uint32_t regionMask) {
+    std::vector<VmaRegion> results;
+    results.reserve(512);
+
+    std::string prevPath;
     size_t pos = 0;
-    const size_t totalLen = content.size();
+    const size_t total = content.size();
 
-    while (pos < totalLen) {
-        size_t lineEnd = content.find('\n', pos);
-        if (lineEnd == std::string::npos) lineEnd = totalLen;
+    while (pos < total) {
+        size_t nl = content.find('\n', pos);
+        if (nl == std::string_view::npos) nl = total;
 
-        const char* linePtr = content.data() + pos;
-        size_t lineLen = lineEnd - pos;
-        pos = lineEnd + 1;
-
-        if (lineLen == 0) continue;
-
-        // Parse: start-end perms offset dev inode [pathname]
-        char* endPtr = nullptr;
-        unsigned long long start = std::strtoull(linePtr, &endPtr, 16);
-        if (!endPtr || *endPtr != '-') continue;
-
-        unsigned long long end = std::strtoull(endPtr + 1, &endPtr, 16);
-        if (!endPtr || end <= start) continue;
-
-        while (*endPtr == ' ' || *endPtr == '\t') ++endPtr;
-        if (static_cast<size_t>(endPtr - linePtr) + 4 > lineLen) continue;
-
-        char perms[5] = { endPtr[0], endPtr[1], endPtr[2], endPtr[3], '\0' };
-        endPtr += 4;
-
-        unsigned long long offset = std::strtoull(endPtr, &endPtr, 16);
-        while (*endPtr == ' ' || *endPtr == '\t') ++endPtr;
-
-        const char* devStart = endPtr;
-        while (static_cast<size_t>(endPtr - linePtr) < lineLen && *endPtr != ' ' && *endPtr != '\t') ++endPtr;
-        std::string devStr(devStart, static_cast<size_t>(endPtr - devStart));
-
-        unsigned long long inode = std::strtoull(endPtr, &endPtr, 10);
-        while (static_cast<size_t>(endPtr - linePtr) < lineLen && (*endPtr == ' ' || *endPtr == '\t')) ++endPtr;
-
-        std::string pathname;
-        if (static_cast<size_t>(endPtr - linePtr) < lineLen) {
-            size_t pathLen = lineLen - static_cast<size_t>(endPtr - linePtr);
-            while (pathLen > 0 && (endPtr[pathLen - 1] == '\r' || endPtr[pathLen - 1] == '\n' || endPtr[pathLen - 1] == ' ')) {
-                --pathLen;
-            }
-            pathname.assign(endPtr, pathLen);
-        }
-
+        std::string_view line = content.substr(pos, nl - pos);
         VmaRegion vma;
-        vma.startAddress = static_cast<uintptr_t>(start);
-        vma.endAddress   = static_cast<uintptr_t>(end);
-        vma.length       = static_cast<size_t>(end - start);
-        vma.fileOffset   = offset;
-        vma.inode        = inode;
-        vma.readable     = (perms[0] == 'r');
-        vma.writable     = (perms[1] == 'w');
-        vma.executable   = (perms[2] == 'x');
-        vma.isPrivate    = (perms[3] == 'p');
-        vma.isShared     = (perms[3] == 's');
-        vma.dev          = std::move(devStr);
-        vma.pathname     = std::move(pathname);
-
-        vma.regionFlag   = classifyVma(vma, prevFileBackedPath);
-
-        // Track last file-backed .so mapping to accurately tag the single immediately following unnamed rw-p as Cb (.bss)
-        if (!vma.pathname.empty() && vma.pathname[0] == '/') {
-            prevFileBackedPath = stripDeleted(vma.pathname);
-        } else {
-            prevFileBackedPath.clear();
-        }
-
-        if (skipUnreadable && (!vma.readable || vma.regionFlag == RegionFlag::B)) {
-            continue;
-        }
-        if (filterMask != 0 && (vma.regionFlag & filterMask) == 0) {
-            continue;
-        }
-
-        regions.push_back(std::move(vma));
-    }
-
-    return regions;
-}
-
-std::vector<VmaRegion> MapsParser::parseProcessMaps(int pid, uint32_t filterMask, bool skipUnreadable) {
-    if (pid <= 0) return {};
-    std::string path = "/proc/" + std::to_string(pid) + "/maps";
-    std::ifstream ifs(path, std::ios::in | std::ios::binary);
-    if (!ifs.is_open()) return {};
-
-    std::ostringstream oss;
-    oss << ifs.rdbuf();
-    return parseMapsContent(oss.str(), filterMask, skipUnreadable);
-}
-
-bool MapsParser::querySmapsForAddress(int pid, uintptr_t targetStart, SmapsDetail& outDetail) {
-    if (pid <= 0) return false;
-    std::string path = "/proc/" + std::to_string(pid) + "/smaps";
-    FILE* fp = std::fopen(path.c_str(), "r");
-    if (!fp) return false;
-
-    outDetail = SmapsDetail{};
-    char line[1024];
-    bool inTargetVma = false;
-
-    while (std::fgets(line, sizeof(line), fp)) {
-        // Check header line: hex-hex perms ...
-        if (std::isxdigit(static_cast<unsigned char>(line[0]))) {
-            char* endPtr = nullptr;
-            unsigned long long start = std::strtoull(line, &endPtr, 16);
-            if (endPtr && *endPtr == '-') {
-                if (inTargetVma) break; // Finished reading target VMA block
-                if (static_cast<uintptr_t>(start) == targetStart) {
-                    inTargetVma = true;
-                }
-                continue;
+        if (parseLine(line, prevPath, vma)) {
+            if (!vma.path.empty()) {
+                prevPath = vma.path;
+            } else {
+                prevPath.clear();
+            }
+            if ((static_cast<uint32_t>(vma.regionFlag) & regionMask) != 0) {
+                results.push_back(std::move(vma));
             }
         }
-
-        if (!inTargetVma) continue;
-
-        size_t val = 0;
-        if (std::sscanf(line, "Rss: %zu kB", &val) == 1) outDetail.rssKB = val;
-        else if (std::sscanf(line, "Pss: %zu kB", &val) == 1) outDetail.pssKB = val;
-        else if (std::sscanf(line, "Shared_Dirty: %zu kB", &val) == 1) outDetail.sharedDirtyKB = val;
-        else if (std::sscanf(line, "Private_Dirty: %zu kB", &val) == 1) outDetail.privateDirtyKB = val;
-        else if (std::sscanf(line, "Anonymous: %zu kB", &val) == 1) outDetail.anonymousKB = val;
-        else if (std::sscanf(line, "Swap: %zu kB", &val) == 1) outDetail.swapKB = val;
-        else if (std::sscanf(line, "KernelPageSize: %zu kB", &val) == 1) outDetail.kernelPageKB = val;
+        pos = nl + 1;
     }
 
-    std::fclose(fp);
-    return inTargetVma;
+    return results;
+}
+
+Result<std::vector<VmaRegion>> MapsParser::parse(pid_t pid, uint32_t regionMask) {
+    if (pid <= 0) {
+        return Result<std::vector<VmaRegion>>::err(StatusCode::ERR_INVALID_PID, "Invalid PID for maps parser");
+    }
+
+    std::string mapsPath = "/proc/" + std::to_string(pid) + "/maps";
+    std::ifstream file(mapsPath, std::ios::in | std::ios::binary);
+    if (!file.is_open()) {
+        return Result<std::vector<VmaRegion>>::err(StatusCode::ERR_PERMISSION_DENIED,
+                                                   "Cannot open " + mapsPath);
+    }
+
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    std::string content = ss.str();
+    if (content.empty()) {
+        return Result<std::vector<VmaRegion>>::err(StatusCode::ERR_EMPTY_MAPS,
+                                                   "Empty maps content for PID " + std::to_string(pid));
+    }
+
+    return Result<std::vector<VmaRegion>>::ok(parseContent(content, regionMask));
 }
 
 } // namespace mem_engine

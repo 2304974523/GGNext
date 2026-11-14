@@ -123,19 +123,19 @@ fun pointerTypeLabel(pointer: Int): String = when (pointer) {
 
 object Motion {
     val Fast = androidx.compose.animation.core.tween<Float>(140)
-    val Normal = androidx.compose.animation.core.tween<Float>(240)
+    val Normal = androidx.compose.animation.core.tween<Float>(220)
     val Springy = androidx.compose.animation.core.spring<Float>(
-        dampingRatio = 0.72f,
-        stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow
+        dampingRatio = androidx.compose.animation.core.Spring.DampingRatioNoBouncy,
+        stiffness = androidx.compose.animation.core.Spring.StiffnessMedium
     )
     val NavSpring = androidx.compose.animation.core.spring<androidx.compose.ui.unit.Dp>(
-        dampingRatio = 0.70f,
-        stiffness = androidx.compose.animation.core.Spring.StiffnessMediumLow
+        dampingRatio = androidx.compose.animation.core.Spring.DampingRatioNoBouncy,
+        stiffness = androidx.compose.animation.core.Spring.StiffnessMedium
     )
     val ColorFast = androidx.compose.animation.core.tween<Color>(140)
-    val ColorNormal = androidx.compose.animation.core.tween<Color>(240)
-    const val DIALOG_ENTER_MS = 220
-    const val DIALOG_EXIT_MS = 160
+    val ColorNormal = androidx.compose.animation.core.tween<Color>(220)
+    const val DIALOG_ENTER_MS = 200
+    const val DIALOG_EXIT_MS = 150
 }
 
 data class UiMetrics(

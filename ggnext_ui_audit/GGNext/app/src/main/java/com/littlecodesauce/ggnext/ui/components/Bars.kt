@@ -131,21 +131,11 @@ fun NavBar(
                 .height(42.dp)
         ) {
             val slotWidth = maxWidth / 4f
-            val targetProgress = tab.ordinal.toFloat()
-            val animatedProgress by animateFloatAsState(
-                targetValue = targetProgress,
-                animationSpec = spring(
-                    dampingRatio = 0.68f,
-                    stiffness = Spring.StiffnessMediumLow
-                ),
-                label = "navPhysicsProgress"
-            )
-            val velocityStretch = (1f + abs(targetProgress - animatedProgress) * 0.18f).coerceAtMost(1.22f)
             val indicatorX by animateDpAsState(
                 targetValue = slotWidth * tab.ordinal,
                 animationSpec = spring(
-                    dampingRatio = 0.68f,
-                    stiffness = Spring.StiffnessMediumLow
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessMedium
                 ),
                 label = "navSlideX"
             )
@@ -156,7 +146,6 @@ fun NavBar(
                     .width(slotWidth)
                     .height(42.dp)
                     .padding(horizontal = 3.dp, vertical = 2.dp)
-                    .scale(scaleX = velocityStretch, scaleY = 1f / (1f + (velocityStretch - 1f) * 0.25f))
                     .background(
                         color = primary.copy(alpha = if (Rose.IsDark) 0.22f else 0.18f),
                         shape = RoundedCornerShape(12.dp)
@@ -239,8 +228,8 @@ private fun NavIcon(
 ) {
     var pressed by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(
-        targetValue = if (pressed) 0.86f else if (selected) 1.04f else 1f,
-        animationSpec = Motion.Springy,
+        targetValue = if (pressed) 0.90f else if (selected) 1.03f else 1f,
+        animationSpec = Motion.Fast,
         label = "nav"
     )
     val tint by animateColorAsState(
@@ -292,7 +281,7 @@ private fun NavIcon(
 fun ToolBar(
     flowingTools: List<ToolId>,
     pinnedTools: List<ToolId>,
-    ui: Ui,
+    ui: com.littlecodesauce.ggnext.core.Ui,
     onTool: (ToolId) -> Unit,
     onScript: () -> Unit,
     onMoreMenu: () -> Unit,
@@ -349,7 +338,10 @@ fun ToolBar(
                             val activeTool = draggingFlowingTool ?: return@detectDragGesturesAfterLongPress
                             val curList = currentFlowing
                             if (curList.isEmpty()) return@detectDragGesturesAfterLongPress
-                            fingerXInFlowing = (fingerXInFlowing + dragAmount.x).coerceIn(0f, (curList.size * itemSpanPx))
+                            fingerXInFlowing = (fingerXInFlowing + dragAmount.x).coerceIn(
+                                itemSpanPx * 0.5f,
+                                (curList.size * itemSpanPx - itemSpanPx * 0.5f).coerceAtLeast(itemSpanPx * 0.5f)
+                            )
                             val targetIndex = (fingerXInFlowing / itemSpanPx).toInt().coerceIn(0, curList.lastIndex)
                             val curIndex = curList.indexOf(activeTool)
                             if (curIndex != -1 && targetIndex != curIndex) {
@@ -359,9 +351,9 @@ fun ToolBar(
                             val viewportX = fingerXInFlowing - scrollState.value
                             val edgeThreshold = 48f
                             if (viewportX < edgeThreshold && scrollState.value > 0) {
-                                coroutineScope.launch { scrollState.scrollBy(-14f) }
+                                coroutineScope.launch { scrollState.scrollBy(-12f) }
                             } else if (viewportX > (scrollState.viewportSize - edgeThreshold) && scrollState.value < scrollState.maxValue) {
-                                coroutineScope.launch { scrollState.scrollBy(14f) }
+                                coroutineScope.launch { scrollState.scrollBy(12f) }
                             }
                         }
                     )
@@ -370,15 +362,20 @@ fun ToolBar(
             verticalAlignment = Alignment.CenterVertically
         ) {
             flowingTools.forEachIndexed { idx, id ->
-                key("flow_${id.name}") {
+                androidx.compose.runtime.key("flow_${id.name}") {
                     val isDragging = draggingFlowingTool == id
                     val enabled = com.littlecodesauce.ggnext.ui.model.isToolEnabled(id, ui.tab, ui)
-                    val translationX = if (isDragging) (fingerXInFlowing - (idx * itemSpanPx + itemSpanPx * 0.5f)) else 0f
+                    val targetTx = if (isDragging) (fingerXInFlowing - (idx * itemSpanPx + itemSpanPx * 0.5f)) else 0f
+                    val smoothTx by animateFloatAsState(
+                        targetValue = targetTx,
+                        animationSpec = if (isDragging) spring(stiffness = Spring.StiffnessHigh) else Motion.Fast,
+                        label = "flowTx"
+                    )
                     ToolIconItem(
                         id = id,
                         enabled = enabled,
                         isDragging = isDragging,
-                        translationX = translationX,
+                        translationX = smoothTx,
                         onClick = {
                             if (enabled) onTool(id) else Session.toast("当前无可选项目")
                         }
@@ -418,7 +415,10 @@ fun ToolBar(
                             val activeTool = draggingPinnedTool ?: return@detectDragGesturesAfterLongPress
                             val curList = currentPinned
                             if (curList.isEmpty()) return@detectDragGesturesAfterLongPress
-                            fingerXInPinned = (fingerXInPinned + dragAmount.x).coerceIn(0f, (curList.size * itemSpanPx))
+                            fingerXInPinned = (fingerXInPinned + dragAmount.x).coerceIn(
+                                itemSpanPx * 0.5f,
+                                (curList.size * itemSpanPx - itemSpanPx * 0.5f).coerceAtLeast(itemSpanPx * 0.5f)
+                            )
                             val targetIndex = (fingerXInPinned / itemSpanPx).toInt().coerceIn(0, curList.lastIndex)
                             val curIndex = curList.indexOf(activeTool)
                             if (curIndex != -1 && targetIndex != curIndex) {
@@ -427,9 +427,9 @@ fun ToolBar(
                             val viewportX = fingerXInPinned - pinnedScrollState.value
                             val edgeThreshold = 36f
                             if (viewportX < edgeThreshold && pinnedScrollState.value > 0) {
-                                coroutineScope.launch { pinnedScrollState.scrollBy(-14f) }
+                                coroutineScope.launch { pinnedScrollState.scrollBy(-12f) }
                             } else if (viewportX > (pinnedScrollState.viewportSize - edgeThreshold) && pinnedScrollState.value < pinnedScrollState.maxValue) {
-                                coroutineScope.launch { pinnedScrollState.scrollBy(14f) }
+                                coroutineScope.launch { pinnedScrollState.scrollBy(12f) }
                             }
                         }
                     )
@@ -438,15 +438,20 @@ fun ToolBar(
             verticalAlignment = Alignment.CenterVertically
         ) {
             pinnedTools.forEachIndexed { idx, id ->
-                key("pin_${id.name}") {
+                androidx.compose.runtime.key("pin_${id.name}") {
                     val isDragging = draggingPinnedTool == id
                     val enabled = com.littlecodesauce.ggnext.ui.model.isToolEnabled(id, ui.tab, ui)
-                    val translationX = if (isDragging) (fingerXInPinned - (idx * itemSpanPx + itemSpanPx * 0.5f)) else 0f
+                    val targetTx = if (isDragging) (fingerXInPinned - (idx * itemSpanPx + itemSpanPx * 0.5f)) else 0f
+                    val smoothTx by animateFloatAsState(
+                        targetValue = targetTx,
+                        animationSpec = if (isDragging) spring(stiffness = Spring.StiffnessHigh) else Motion.Fast,
+                        label = "pinTx"
+                    )
                     ToolIconItem(
                         id = id,
                         enabled = enabled,
                         isDragging = isDragging,
-                        translationX = translationX,
+                        translationX = smoothTx,
                         isPinned = true,
                         onClick = {
                             if (!enabled) {
@@ -467,7 +472,7 @@ fun ToolBar(
 }
 
 /**
- * 工具栏图标渲染组件（支持主题色高亮，支持拖拽位移渲染）
+ * 工具栏图标渲染组件（支持主题色高亮，支持平滑无回弹拖拽位移渲染）
  */
 @Composable
 private fun ToolIconItem(
@@ -481,8 +486,8 @@ private fun ToolIconItem(
     var pressed by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(
         targetValue = when {
-            isDragging -> 1.18f
-            pressed -> 0.84f
+            isDragging -> 1.12f
+            pressed -> 0.88f
             else -> 1f
         },
         animationSpec = Motion.Fast,
@@ -512,8 +517,6 @@ private fun ToolIconItem(
             ),
         contentAlignment = Alignment.Center
     ) {
-        // 需求 1：固定工具栏图标跟随主题色 (Rose.Primary)，流动工具栏图标仍为白色 (Rose.Text)
-        // 优化 1：按钮置灰时增加透明度 (0.28f)
         val tint = when {
             !enabled -> Rose.TextDim.copy(alpha = 0.28f)
             isPinned -> Rose.Primary
@@ -550,7 +553,7 @@ fun ProcessBar(
         verticalAlignment = Alignment.CenterVertically
     ) {
         var pausePressed by remember { mutableStateOf(false) }
-        val pauseScale by animateFloatAsState(if (pausePressed) 0.85f else 1f, Motion.Fast, label = "pauseScale")
+        val pauseScale by animateFloatAsState(if (pausePressed) 0.88f else 1f, Motion.Fast, label = "pauseScale")
         Box(
             Modifier
                 .size(22.dp)
@@ -614,7 +617,7 @@ fun ProcessBar(
         Spacer(Modifier.width(6.dp))
 
         var refreshPressed by remember { mutableStateOf(false) }
-        val refreshScale by animateFloatAsState(if (refreshPressed) 0.85f else 1f, Motion.Fast, label = "refScale")
+        val refreshScale by animateFloatAsState(if (refreshPressed) 0.88f else 1f, Motion.Fast, label = "refScale")
         Box(
             Modifier
                 .size(22.dp)
@@ -631,7 +634,7 @@ fun ProcessBar(
         Spacer(Modifier.width(4.dp))
 
         var countPressed by remember { mutableStateOf(false) }
-        val countScale by animateFloatAsState(if (countPressed) 0.9f else 1f, Motion.Fast, label = "cntScale")
+        val countScale by animateFloatAsState(if (countPressed) 0.92f else 1f, Motion.Fast, label = "cntScale")
         val countBg by animateColorAsState(
             if (countPressed) Rose.CardHigh else Color.Transparent,
             Motion.ColorFast,
@@ -649,8 +652,80 @@ fun ProcessBar(
             contentAlignment = Alignment.Center
         ) {
             Text(
-                text = if (busy) "(…)" else countText,
+                text = countText,
                 style = monoStyle(12, if (countPressed) Rose.Primary else Rose.TextSecond)
+            )
+        }
+    }
+}
+
+/**
+ * 其他 2：紧贴在 ProcessBar 下方的精简非阻塞搜索进度栏
+ * 显示当前任务名称、实时命中数量、扫描进度百分比与预计剩余时间（不弹窗阻塞，允许在搜索同时操作界面）
+ */
+@Composable
+fun InlineSearchProgressBar(ui: com.littlecodesauce.ggnext.core.Ui) {
+    val progress by animateFloatAsState(
+        targetValue = ui.searchProgress.coerceIn(0.04f, 1f),
+        animationSpec = Motion.Fast,
+        label = "inlineSearchProg"
+    )
+    val pct = (ui.searchProgress.coerceIn(0f, 1f) * 100f).toInt()
+    val etaStr = if (ui.searchEtaSeconds >= 0) "剩余 ~${ui.searchEtaSeconds}s" else "扫描中"
+
+    androidx.compose.foundation.layout.Column(
+        Modifier
+            .fillMaxWidth()
+            .background(Rose.Card.copy(alpha = (ui.metrics.bgOpacity * 0.92f).coerceIn(0.25f, 1f)))
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .height(22.dp)
+                .padding(horizontal = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = ui.busyText.ifEmpty { "搜索中..." },
+                color = Rose.Primary,
+                fontSize = fsp(11f),
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+            Spacer(Modifier.width(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "命中 ${ui.searchFoundSoFar}",
+                    style = monoStyle(11, Rose.Green, FontWeight.SemiBold)
+                )
+                if (ui.searchTotalMb > 0.1f) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = String.format(java.util.Locale.US, "%.0f/%.0fMB", ui.searchScannedMb, ui.searchTotalMb),
+                        style = monoStyle(10, Rose.TextDim)
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "$pct% · $etaStr",
+                    style = monoStyle(11, Rose.TextSecond)
+                )
+            }
+        }
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(2.5.dp)
+                .background(Rose.Divider)
+        ) {
+            Box(
+                Modifier
+                    .fillMaxWidth(progress)
+                    .height(2.5.dp)
+                    .background(Rose.Primary)
             )
         }
     }

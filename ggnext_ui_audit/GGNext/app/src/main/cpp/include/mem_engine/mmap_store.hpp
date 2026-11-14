@@ -18,9 +18,10 @@ namespace mem_engine {
 class MmapCandidateStore {
 public:
     static constexpr size_t DEFAULT_MEMORY_THRESHOLD = 1000000; // 1M candidates
+    static constexpr size_t MAX_STORED_CANDIDATES    = 2000000; // Hard cap: 2M candidates (48 MB anonymous mmap)
 
     explicit MmapCandidateStore(size_t inMemoryThreshold = DEFAULT_MEMORY_THRESHOLD,
-                                const std::string& spillDir = "/tmp");
+                                const std::string& spillDir = "/data/local/tmp");
     ~MmapCandidateStore();
 
     MmapCandidateStore(const MmapCandidateStore&) = delete;
@@ -33,6 +34,7 @@ public:
 
     size_t size() const noexcept { return m_count; }
     bool empty() const noexcept { return m_count == 0; }
+    bool isFull() const noexcept { return m_count >= MAX_STORED_CANDIDATES; }
     bool isSpilledToDisk() const noexcept { return m_isMmap; }
     size_t heapBytesUsed() const noexcept { return m_ramVec.capacity() * sizeof(CandidateEntry); }
     size_t mmapBytesUsed() const noexcept { return m_isMmap ? m_mmapCapacityBytes : 0; }
@@ -51,11 +53,11 @@ private:
     bool growMmap(size_t requiredCount);
 
     size_t                      m_threshold = DEFAULT_MEMORY_THRESHOLD;
-    std::string                 m_spillDir  = "/tmp";
+    std::string                 m_spillDir  = "/data/local/tmp";
     std::vector<CandidateEntry> m_ramVec;
     size_t                      m_count     = 0;
 
-    // Disk-backed mmap state
+    // Anonymous demand-paged mmap state
     bool                        m_isMmap            = false;
     int                         m_fd                = -1;
     CandidateEntry*             m_mmapPtr           = nullptr;
@@ -63,11 +65,13 @@ private:
 };
 
 // ============================================================================
-// MmapRegionSnapshotStore: Disk-Backed Full Memory Snapshot for Unknown Initial
-// Value Fuzzy Searches across 500MB / 1GB / 3GB without consuming Heap RSS!
+// MmapRegionSnapshotStore: Anonymous Demand-Paged Full Memory Snapshot for
+// Unknown Initial Value Fuzzy Searches without touching flash storage or heap!
 // ============================================================================
 class MmapRegionSnapshotStore {
 public:
+    static constexpr size_t MAX_SNAPSHOT_BYTES = 256ULL * 1024ULL * 1024ULL; // 256 MB cap
+
     struct SnapshotBlock {
         uintptr_t startAddress = 0;
         size_t    length       = 0;
@@ -75,7 +79,7 @@ public:
         uint32_t  regionFlag   = 0;
     };
 
-    explicit MmapRegionSnapshotStore(const std::string& spillDir = "/tmp");
+    explicit MmapRegionSnapshotStore(const std::string& spillDir = "/data/local/tmp");
     ~MmapRegionSnapshotStore();
 
     MmapRegionSnapshotStore(const MmapRegionSnapshotStore&) = delete;
@@ -86,6 +90,7 @@ public:
     bool openStore(size_t reserveBytes);
     bool appendRegionChunk(uintptr_t startAddr, const uint8_t* data, size_t len, uint32_t regionFlag);
     const uint8_t* getBlockData(const SnapshotBlock& block) const noexcept;
+    uint8_t* getBlockDataMut(const SnapshotBlock& block) noexcept;
 
     const std::vector<SnapshotBlock>& blocks() const noexcept { return m_blocks; }
     size_t totalSnapshotBytes() const noexcept { return m_writeOffset; }
@@ -94,7 +99,7 @@ public:
 private:
     bool ensureCapacity(size_t totalBytesNeeded);
 
-    std::string                m_spillDir = "/tmp";
+    std::string                m_spillDir = "/data/local/tmp";
     int                        m_fd       = -1;
     uint8_t*                   m_mmapPtr  = nullptr;
     size_t                     m_capacity = 0;
