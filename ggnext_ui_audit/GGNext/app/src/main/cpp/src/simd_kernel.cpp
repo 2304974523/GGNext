@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <type_traits>
 
 #if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>

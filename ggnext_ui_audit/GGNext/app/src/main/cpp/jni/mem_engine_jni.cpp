@@ -431,46 +431,52 @@ Java_com_qa_memengine_MemDiagnosticEngine_nativeUnlockAddress(
 JNIEXPORT jlong JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeCreate(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jint workerThreads,
     jstring spillDirJstr
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeCreate(env, thiz, workerThreads, spillDirJstr);
+    return Java_com_qa_memengine_MemDiagnosticEngine_nativeCreate(
+        env, reinterpret_cast<jobject>(clazz), workerThreads, spillDirJstr
+    );
 }
 
 JNIEXPORT void JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeDestroy(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle
 ) {
-    Java_com_qa_memengine_MemDiagnosticEngine_nativeDestroy(env, thiz, handle);
+    Java_com_qa_memengine_MemDiagnosticEngine_nativeDestroy(env, reinterpret_cast<jobject>(clazz), handle);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeAttach(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jint pid
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeAttachProcess(env, thiz, handle, pid);
+    return Java_com_qa_memengine_MemDiagnosticEngine_nativeAttachProcess(
+        env, reinterpret_cast<jobject>(clazz), handle, pid
+    );
 }
 
 JNIEXPORT void JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSetRegionMask(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jint regionMask
 ) {
-    Java_com_qa_memengine_MemDiagnosticEngine_nativeSetRegionMask(env, thiz, handle, regionMask);
+    Java_com_qa_memengine_MemDiagnosticEngine_nativeSetRegionMask(
+        env, reinterpret_cast<jobject>(clazz), handle, regionMask
+    );
 }
 
 JNIEXPORT jlongArray JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionTotals(
     JNIEnv* env,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jint pid
 ) {
@@ -511,7 +517,7 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionTotals(
 JNIEXPORT jstring JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionCodeAt(
     JNIEnv* env,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jlong address
 ) {
@@ -531,7 +537,7 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionCodeAt(
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeClassifyPointer(
     JNIEnv* /*env*/,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jlong ptrValue
 ) {
@@ -558,7 +564,7 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeClassifyPointer(
 JNIEXPORT jbyteArray JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeReadBlock(
     JNIEnv* env,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jlong address,
     jint size
@@ -581,19 +587,21 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeReadBlock(
 JNIEXPORT jboolean JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeWriteBlock(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jlong address,
     jbyteArray bytesJarr
 ) {
-    jint rc = Java_com_qa_memengine_MemDiagnosticEngine_nativeWriteMemory(env, thiz, handle, address, bytesJarr);
+    jint rc = Java_com_qa_memengine_MemDiagnosticEngine_nativeWriteMemory(
+        env, reinterpret_cast<jobject>(clazz), handle, address, bytesJarr
+    );
     return rc == static_cast<jint>(mem_engine::EngineErrc::OK) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeCopyMemory(
     JNIEnv* /*env*/,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jlong fromAddr,
     jlong toAddr,
@@ -632,7 +640,7 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeCopyMemory(
 JNIEXPORT jlong JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeDumpMemory(
     JNIEnv* env,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jlong startAddr,
     jlong endAddr,
@@ -675,7 +683,7 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeDumpMemory(
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchExact(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jint dataType,
     jlong intTarget,
@@ -684,14 +692,14 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchExact(
     jboolean aligned
 ) {
     return Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchExact(
-        env, thiz, handle, dataType, intTarget, floatTarget, epsilon, aligned
+        env, reinterpret_cast<jobject>(clazz), handle, dataType, intTarget, floatTarget, epsilon, aligned
     );
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineExact(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jint dataType,
     jlong intTarget,
@@ -699,14 +707,14 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineExact(
     jdouble epsilon
 ) {
     return Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineExact(
-        env, thiz, handle, dataType, intTarget, floatTarget, epsilon
+        env, reinterpret_cast<jobject>(clazz), handle, dataType, intTarget, floatTarget, epsilon
     );
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchRange(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jint dataType,
     jlong intMin,
@@ -717,14 +725,14 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchRange(
     jboolean aligned
 ) {
     return Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchRange(
-        env, thiz, handle, dataType, intMin, intMax, floatMin, floatMax, inclusive, aligned
+        env, reinterpret_cast<jobject>(clazz), handle, dataType, intMin, intMax, floatMin, floatMax, inclusive, aligned
     );
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchGroup(
     JNIEnv* env,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jintArray typesJarr,
     jlongArray intValsJarr,
@@ -771,7 +779,7 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchGroup(
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchPattern(
     JNIEnv* env,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jbyteArray patternJarr,
     jstring maskJstr
@@ -806,7 +814,7 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchPattern(
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchEncoded(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jint dataType,
     jint encodedMode,
@@ -816,24 +824,26 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchEncoded(
     jboolean aligned
 ) {
     return Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchEncoded(
-        env, thiz, handle, dataType, encodedMode, logicalInt, logicalFloat, keyOrMask, aligned
+        env, reinterpret_cast<jobject>(clazz), handle, dataType, encodedMode, logicalInt, logicalFloat, keyOrMask, aligned
     );
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeStartUnknownSnapshot(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jint dataType
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeStartUnknownSnapshot(env, thiz, handle, dataType);
+    return Java_com_qa_memengine_MemDiagnosticEngine_nativeStartUnknownSnapshot(
+        env, reinterpret_cast<jobject>(clazz), handle, dataType
+    );
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineFuzzy(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jint deltaOp,
     jlong intDelta,
@@ -841,23 +851,25 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineFuzzy(
     jdouble epsilon
 ) {
     return Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineFuzzy(
-        env, thiz, handle, deltaOp, intDelta, floatDelta, epsilon
+        env, reinterpret_cast<jobject>(clazz), handle, deltaOp, intDelta, floatDelta, epsilon
     );
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetCandidateCount(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeGetCandidateCount(env, thiz, handle);
+    return Java_com_qa_memengine_MemDiagnosticEngine_nativeGetCandidateCount(
+        env, reinterpret_cast<jobject>(clazz), handle
+    );
 }
 
 JNIEXPORT jlongArray JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetCandidatesPacked(
     JNIEnv* env,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jint offset,
     jint limit
@@ -890,28 +902,32 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetCandidatesPacked
 JNIEXPORT void JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeLockAddress(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jlong address,
     jbyteArray bytesJarr
 ) {
-    Java_com_qa_memengine_MemDiagnosticEngine_nativeLockAddress(env, thiz, handle, address, bytesJarr);
+    Java_com_qa_memengine_MemDiagnosticEngine_nativeLockAddress(
+        env, reinterpret_cast<jobject>(clazz), handle, address, bytesJarr
+    );
 }
 
 JNIEXPORT void JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeUnlockAddress(
     JNIEnv* env,
-    jobject thiz,
+    jclass clazz,
     jlong handle,
     jlong address
 ) {
-    Java_com_qa_memengine_MemDiagnosticEngine_nativeUnlockAddress(env, thiz, handle, address);
+    Java_com_qa_memengine_MemDiagnosticEngine_nativeUnlockAddress(
+        env, reinterpret_cast<jobject>(clazz), handle, address
+    );
 }
 
 JNIEXPORT void JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeUnlockAll(
     JNIEnv* /*env*/,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle
 ) {
     auto* session = reinterpret_cast<NativeEngineSession*>(handle);

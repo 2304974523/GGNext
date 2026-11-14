@@ -95,7 +95,7 @@ bool MmapCandidateStore::growMmap(size_t requiredCount) {
     );
     if (newCapBytes < neededBytes) newCapBytes = neededBytes;
 
-#ifdef __linux__
+#if defined(__linux__) && defined(MREMAP_MAYMOVE)
     void* newPtr = ::mremap(m_mmapPtr, m_mmapCapacityBytes, newCapBytes, MREMAP_MAYMOVE);
     if (newPtr == MAP_FAILED) return false;
 #else
@@ -265,7 +265,7 @@ bool MmapRegionSnapshotStore::ensureCapacity(size_t totalBytesNeeded) {
         std::max(m_capacity * 2, totalBytesNeeded + (16 * 1024 * 1024))
     );
 
-#ifdef __linux__
+#if defined(__linux__) && defined(MREMAP_MAYMOVE)
     void* newPtr = ::mremap(m_mmapPtr, m_capacity, newCap, MREMAP_MAYMOVE);
     if (newPtr == MAP_FAILED) return false;
 #else

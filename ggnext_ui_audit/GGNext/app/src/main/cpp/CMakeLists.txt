@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(UNIX)
+    add_compile_definitions(_GNU_SOURCE)
+endif()
+
 option(MEMENGINE_BUILD_JNI "Build Android JNI shared library target" ON)
 
 # Architecture & SIMD Detection (ARM64 NEON, ARMv7 NEON, x86_64 Scalar/SSE/AVX)
