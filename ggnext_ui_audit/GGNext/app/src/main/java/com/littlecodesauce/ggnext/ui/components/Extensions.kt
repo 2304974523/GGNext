@@ -7,7 +7,9 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -28,6 +30,7 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -617,8 +620,8 @@ fun GgTextField(
                         modifier = Modifier
                             .fillMaxWidth()
                             .then(
-                                androidx.compose.ui.Modifier.pointerInput(Unit) {
-                                    androidx.compose.foundation.gestures.detectTapGestures(
+                                Modifier.pointerInput(Unit) {
+                                    detectTapGestures(
                                         onLongPress = {
                                             focusRequester.requestFocus()
                                             onFocus?.invoke()

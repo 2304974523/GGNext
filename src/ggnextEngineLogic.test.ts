@@ -106,8 +106,8 @@ describe('GGNext + C++20 MemEngine Integration Pure Logic Tests', () => {
     assert.equal(sysApp.category, 'SYSTEM');
   });
 
-  test('audit catalog contains all 18 documented bugs with non-empty diffs', () => {
-    assert.equal(GGNEXT_AUDIT_FINDINGS.length, 18);
+  test('audit catalog contains all 21 documented bugs with non-empty diffs', () => {
+    assert.equal(GGNEXT_AUDIT_FINDINGS.length, 21);
     for (const item of GGNEXT_AUDIT_FINDINGS) {
       assert.ok(item.beforeCode.length > 5);
       assert.ok(item.afterCode.length > 5);

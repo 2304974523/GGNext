@@ -16,7 +16,7 @@
 -keep class com.littlecodesauce.ggnext.service.FloatingIconService { <init>(...); }
 
 # ---------- JNI 桥接与 Native 方法 ----------
--keep class com.littlecodesauce.ggnext.engine.NativeMemoryBridge { *; }
+-keep class com.littlecodesauce.ggnext.engine.NativeMemBridge { *; }
 -keepclasseswithmembernames class * {
     native <methods>;
 }

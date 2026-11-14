@@ -51,8 +51,14 @@ object RootMemDaemon {
             val w = BufferedWriter(OutputStreamWriter(p.outputStream, Charsets.UTF_8))
             val r = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
 
-            // 赋予可执行权限并直接 exec 启动 C++20 Root 引擎守护进程
+            val binDir = File(binPath).parent ?: "/data/local/tmp"
+            val nativeDir = context?.applicationInfo?.nativeLibraryDir
+            val libDirs = listOfNotNull(nativeDir, binDir, "/system/lib64", "/system/lib")
+                .distinct()
+                .joinToString(":")
+            // 赋予可执行权限并注入 LD_LIBRARY_PATH (c++_shared) 后直接 exec 启动 C++20 Root 引擎守护进程
             w.write("chmod 755 \"$binPath\" 2>/dev/null || true\n")
+            w.write("export LD_LIBRARY_PATH=\"$libDirs:\${LD_LIBRARY_PATH:-}\"\n")
             w.write("exec \"$binPath\" \"$spillDir\" $threads\n")
             w.flush()
 
@@ -118,9 +124,11 @@ object RootMemDaemon {
             return directSo.absolutePath
         }
 
-        // 若系统未解压 nativeLibs，则直接从 APK (sourceDir) 中提取对应 ABI 的 libmem_engine_root.so
-        val extracted = File(context.codeCacheDir ?: context.filesDir, "libmem_engine_root.so")
-        if (extracted.exists() && extracted.length() > 0L) {
+        // 若系统未解压 nativeLibs，则直接从 APK (sourceDir) 中提取对应 ABI 的 libmem_engine_root.so 与 libc++_shared.so
+        val extractDir = context.codeCacheDir ?: context.filesDir
+        val extracted = File(extractDir, "libmem_engine_root.so")
+        val extractedCpp = File(extractDir, "libc++_shared.so")
+        if (extracted.exists() && extracted.length() > 0L && extractedCpp.exists() && extractedCpp.length() > 0L) {
             extracted.setExecutable(true, false)
             return extracted.absolutePath
         }
@@ -134,6 +142,13 @@ object RootMemDaemon {
                     zip.getInputStream(entry).use { input ->
                         FileOutputStream(extracted).use { output ->
                             input.copyTo(output)
+                        }
+                    }
+                    zip.getEntry("lib/$abi/libc++_shared.so")?.let { cppEntry ->
+                        zip.getInputStream(cppEntry).use { input ->
+                            FileOutputStream(extractedCpp).use { output ->
+                                input.copyTo(output)
+                            }
                         }
                     }
                     extracted.setExecutable(true, false)

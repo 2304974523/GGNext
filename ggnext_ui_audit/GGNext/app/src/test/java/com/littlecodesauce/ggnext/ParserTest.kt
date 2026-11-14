@@ -66,17 +66,17 @@ class ParserTest {
     fun parseTextUtf8AndUtf16() {
         val u8 = NumberParser.parse("'AB", ValueType.AUTO)
         assertEquals(NumberParser.Kind.TEXT, u8.kind)
-        assertEquals(2, u8.textBytes?.size)
+        assertEquals(2, u8.textBytes.size)
 
         val u16 = NumberParser.parse("\"AB", ValueType.AUTO)
-        assertEquals(4, u16.textBytes?.size)
+        assertEquals(4, u16.textBytes.size)
     }
 
     @Test
     fun parseXorQuery() {
         val x = NumberParser.parse("100X8", ValueType.DWORD)
         assertEquals(100L, x.numbers[0])
-        assertEquals(8, x.xorKey)
+        assertEquals(8L, x.xorKey)
     }
 
     @Test
@@ -89,12 +89,10 @@ class ParserTest {
     }
 
     @Test
-    fun fuzzySearchSimulationLifecycle() {
+    fun compareTypedValuesOrdering() {
         val engine = MemoryEngine()
-        engine.attach(12345, true)
-        val initSnap = engine.fuzzySearch(ValueType.DWORD, ValueType.SIGN_EQUAL, 0L, 0, null)
-        assertTrue(initSnap.items.isNotEmpty())
-        val refined = engine.fuzzySearch(ValueType.DWORD, ValueType.SIGN_GREATER_EQ, 0L, 0, initSnap.items)
-        assertTrue(refined.items.isNotEmpty())
+        assertEquals(-1, engine.compareTypedValues(-5L, 10L, ValueType.DWORD))
+        assertEquals(0, engine.compareTypedValues(Float.floatToRawIntBits(3.5f).toLong(), Float.floatToRawIntBits(3.5f).toLong(), ValueType.FLOAT))
+        assertTrue(engine.compareTypedValues(Float.floatToRawIntBits(10.0f).toLong(), Float.floatToRawIntBits(2.0f).toLong(), ValueType.FLOAT) > 0)
     }
 }

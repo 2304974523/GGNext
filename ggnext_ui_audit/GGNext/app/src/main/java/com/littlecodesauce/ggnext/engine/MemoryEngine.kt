@@ -594,7 +594,8 @@ class MemoryEngine {
             if (nativeBackendActive && nativeHandle != 0L) {
                 val mask = NativeMemBridge.buildRegionMask(selectedRegions)
                 NativeMemBridge.nativeSetRegionMask(nativeHandle, mask)
-                val totalFound = NativeMemBridge.nativeStartUnknownSnapshot(nativeHandle, nativeDt)
+                NativeMemBridge.nativeStartUnknownSnapshot(nativeHandle, nativeDt)
+                val totalFound = NativeMemBridge.nativeGetCandidateCount(nativeHandle)
                 val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap)
                 if (packed != null && packed.isNotEmpty()) {
                     val out = ArrayList<MemoryItem>(packed.size / 3)
@@ -656,7 +657,8 @@ class MemoryEngine {
                 }
                 return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
             } else if (nativeBackendActive && nativeHandle != 0L) {
-                val totalFound = NativeMemBridge.nativeRefineFuzzy(nativeHandle, deltaOp, delta, delta.toDouble(), 1e-4)
+                NativeMemBridge.nativeRefineFuzzy(nativeHandle, deltaOp, delta, delta.toDouble(), 1e-4)
+                val totalFound = NativeMemBridge.nativeGetCandidateCount(nativeHandle)
                 val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap) ?: LongArray(0)
                 val prevMap = current.associate { it.address to it.value }
                 val out = ArrayList<MemoryItem>(packed.size / 3)
@@ -811,7 +813,7 @@ class MemoryEngine {
             if (nativeBackendActive && nativeHandle != 0L) {
                 val mask = NativeMemBridge.buildRegionMask(selectedRegions)
                 NativeMemBridge.nativeSetRegionMask(nativeHandle, mask)
-                val totalFound = NativeMemBridge.nativeSearchRange(
+                NativeMemBridge.nativeSearchRange(
                     nativeHandle,
                     NativeMemBridge.toNativeDataType(ptrType),
                     lo,
@@ -821,6 +823,7 @@ class MemoryEngine {
                     true,
                     true
                 )
+                val totalFound = NativeMemBridge.nativeGetCandidateCount(nativeHandle)
                 val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap)
                 if (packed != null && packed.isNotEmpty()) {
                     val out = ArrayList<MemoryItem>(packed.size / 3)
@@ -1028,7 +1031,7 @@ class MemoryEngine {
             else -> c.to.toDouble()
         }
 
-        val totalFound: Long = if (newSearch) {
+        if (newSearch) {
             when {
                 c.isText && c.textBytes.isNotEmpty() -> {
                     val maskStr = "x".repeat(c.textBytes.size)
@@ -1124,6 +1127,7 @@ class MemoryEngine {
             }
         }
 
+        val totalFound = NativeMemBridge.nativeGetCandidateCount(nativeHandle)
         val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, maxResults) ?: LongArray(0)
         val out = ArrayList<MemoryItem>(packed.size / 3)
         val hasAddrFilter = (c.memoryFrom != 0L || c.memoryTo != Long.MAX_VALUE)
