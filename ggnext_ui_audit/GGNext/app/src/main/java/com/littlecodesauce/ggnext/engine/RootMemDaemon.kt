@@ -388,10 +388,35 @@ object RootMemDaemon {
     }
 
     @Synchronized
+    fun refineRange(
+        dataType: Int,
+        intMin: Long,
+        intMax: Long,
+        floatMin: Double,
+        floatMax: Double,
+        inclusive: Boolean,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): Long {
+        val inc = if (inclusive) 1 else 0
+        val resp = sendCommandLocked(
+            String.format(
+                Locale.US,
+                "REFINE_RANGE %d %d %d %.8f %.8f %d",
+                dataType, intMin, intMax, floatMin, floatMax, inc
+            ),
+            onProgress
+        ) ?: return 0L
+        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+    }
+
+    @Synchronized
     fun searchGroup(
         types: IntArray,
         intVals: LongArray,
         floatVals: DoubleArray,
+        intMaxVals: LongArray,
+        floatMaxVals: DoubleArray,
+        fieldOps: IntArray,
         windowSize: Int,
         ordered: Boolean,
         aligned: Boolean,
@@ -403,9 +428,15 @@ object RootMemDaemon {
         sb.append("SEARCH_GROUP ").append(windowSize).append(' ')
             .append(ord).append(' ').append(aln).append(' ').append(types.size)
         for (i in types.indices) {
+            val iMax = intMaxVals.getOrElse(i) { intVals[i] }
+            val fMax = floatMaxVals.getOrElse(i) { floatVals[i] }
+            val op = fieldOps.getOrElse(i) { 0 }
             sb.append(' ').append(types[i])
                 .append(' ').append(intVals[i])
                 .append(' ').append(String.format(Locale.US, "%.8f", floatVals[i]))
+                .append(' ').append(iMax)
+                .append(' ').append(String.format(Locale.US, "%.8f", fMax))
+                .append(' ').append(op)
         }
         val resp = sendCommandLocked(sb.toString(), onProgress) ?: return 0L
         return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
@@ -440,6 +471,27 @@ object RootMemDaemon {
                 Locale.US,
                 "SEARCH_ENCODED %d %d %d %.8f %s %d",
                 dataType, encodedMode, logicalInt, logicalFloat, uKey, aln
+            ),
+            onProgress
+        ) ?: return 0L
+        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+    }
+
+    @Synchronized
+    fun refineEncoded(
+        dataType: Int,
+        encodedMode: Int,
+        logicalInt: Long,
+        logicalFloat: Double,
+        keyOrMask: Long,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): Long {
+        val uKey = java.lang.Long.toUnsignedString(keyOrMask)
+        val resp = sendCommandLocked(
+            String.format(
+                Locale.US,
+                "REFINE_ENCODED %d %d %d %.8f %s",
+                dataType, encodedMode, logicalInt, logicalFloat, uKey
             ),
             onProgress
         ) ?: return 0L

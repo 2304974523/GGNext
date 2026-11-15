@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Search
@@ -37,19 +38,23 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.littlecodesauce.ggnext.core.Session
 import com.littlecodesauce.ggnext.core.Ui
 import com.littlecodesauce.ggnext.data.AppIconCache
 import com.littlecodesauce.ggnext.data.ProcessScanner
 import com.littlecodesauce.ggnext.model.TargetProcess
-import com.littlecodesauce.ggnext.ui.components.FilterChipRow
+import com.littlecodesauce.ggnext.ui.components.Chip
 import com.littlecodesauce.ggnext.ui.components.GgTextField
 import com.littlecodesauce.ggnext.ui.components.ItemEnter
 import com.littlecodesauce.ggnext.ui.components.NextSheetCard
+import com.littlecodesauce.ggnext.ui.components.VerticalFastScrollbar
 import com.littlecodesauce.ggnext.ui.components.clickableNoRipple
 import com.littlecodesauce.ggnext.ui.components.fsp
 import com.littlecodesauce.ggnext.ui.components.monoStyle
@@ -65,20 +70,29 @@ fun ProcessSheet(ui: Ui) {
         }
     }
     var query by remember { mutableStateOf(TextFieldValue("")) }
-    val list = remember(ui.processes, ui.processFilter, query.text) {
-        val base = when (ui.processFilter) {
+    val list = remember(ui.processes, ui.processFilter, ui.processSortBySize, query.text) {
+        val filteredByCategory = when (ui.processFilter) {
             1 -> ui.processes.filter { !it.system }
             2 -> ui.processes.filter { it.system }
-            3 -> ui.processes.sortedWith(compareBy<TargetProcess> { it.system }.thenBy { it.pid })
-            4 -> ui.processes.sortedByDescending { it.sizeBytes }
             else -> ui.processes
         }
-        if (query.text.isBlank()) base
-        else base.filter {
+        val sorted = if (ui.processSortBySize) {
+            filteredByCategory.sortedByDescending { it.sizeBytes }
+        } else {
+            filteredByCategory.sortedWith(
+                compareBy<TargetProcess> { it.system }
+                    .thenByDescending { it.sizeBytes }
+                    .thenBy { it.pid }
+            )
+        }
+        if (query.text.isBlank()) sorted
+        else sorted.filter {
             it.label.contains(query.text, true) || it.packageName.contains(query.text, true) ||
                 it.pid.toString().contains(query.text)
         }
     }
+
+    val listState = rememberLazyListState()
 
     NextSheetCard(
         title = "进程列表",
@@ -108,15 +122,51 @@ fun ProcessSheet(ui: Ui) {
                     placeholder = "搜索名称 / 包名 / pid"
                 )
             }
-            FilterChipRow(
-                items = listOf("全部", "用户", "系统", "优先级", "大小"),
-                selected = ui.processFilter,
-                onSelect = Session::setProcessFilter
-            )
-            if (ui.processLoading) SkeletonList()
-            else LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                itemsIndexed(list, key = { _, p -> p.packageName + p.pid }) { idx, p ->
-                    ProcessRow(p, idx) { Session.attach(p) }
+            // 界面问题 2：去除“优先级”按钮，同时“大小”按钮支持与“全部/用户/系统”多选共存
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf(
+                    0 to "全部",
+                    1 to "用户",
+                    2 to "系统"
+                ).forEach { (idx, label) ->
+                    Chip(
+                        label = label,
+                        selected = ui.processFilter == idx,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Session.setProcessFilter(idx)
+                    }
+                }
+                Chip(
+                    label = "大小",
+                    selected = ui.processSortBySize,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Session.toggleProcessSortBySize()
+                }
+            }
+            if (ui.processLoading) {
+                SkeletonList()
+            } else {
+                Box(Modifier.fillMaxWidth()) {
+                    LazyColumn(
+                        state = listState,
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        itemsIndexed(list, key = { _, p -> p.packageName + p.pid }) { idx, p ->
+                            ProcessRow(p, idx) { Session.attach(p) }
+                        }
+                    }
+                    VerticalFastScrollbar(
+                        listState = listState,
+                        modifier = Modifier.align(Alignment.CenterEnd)
+                    )
                 }
             }
         }
@@ -140,19 +190,37 @@ private fun ProcessRow(p: TargetProcess, index: Int, onClick: () -> Unit) {
         ) {
             AppIcon(p)
             Spacer(Modifier.width(12.dp))
-            Text("[${p.pid}]", style = monoStyle(14, Rose.Green))
-            Spacer(Modifier.width(8.dp))
-            Text(
-                p.label,
-                color = Rose.Text,
-                fontSize = fsp(15f),
-                maxLines = 1,
-                modifier = Modifier.weight(1f, fill = false)
-            )
+            Text("[${p.pid}]", style = monoStyle(13, Rose.Green))
             Spacer(Modifier.width(6.dp))
-            Text("[${if (p.x64) "x64" else "x86"}]", style = monoStyle(13, Rose.TextSecond))
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // 界面问题 4：虚拟空间中的进程在进程名左侧显示蓝色 '*'
+                if (p.isVirtual) {
+                    Text(
+                        text = "*",
+                        color = Color(0xFF42A5F5),
+                        fontSize = fsp(16f),
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Spacer(Modifier.width(3.dp))
+                }
+                // 界面问题 3：支持展示完整子进程名称（最高 2 行），不强制截断丢失子进程后缀
+                Text(
+                    text = p.label,
+                    color = Rose.Text,
+                    fontSize = fsp(14.5f),
+                    lineHeight = fsp(18f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+            }
             Spacer(Modifier.width(6.dp))
-            Text("[${ProcessScanner.sizeText(p.sizeBytes)}]", style = monoStyle(13, Rose.TextSecond))
+            Text("[${if (p.x64) "x64" else "x86"}]", style = monoStyle(12, Rose.TextSecond))
+            Spacer(Modifier.width(4.dp))
+            Text("[${ProcessScanner.sizeText(p.sizeBytes)}]", style = monoStyle(12, Rose.TextSecond))
         }
     }
 }
@@ -160,7 +228,7 @@ private fun ProcessRow(p: TargetProcess, index: Int, onClick: () -> Unit) {
 @Composable
 private fun AppIcon(p: TargetProcess) {
     val ctx = LocalContext.current
-    val bmp = remember(p.packageName) { AppIconCache.get(ctx, p.packageName) }
+    val bmp = remember(p.packageName, p.apkPath) { AppIconCache.get(ctx, p.packageName, p.apkPath) }
     Box(
         Modifier
             .size(42.dp)

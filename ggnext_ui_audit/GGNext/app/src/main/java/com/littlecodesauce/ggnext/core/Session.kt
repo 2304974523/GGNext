@@ -63,6 +63,7 @@ enum class Sheet {
     VALUE_FORMAT,
     EDITOR,
     OFFSET,
+    CALC_OFFSET,
     REMOVE,
     TOOLBAR_ORDER,
     TOOLBAR_PICK,
@@ -206,7 +207,8 @@ data class Ui(
     val memoryHistoryForward: List<Long> = emptyList(),
 
     val processes: List<TargetProcess> = emptyList(),
-    val processFilter: Int = 0,
+    val processFilter: Int = 0, // 0=全部, 1=用户, 2=系统
+    val processSortBySize: Boolean = true, // "大小"可多选排序按钮（可与全部/用户/系统同时选中）
     val processLoading: Boolean = true,
     val target: TargetProcess? = null,
     val processPaused: Boolean = false,
@@ -730,7 +732,11 @@ object Session {
     }
 
     fun setProcessFilter(index: Int) = _ui.update { st ->
-        st.copy(processFilter = index)
+        st.copy(processFilter = index.coerceIn(0, 2))
+    }
+
+    fun toggleProcessSortBySize() = _ui.update { st ->
+        st.copy(processSortBySize = !st.processSortBySize)
     }
 
     fun toggleProcessPause() = _ui.update { st ->
@@ -1051,7 +1057,10 @@ object Session {
                 notRange = parsed.notRange,
                 sign = parsed.sign,
                 xorKey = parsed.xorKey,
+                xorOffset = parsed.xorOffset,
                 orderedGroup = parsed.numbers,
+                groupTo = parsed.to,
+                groupOps = parsed.groupOps,
                 ordered = parsed.ordered,
                 groupTypes = parsed.types,
                 area = parsed.area.coerceAtLeast(2),

@@ -92,8 +92,8 @@ fun NavBar(
 ) {
     val primary = MaterialTheme.colorScheme.primary
     val ctx = LocalContext.current
-    val appBmp = remember(target?.packageName) {
-        target?.let { AppIconCache.get(ctx, it.packageName) }
+    val appBmp = remember(target?.packageName, target?.apkPath) {
+        target?.let { AppIconCache.get(ctx, it.packageName, it.apkPath) }
     }
 
     Row(
@@ -228,9 +228,36 @@ private fun NavIcon(
 ) {
     var pressed by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(
-        targetValue = if (pressed) 0.90f else if (selected) 1.03f else 1f,
-        animationSpec = Motion.Fast,
-        label = "nav"
+        targetValue = when {
+            pressed -> 0.88f
+            selected -> 1.08f
+            else -> 1f
+        },
+        animationSpec = spring(
+            dampingRatio = 0.58f,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "navScale"
+    )
+    val iconLiftPx by animateFloatAsState(
+        targetValue = if (selected) -3.5f else 0f,
+        animationSpec = spring(
+            dampingRatio = 0.62f,
+            stiffness = Spring.StiffnessMediumLow
+        ),
+        label = "navLift"
+    )
+    val iconTiltDeg by animateFloatAsState(
+        targetValue = when {
+            pressed -> -8f
+            selected -> if (desc == "设置") 24f else -5f
+            else -> 0f
+        },
+        animationSpec = spring(
+            dampingRatio = 0.55f,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "navTilt"
     )
     val tint by animateColorAsState(
         if (selected) primary else Rose.Text,
@@ -249,7 +276,17 @@ private fun NavIcon(
             ),
         contentAlignment = Alignment.Center
     ) {
-        Icon(icon, desc, tint = tint, modifier = Modifier.size(22.dp))
+        Icon(
+            imageVector = icon,
+            contentDescription = desc,
+            tint = tint,
+            modifier = Modifier
+                .size(22.dp)
+                .graphicsLayer {
+                    translationY = iconLiftPx
+                    rotationZ = iconTiltDeg
+                }
+        )
         if (badgeCount > 0) {
             Box(
                 Modifier
@@ -599,6 +636,15 @@ fun ProcessBar(
             ) {
                 Text("[${target.pid}]", style = monoStyle(12, Rose.Green))
                 Spacer(Modifier.width(4.dp))
+                if (target.isVirtual) {
+                    Text(
+                        text = "*",
+                        color = Color(0xFF42A5F5),
+                        fontSize = fsp(14f),
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Spacer(Modifier.width(2.dp))
+                }
                 Text(
                     target.label,
                     color = Rose.Text,

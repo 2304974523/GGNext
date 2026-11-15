@@ -1,6 +1,7 @@
 package com.littlecodesauce.ggnext.ui.sheet
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -27,11 +28,13 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.TextRange
@@ -69,11 +72,71 @@ import com.littlecodesauce.ggnext.ui.theme.typeColor
 
 @Composable
 fun SearchSheet(ui: Ui) {
+    // 界面问题 7：统一提升搜索面板全部输入框状态，支持在不同输入框（主搜索词 / 从 / 到 / 附近地址 / 附近距离 / 地址蒙版）间自由切换焦点与光标
     var tf by remember { mutableStateOf(TextFieldValue(ui.search.text, TextRange(0, ui.search.text.length))) }
+    var fromTf by remember {
+        mutableStateOf(TextFieldValue(ui.search.rangeFrom, TextRange(0, ui.search.rangeFrom.length)))
+    }
+    var toTf by remember {
+        mutableStateOf(TextFieldValue(ui.search.rangeTo, TextRange(0, ui.search.rangeTo.length)))
+    }
+    var addrTf by remember {
+        val cur = ui.search.nearbyAddress.ifEmpty {
+            java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
+        }
+        mutableStateOf(TextFieldValue(cur, TextRange(0, cur.length)))
+    }
+    var distTf by remember {
+        mutableStateOf(TextFieldValue(ui.search.nearbyDistance, TextRange(0, ui.search.nearbyDistance.length)))
+    }
+    var maskTf by remember {
+        mutableStateOf(TextFieldValue(ui.search.mask, TextRange(0, ui.search.mask.length)))
+    }
+    // 0: 主搜索框 tf, 1: 从(fromTf), 2: 到(toTf), 3: 附近地址(addrTf), 4: 附近距离(distTf), 5: 地址蒙版(maskTf)
+    var activeField by remember { mutableIntStateOf(0) }
+
     var showSign by remember { mutableStateOf(false) }
     var showType by remember { mutableStateOf(false) }
     val extended = ui.search.expanded
     val keyboardOn = ui.search.keyboardVisible
+
+    val activeTf = when (activeField) {
+        1 -> fromTf
+        2 -> toTf
+        3 -> addrTf
+        4 -> distTf
+        5 -> maskTf
+        else -> tf
+    }
+
+    fun updateActiveField(next: TextFieldValue) {
+        when (activeField) {
+            1 -> {
+                fromTf = next
+                Session.updateSearch { s -> s.copy(rangeFrom = next.text) }
+            }
+            2 -> {
+                toTf = next
+                Session.updateSearch { s -> s.copy(rangeTo = next.text) }
+            }
+            3 -> {
+                addrTf = next
+                Session.updateSearch { s -> s.copy(nearbyAddress = next.text) }
+            }
+            4 -> {
+                distTf = next
+                Session.updateSearch { s -> s.copy(nearbyDistance = next.text) }
+            }
+            5 -> {
+                maskTf = next
+                Session.updateSearch { s -> s.copy(mask = next.text) }
+            }
+            else -> {
+                tf = next
+                Session.updateSearch { s -> s.copy(text = next.text) }
+            }
+        }
+    }
 
     val currentTypeColor = typeColor(ui.search.type)
     val typeRangeText = remember(ui.search.type) {
@@ -109,11 +172,14 @@ fun SearchSheet(ui: Ui) {
                     .fillMaxWidth()
                     .height(52.dp)
                     .background(Rose.CardHigh, RoundedCornerShape(12.dp))
-                    .border(1.dp, Rose.Divider, RoundedCornerShape(12.dp))
+                    .border(
+                        width = 1.dp,
+                        color = if (activeField == 0) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                        shape = RoundedCornerShape(12.dp)
+                    )
                     .padding(horizontal = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // 界面调整 12：搜索条件按钮 + 动态旋转三角符号（未展开朝右 ▸，展开朝下 ▾）
                 Row(
                     Modifier
                         .height(38.dp)
@@ -134,7 +200,6 @@ fun SearchSheet(ui: Ui) {
                     )
                 }
 
-                // 界面调整 12：数据类型按钮 + 动态旋转三角符号（未展开朝右 ▸，展开朝下 ▾）
                 Row(
                     Modifier
                         .height(38.dp)
@@ -163,9 +228,11 @@ fun SearchSheet(ui: Ui) {
                 GgTextField(
                     value = tf,
                     onValueChange = {
+                        activeField = 0
                         tf = it
                         Session.updateSearch { s -> s.copy(text = it.text) }
                     },
+                    onFocus = { activeField = 0 },
                     modifier = Modifier.weight(1f).height(40.dp),
                     textStyle = monoStyle(15, Rose.Text),
                     cursorColor = Rose.Primary,
@@ -190,30 +257,35 @@ fun SearchSheet(ui: Ui) {
                     if (extended) "收起" else "更多",
                     Modifier.width(60.dp).height(36.dp),
                     filled = true
-                ) { Session.updateSearch { s -> s.copy(expanded = !s.expanded) } }
+                ) {
+                    val nextExp = !ui.search.expanded
+                    if (!nextExp) activeField = 0
+                    Session.updateSearch { s -> s.copy(expanded = nextExp) }
+                }
             }
 
-            // Bug 4 优化：数据类型选择采用和修改地址时完全一致的横向按钮排列（参考图3）
             AnimatedVisibility(showType, enter = expandEnter(), exit = expandExit()) {
                 Row(
                     Modifier
                         .fillMaxWidth()
                         .padding(top = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     (ValueType.order + ValueType.AUTO).forEach { t ->
                         val on = ui.search.type == t
                         val isAuto = t == ValueType.AUTO
                         val shortName = if (isAuto) "A" else ValueType.shortName(t)
                         val col = if (isAuto) Rose.Text else typeColor(t)
+                        val bgCol by animateColorAsState(
+                            if (on) Rose.ChipSelected else Rose.CardHigh,
+                            Motion.ColorFast,
+                            label = "typeChipBg"
+                        )
                         Box(
                             Modifier
                                 .weight(1f)
                                 .height(36.dp)
-                                .background(
-                                    if (on) Rose.ChipSelected else Rose.CardHigh,
-                                    RoundedCornerShape(8.dp)
-                                )
+                                .background(bgCol, RoundedCornerShape(8.dp))
                                 .border(
                                     width = if (on) 1.dp else 0.dp,
                                     color = if (on) col else Color.Transparent,
@@ -236,7 +308,6 @@ fun SearchSheet(ui: Ui) {
                 }
             }
 
-            // Bug 4 优化：搜索条件选择采用横向紧凑按钮排列（参考图3风格）
             AnimatedVisibility(showSign, enter = expandEnter(), exit = expandExit()) {
                 Row(
                     Modifier
@@ -251,14 +322,16 @@ fun SearchSheet(ui: Ui) {
                         ValueType.SIGN_LESS_EQ to "≤"
                     ).forEach { (s, symbol) ->
                         val on = (ui.search.sign and ValueType.SIGN_MASK) == s
+                        val bgCol by animateColorAsState(
+                            if (on) Rose.ChipSelected else Rose.CardHigh,
+                            Motion.ColorFast,
+                            label = "signChipBg"
+                        )
                         Box(
                             Modifier
                                 .weight(1f)
                                 .height(36.dp)
-                                .background(
-                                    if (on) Rose.ChipSelected else Rose.CardHigh,
-                                    RoundedCornerShape(8.dp)
-                                )
+                                .background(bgCol, RoundedCornerShape(8.dp))
                                 .border(
                                     width = if (on) 1.dp else 0.dp,
                                     color = if (on) Rose.Primary else Color.Transparent,
@@ -285,7 +358,7 @@ fun SearchSheet(ui: Ui) {
                 Column {
                     Spacer(Modifier.height(8.dp))
 
-                    // 范围模式选择胶囊 (全部内存 / 指定地址区间 / 附近) - 参考图 2
+                    // 其他改进 2：范围模式选择胶囊带平滑颜色、边框与按下缩放过渡动画
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         listOf(
                             0 to "全部内存",
@@ -293,22 +366,49 @@ fun SearchSheet(ui: Ui) {
                             2 to "附近:"
                         ).forEach { (m, label) ->
                             val isSel = ui.search.rangeMode == m
+                            var pillPressed by remember { mutableStateOf(false) }
+                            val pillScale by animateFloatAsState(
+                                if (pillPressed) 0.94f else 1f,
+                                Motion.Fast,
+                                label = "rangePillScale"
+                            )
+                            val pillBg by animateColorAsState(
+                                if (isSel) Rose.ChipSelected else if (pillPressed) Rose.Chip else Rose.CardHigh,
+                                Motion.ColorFast,
+                                label = "rangePillBg"
+                            )
+                            val pillTextCol by animateColorAsState(
+                                if (isSel) Rose.Primary else Rose.TextSecond,
+                                Motion.ColorFast,
+                                label = "rangePillTxt"
+                            )
                             Box(
                                 Modifier
                                     .weight(1f)
                                     .height(36.dp)
-                                    .background(
-                                        if (isSel) Rose.ChipSelected else Rose.CardHigh,
-                                        RoundedCornerShape(8.dp)
+                                    .scale(pillScale)
+                                    .background(pillBg, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = if (isSel) 1.dp else 0.dp,
+                                        color = if (isSel) Rose.Primary.copy(alpha = 0.45f) else Color.Transparent,
+                                        shape = RoundedCornerShape(8.dp)
                                     )
-                                    .clickableWithTooltip {
-                                        Session.updateSearch { s -> s.copy(rangeMode = m) }
-                                    },
+                                    .clickableWithTooltip(
+                                        onPressChange = { pillPressed = it },
+                                        onClick = {
+                                            Session.updateSearch { s -> s.copy(rangeMode = m) }
+                                            when (m) {
+                                                1 -> if (activeField !in 1..2) activeField = 1
+                                                2 -> if (activeField !in 3..4) activeField = 3
+                                                else -> if (activeField in 1..4) activeField = 0
+                                            }
+                                        }
+                                    ),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     tr(label),
-                                    color = if (isSel) Rose.Primary else Rose.TextSecond,
+                                    color = pillTextCol,
                                     fontSize = fsp(12.5f),
                                     fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal
                                 )
@@ -316,188 +416,211 @@ fun SearchSheet(ui: Ui) {
                         }
                     }
 
-                    // 模式 1：指定地址区间 (从 00000000 到 FFFFFFFFFFFFFFFF) - 参考图 3
-                    if (ui.search.rangeMode == 1) {
-                        Spacer(Modifier.height(8.dp))
-                        var fromTf by remember {
-                            mutableStateOf(TextFieldValue(ui.search.rangeFrom, TextRange(0, ui.search.rangeFrom.length)))
-                        }
-                        var toTf by remember {
-                            mutableStateOf(TextFieldValue(ui.search.rangeTo, TextRange(0, ui.search.rangeTo.length)))
-                        }
-
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp)
-                                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(tr("从:"), color = Rose.TextSecond, fontSize = fsp(13f), modifier = Modifier.width(36.dp))
-                            GgTextField(
-                                value = fromTf,
-                                onValueChange = {
-                                    fromTf = it
-                                    Session.updateSearch { s -> s.copy(rangeFrom = it.text) }
-                                },
-                                modifier = Modifier.weight(1f).height(34.dp),
-                                textStyle = monoStyle(14, Rose.Text),
-                                cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = keyboardOn
-                            )
-                            Box(
+                    // 模式 1：指定地址区间（带平滑展开收起动画 + 焦点切换）
+                    AnimatedVisibility(ui.search.rangeMode == 1, enter = expandEnter(), exit = expandExit()) {
+                        Column {
+                            Spacer(Modifier.height(8.dp))
+                            Row(
                                 Modifier
-                                    .size(30.dp)
-                                    .clickableWithTooltip {
-                                        fromTf = TextFieldValue("00000000", TextRange(8))
-                                        Session.updateSearch { s -> s.copy(rangeFrom = "00000000") }
-                                    },
-                                contentAlignment = Alignment.Center
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (activeField == 1) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple(remember { MutableInteractionSource() }) { activeField = 1 }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(GgIcons.ContentDuplicate, null, tint = Rose.Primary, modifier = Modifier.size(16.dp))
+                                Text(tr("从:"), color = Rose.TextSecond, fontSize = fsp(13f), modifier = Modifier.width(36.dp))
+                                GgTextField(
+                                    value = fromTf,
+                                    onValueChange = {
+                                        activeField = 1
+                                        fromTf = it
+                                        Session.updateSearch { s -> s.copy(rangeFrom = it.text) }
+                                    },
+                                    onFocus = { activeField = 1 },
+                                    modifier = Modifier.weight(1f).height(34.dp),
+                                    textStyle = monoStyle(14, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = keyboardOn
+                                )
+                                Box(
+                                    Modifier
+                                        .size(30.dp)
+                                        .clickableWithTooltip {
+                                            activeField = 1
+                                            fromTf = TextFieldValue("00000000", TextRange(8))
+                                            Session.updateSearch { s -> s.copy(rangeFrom = "00000000") }
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(GgIcons.ContentDuplicate, null, tint = Rose.Primary, modifier = Modifier.size(16.dp))
+                                }
                             }
-                        }
 
-                        Spacer(Modifier.height(6.dp))
+                            Spacer(Modifier.height(6.dp))
 
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp)
-                                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(tr("到:"), color = Rose.TextSecond, fontSize = fsp(13f), modifier = Modifier.width(36.dp))
-                            GgTextField(
-                                value = toTf,
-                                onValueChange = {
-                                    toTf = it
-                                    Session.updateSearch { s -> s.copy(rangeTo = it.text) }
-                                },
-                                modifier = Modifier.weight(1f).height(34.dp),
-                                textStyle = monoStyle(14, Rose.Text),
-                                cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = keyboardOn
-                            )
-                            Box(
+                            Row(
                                 Modifier
-                                    .size(30.dp)
-                                    .clickableWithTooltip {
-                                        toTf = TextFieldValue("FFFFFFFFFFFFFFFF", TextRange(16))
-                                        Session.updateSearch { s -> s.copy(rangeTo = "FFFFFFFFFFFFFFFF") }
-                                    },
-                                contentAlignment = Alignment.Center
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (activeField == 2) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple(remember { MutableInteractionSource() }) { activeField = 2 }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(GgIcons.ContentDuplicate, null, tint = Rose.Primary, modifier = Modifier.size(16.dp))
+                                Text(tr("到:"), color = Rose.TextSecond, fontSize = fsp(13f), modifier = Modifier.width(36.dp))
+                                GgTextField(
+                                    value = toTf,
+                                    onValueChange = {
+                                        activeField = 2
+                                        toTf = it
+                                        Session.updateSearch { s -> s.copy(rangeTo = it.text) }
+                                    },
+                                    onFocus = { activeField = 2 },
+                                    modifier = Modifier.weight(1f).height(34.dp),
+                                    textStyle = monoStyle(14, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = keyboardOn
+                                )
+                                Box(
+                                    Modifier
+                                        .size(30.dp)
+                                        .clickableWithTooltip {
+                                            activeField = 2
+                                            toTf = TextFieldValue("FFFFFFFFFFFFFFFF", TextRange(16))
+                                            Session.updateSearch { s -> s.copy(rangeTo = "FFFFFFFFFFFFFFFF") }
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(GgIcons.ContentDuplicate, null, tint = Rose.Primary, modifier = Modifier.size(16.dp))
+                                }
                             }
                         }
                     }
 
-                    // 模式 2：附近 (地址 + 之前/后复选框 + 距离) - 完美匹配图 2 原版 GG
-                    if (ui.search.rangeMode == 2) {
-                        Spacer(Modifier.height(8.dp))
-                        var addrTf by remember {
-                            val cur = ui.search.nearbyAddress.ifEmpty {
-                                java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
-                            }
-                            mutableStateOf(TextFieldValue(cur, TextRange(0, cur.length)))
-                        }
-                        var distTf by remember {
-                            mutableStateOf(TextFieldValue(ui.search.nearbyDistance, TextRange(0, ui.search.nearbyDistance.length)))
-                        }
-
-                        // 地址: 7168F44CC0
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp)
-                                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(tr("地址:"), color = Rose.TextSecond, fontSize = fsp(13.5f))
-                            Spacer(Modifier.width(8.dp))
-                            GgTextField(
-                                value = addrTf,
-                                onValueChange = {
-                                    addrTf = it
-                                    Session.updateSearch { s -> s.copy(nearbyAddress = it.text) }
-                                },
-                                modifier = Modifier.weight(1f).height(34.dp),
-                                textStyle = monoStyle(14, Rose.Text),
-                                cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = keyboardOn
-                            )
-                        }
-
-                        Spacer(Modifier.height(6.dp))
-
-                        // [x] 之前   [x] 后
-                        Row(
-                            Modifier.fillMaxWidth().padding(horizontal = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                    // 模式 2：附近（带平滑展开收起动画 + 焦点切换）
+                    AnimatedVisibility(ui.search.rangeMode == 2, enter = expandEnter(), exit = expandExit()) {
+                        Column {
+                            Spacer(Modifier.height(8.dp))
                             Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.clickableWithTooltip {
-                                    Session.updateSearch { s -> s.copy(nearbyBefore = !s.nearbyBefore) }
-                                }
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (activeField == 3) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple(remember { MutableInteractionSource() }) { activeField = 3 }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                GgCheckBox(checked = ui.search.nearbyBefore, onCheckedChange = {
-                                    Session.updateSearch { s -> s.copy(nearbyBefore = it) }
-                                }, size = 18.dp)
-                                Spacer(Modifier.width(6.dp))
-                                Text(tr("之前"), color = Rose.Text, fontSize = fsp(13f))
+                                Text(tr("地址:"), color = Rose.TextSecond, fontSize = fsp(13.5f))
+                                Spacer(Modifier.width(8.dp))
+                                GgTextField(
+                                    value = addrTf,
+                                    onValueChange = {
+                                        activeField = 3
+                                        addrTf = it
+                                        Session.updateSearch { s -> s.copy(nearbyAddress = it.text) }
+                                    },
+                                    onFocus = { activeField = 3 },
+                                    modifier = Modifier.weight(1f).height(34.dp),
+                                    textStyle = monoStyle(14, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = keyboardOn
+                                )
                             }
-                            Spacer(Modifier.width(20.dp))
+
+                            Spacer(Modifier.height(6.dp))
+
                             Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.clickableWithTooltip {
-                                    Session.updateSearch { s -> s.copy(nearbyAfter = !s.nearbyAfter) }
-                                }
+                                Modifier.fillMaxWidth().padding(horizontal = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                GgCheckBox(checked = ui.search.nearbyAfter, onCheckedChange = {
-                                    Session.updateSearch { s -> s.copy(nearbyAfter = it) }
-                                }, size = 18.dp)
-                                Spacer(Modifier.width(6.dp))
-                                Text(tr("后"), color = Rose.Text, fontSize = fsp(13f))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.clickableWithTooltip {
+                                        Session.updateSearch { s -> s.copy(nearbyBefore = !s.nearbyBefore) }
+                                    }
+                                ) {
+                                    GgCheckBox(checked = ui.search.nearbyBefore, onCheckedChange = {
+                                        Session.updateSearch { s -> s.copy(nearbyBefore = it) }
+                                    }, size = 18.dp)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(tr("之前"), color = Rose.Text, fontSize = fsp(13f))
+                                }
+                                Spacer(Modifier.width(20.dp))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.clickableWithTooltip {
+                                        Session.updateSearch { s -> s.copy(nearbyAfter = !s.nearbyAfter) }
+                                    }
+                                ) {
+                                    GgCheckBox(checked = ui.search.nearbyAfter, onCheckedChange = {
+                                        Session.updateSearch { s -> s.copy(nearbyAfter = it) }
+                                    }, size = 18.dp)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(tr("后"), color = Rose.Text, fontSize = fsp(13f))
+                                }
                             }
-                        }
 
-                        Spacer(Modifier.height(6.dp))
+                            Spacer(Modifier.height(6.dp))
 
-                        // 距离: 500
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp)
-                                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(tr("距离:"), color = Rose.TextSecond, fontSize = fsp(13.5f))
-                            Spacer(Modifier.width(8.dp))
-                            GgTextField(
-                                value = distTf,
-                                onValueChange = {
-                                    distTf = it
-                                    Session.updateSearch { s -> s.copy(nearbyDistance = it.text) }
-                                },
-                                modifier = Modifier.weight(1f).height(34.dp),
-                                textStyle = monoStyle(14, Rose.Text),
-                                cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = keyboardOn,
-                                placeholder = "500"
-                            )
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (activeField == 4) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple(remember { MutableInteractionSource() }) { activeField = 4 }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(tr("距离:"), color = Rose.TextSecond, fontSize = fsp(13.5f))
+                                Spacer(Modifier.width(8.dp))
+                                GgTextField(
+                                    value = distTf,
+                                    onValueChange = {
+                                        activeField = 4
+                                        distTf = it
+                                        Session.updateSearch { s -> s.copy(nearbyDistance = it.text) }
+                                    },
+                                    onFocus = { activeField = 4 },
+                                    modifier = Modifier.weight(1f).height(34.dp),
+                                    textStyle = monoStyle(14, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = keyboardOn,
+                                    placeholder = "500"
+                                )
+                            }
                         }
                     }
 
                     Spacer(Modifier.height(8.dp))
-                    var mask by remember { mutableStateOf(TextFieldValue(ui.search.mask, TextRange(0, ui.search.mask.length))) }
-                    FieldRow("地址蒙版", mask, suppressSystemKeyboard = keyboardOn) {
-                        mask = it
+                    FieldRow(
+                        label = "地址蒙版",
+                        value = maskTf,
+                        suppressSystemKeyboard = keyboardOn,
+                        onFocus = { activeField = 5 }
+                    ) {
+                        activeField = 5
+                        maskTf = it
                         Session.updateSearch { s -> s.copy(mask = it.text) }
                     }
                 }
@@ -541,11 +664,8 @@ fun SearchSheet(ui: Ui) {
                 Column {
                     Spacer(Modifier.height(10.dp))
                     BuiltInKeyboard(
-                        value = tf,
-                        onValueChange = {
-                            tf = it
-                            Session.updateSearch { s -> s.copy(text = it.text) }
-                        },
+                        value = activeTf,
+                        onValueChange = ::updateActiveField,
                         onHistory = { Session.openSheet(Sheet.HISTORY) },
                         onDismiss = { Session.updateSearch { s -> s.copy(keyboardVisible = false) } }
                     )
@@ -1126,6 +1246,7 @@ private fun UnderlinedFilterInput(
                     onFocus()
                     onValueChange(it)
                 },
+                onFocus = onFocus,
                 modifier = Modifier.fillMaxWidth(),
                 textStyle = monoStyle(15, Rose.Text),
                 cursorColor = Rose.Primary,
@@ -1172,13 +1293,60 @@ fun FuzzySearchSheet(ui: Ui) {
     val fz = ui.fuzzy
     val hasResults = ui.rawResults.isNotEmpty() || fz.active
     var showTypeList by remember { mutableStateOf(true) }
+
+    // 界面问题 7：统一提升模糊搜索全部输入框状态，支持多输入栏焦点与内置软键盘无缝切换
     var deltaTf by remember(fz.deltaText) {
         mutableStateOf(TextFieldValue(fz.deltaText, TextRange(0, fz.deltaText.length)))
     }
+    var fromTf by remember {
+        mutableStateOf(TextFieldValue(fz.rangeFrom, TextRange(0, fz.rangeFrom.length)))
+    }
+    var toTf by remember {
+        mutableStateOf(TextFieldValue(fz.rangeTo, TextRange(0, fz.rangeTo.length)))
+    }
+    var addrTf by remember {
+        val cur = fz.nearbyAddress.ifEmpty {
+            java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
+        }
+        mutableStateOf(TextFieldValue(cur, TextRange(0, cur.length)))
+    }
+    var distTf by remember {
+        mutableStateOf(TextFieldValue(fz.nearbyDistance, TextRange(0, fz.nearbyDistance.length)))
+    }
+    // 0: deltaTf, 1: fromTf, 2: toTf, 3: addrTf, 4: distTf
+    var activeField by remember { mutableIntStateOf(if (hasResults) 0 else 1) }
+
+    val activeFuzzyTf = when (activeField) {
+        1 -> fromTf
+        2 -> toTf
+        3 -> addrTf
+        4 -> distTf
+        else -> deltaTf
+    }
 
     fun onActiveChange(next: TextFieldValue) {
-        deltaTf = next
-        Session.updateFuzzy { it.copy(deltaText = next.text) }
+        when (activeField) {
+            1 -> {
+                fromTf = next
+                Session.updateFuzzy { it.copy(rangeFrom = next.text) }
+            }
+            2 -> {
+                toTf = next
+                Session.updateFuzzy { it.copy(rangeTo = next.text) }
+            }
+            3 -> {
+                addrTf = next
+                Session.updateFuzzy { it.copy(nearbyAddress = next.text) }
+            }
+            4 -> {
+                distTf = next
+                Session.updateFuzzy { it.copy(nearbyDistance = next.text) }
+            }
+            else -> {
+                deltaTf = next
+                Session.updateFuzzy { it.copy(deltaText = next.text) }
+            }
+        }
     }
 
     val typeArrowRot by animateFloatAsState(
@@ -1200,13 +1368,35 @@ fun FuzzySearchSheet(ui: Ui) {
     ) {
         if (!hasResults) {
             // 无搜索结果时的初始模糊搜索界面
-            Text(
-                text = tr("模糊搜索"),
-                color = Rose.Text,
-                fontSize = fsp(18f),
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(bottom = 2.dp)
-            )
+            Row(
+                Modifier.fillMaxWidth().padding(bottom = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = tr("模糊搜索"),
+                    color = Rose.Text,
+                    fontSize = fsp(18f),
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                if (fz.extended && fz.rangeMode != 0) {
+                    Box(
+                        Modifier
+                            .size(32.dp)
+                            .clickableWithTooltip {
+                                Session.updateFuzzy { it.copy(keyboardVisible = !it.keyboardVisible) }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Rounded.Keyboard,
+                            contentDescription = "内置键盘",
+                            tint = if (fz.keyboardVisible) Rose.Primary else Rose.TextSecond,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
             Text(
                 text = tr("选择要采样的数值类型，点击下方「搜索」按钮进行初始内存采样："),
                 color = Rose.TextSecond,
@@ -1214,7 +1404,6 @@ fun FuzzySearchSheet(ui: Ui) {
                 modifier = Modifier.padding(bottom = 8.dp)
             )
 
-            // 界面调整 12：当前选中类型折叠头，带朝右/朝下旋转三角符号
             val selCol = if (fz.type == ValueType.AUTO) Rose.Text else typeColor(fz.type)
             Row(
                 Modifier
@@ -1249,7 +1438,6 @@ fun FuzzySearchSheet(ui: Ui) {
                 )
             }
 
-            // Bug 4 优化：模糊搜索类型展开同样采用横向排列按钮（参考图3）
             AnimatedVisibility(showTypeList, enter = expandEnter(), exit = expandExit()) {
                 Row(
                     Modifier
@@ -1262,14 +1450,16 @@ fun FuzzySearchSheet(ui: Ui) {
                         val isAuto = t == ValueType.AUTO
                         val shortName = if (isAuto) "A" else ValueType.shortName(t)
                         val col = if (isAuto) Rose.Text else typeColor(t)
+                        val bgCol by animateColorAsState(
+                            if (on) Rose.ChipSelected else Rose.CardHigh,
+                            Motion.ColorFast,
+                            label = "fzTypeBg"
+                        )
                         Box(
                             Modifier
                                 .weight(1f)
                                 .height(36.dp)
-                                .background(
-                                    if (on) Rose.ChipSelected else Rose.CardHigh,
-                                    RoundedCornerShape(8.dp)
-                                )
+                                .background(bgCol, RoundedCornerShape(8.dp))
                                 .border(
                                     width = if (on) 1.dp else 0.dp,
                                     color = if (on) col else Color.Transparent,
@@ -1294,7 +1484,6 @@ fun FuzzySearchSheet(ui: Ui) {
 
             AnimatedVisibility(fz.extended, enter = expandEnter(), exit = expandExit()) {
                 Column(Modifier.padding(top = 10.dp)) {
-                    // 范围模式选择胶囊 (全部内存 / 指定地址区间 / 附近) - 解决需求 9
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         listOf(
                             0 to "全部内存",
@@ -1302,22 +1491,48 @@ fun FuzzySearchSheet(ui: Ui) {
                             2 to "附近:"
                         ).forEach { (m, label) ->
                             val isSel = fz.rangeMode == m
+                            var pillPressed by remember { mutableStateOf(false) }
+                            val pillScale by animateFloatAsState(
+                                if (pillPressed) 0.94f else 1f,
+                                Motion.Fast,
+                                label = "fzPillScale"
+                            )
+                            val pillBg by animateColorAsState(
+                                if (isSel) Rose.ChipSelected else if (pillPressed) Rose.Chip else Rose.CardHigh,
+                                Motion.ColorFast,
+                                label = "fzPillBg"
+                            )
+                            val pillTxt by animateColorAsState(
+                                if (isSel) Rose.Primary else Rose.TextSecond,
+                                Motion.ColorFast,
+                                label = "fzPillTxt"
+                            )
                             Box(
                                 Modifier
                                     .weight(1f)
                                     .height(36.dp)
-                                    .background(
-                                        if (isSel) Rose.ChipSelected else Rose.CardHigh,
-                                        RoundedCornerShape(8.dp)
+                                    .scale(pillScale)
+                                    .background(pillBg, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = if (isSel) 1.dp else 0.dp,
+                                        color = if (isSel) Rose.Primary.copy(alpha = 0.45f) else Color.Transparent,
+                                        shape = RoundedCornerShape(8.dp)
                                     )
-                                    .clickableWithTooltip {
-                                        Session.updateFuzzy { it.copy(rangeMode = m) }
-                                    },
+                                    .clickableWithTooltip(
+                                        onPressChange = { pillPressed = it },
+                                        onClick = {
+                                            Session.updateFuzzy { it.copy(rangeMode = m) }
+                                            when (m) {
+                                                1 -> activeField = 1
+                                                2 -> activeField = 3
+                                            }
+                                        }
+                                    ),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     tr(label),
-                                    color = if (isSel) Rose.Primary else Rose.TextSecond,
+                                    color = pillTxt,
                                     fontSize = fsp(12.5f),
                                     fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal
                                 )
@@ -1325,159 +1540,175 @@ fun FuzzySearchSheet(ui: Ui) {
                         }
                     }
 
-                    // 模式 1：指定地址区间 (从 ... 到 ...)
-                    if (fz.rangeMode == 1) {
-                        Spacer(Modifier.height(8.dp))
-                        var fromTf by remember {
-                            mutableStateOf(TextFieldValue(fz.rangeFrom, TextRange(0, fz.rangeFrom.length)))
-                        }
-                        var toTf by remember {
-                            mutableStateOf(TextFieldValue(fz.rangeTo, TextRange(0, fz.rangeTo.length)))
-                        }
+                    // 模式 1：指定地址区间
+                    AnimatedVisibility(fz.rangeMode == 1, enter = expandEnter(), exit = expandExit()) {
+                        Column {
+                            Spacer(Modifier.height(8.dp))
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (activeField == 1) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple(remember { MutableInteractionSource() }) { activeField = 1 }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(tr("从:"), color = Rose.TextSecond, fontSize = fsp(13f), modifier = Modifier.width(36.dp))
+                                GgTextField(
+                                    value = fromTf,
+                                    onValueChange = {
+                                        activeField = 1
+                                        fromTf = it
+                                        Session.updateFuzzy { f -> f.copy(rangeFrom = it.text) }
+                                    },
+                                    onFocus = { activeField = 1 },
+                                    modifier = Modifier.weight(1f).height(34.dp),
+                                    textStyle = monoStyle(14, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = fz.keyboardVisible
+                                )
+                            }
 
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp)
-                                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(tr("从:"), color = Rose.TextSecond, fontSize = fsp(13f), modifier = Modifier.width(36.dp))
-                            GgTextField(
-                                value = fromTf,
-                                onValueChange = {
-                                    fromTf = it
-                                    Session.updateFuzzy { f -> f.copy(rangeFrom = it.text) }
-                                },
-                                modifier = Modifier.weight(1f).height(34.dp),
-                                textStyle = monoStyle(14, Rose.Text),
-                                cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = fz.keyboardVisible
-                            )
-                        }
+                            Spacer(Modifier.height(6.dp))
 
-                        Spacer(Modifier.height(6.dp))
-
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp)
-                                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(tr("到:"), color = Rose.TextSecond, fontSize = fsp(13f), modifier = Modifier.width(36.dp))
-                            GgTextField(
-                                value = toTf,
-                                onValueChange = {
-                                    toTf = it
-                                    Session.updateFuzzy { f -> f.copy(rangeTo = it.text) }
-                                },
-                                modifier = Modifier.weight(1f).height(34.dp),
-                                textStyle = monoStyle(14, Rose.Text),
-                                cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = fz.keyboardVisible
-                            )
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (activeField == 2) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple(remember { MutableInteractionSource() }) { activeField = 2 }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(tr("到:"), color = Rose.TextSecond, fontSize = fsp(13f), modifier = Modifier.width(36.dp))
+                                GgTextField(
+                                    value = toTf,
+                                    onValueChange = {
+                                        activeField = 2
+                                        toTf = it
+                                        Session.updateFuzzy { f -> f.copy(rangeTo = it.text) }
+                                    },
+                                    onFocus = { activeField = 2 },
+                                    modifier = Modifier.weight(1f).height(34.dp),
+                                    textStyle = monoStyle(14, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = fz.keyboardVisible
+                                )
+                            }
                         }
                     }
 
-                    // 模式 2：附近 (地址 + 之前/后复选框 + 距离) - 参考图 2
-                    if (fz.rangeMode == 2) {
-                        Spacer(Modifier.height(8.dp))
-                        var addrTf by remember {
-                            val cur = fz.nearbyAddress.ifEmpty {
-                                java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
-                            }
-                            mutableStateOf(TextFieldValue(cur, TextRange(0, cur.length)))
-                        }
-                        var distTf by remember {
-                            mutableStateOf(TextFieldValue(fz.nearbyDistance, TextRange(0, fz.nearbyDistance.length)))
-                        }
-
-                        // 地址: 7168F44CC0
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp)
-                                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(tr("地址:"), color = Rose.TextSecond, fontSize = fsp(13.5f))
-                            Spacer(Modifier.width(8.dp))
-                            GgTextField(
-                                value = addrTf,
-                                onValueChange = {
-                                    addrTf = it
-                                    Session.updateFuzzy { f -> f.copy(nearbyAddress = it.text) }
-                                },
-                                modifier = Modifier.weight(1f).height(34.dp),
-                                textStyle = monoStyle(14, Rose.Text),
-                                cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = fz.keyboardVisible
-                            )
-                        }
-
-                        Spacer(Modifier.height(6.dp))
-
-                        // [x] 之前   [x] 后
-                        Row(
-                            Modifier.fillMaxWidth().padding(horizontal = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                    // 模式 2：附近
+                    AnimatedVisibility(fz.rangeMode == 2, enter = expandEnter(), exit = expandExit()) {
+                        Column {
+                            Spacer(Modifier.height(8.dp))
                             Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.clickableWithTooltip {
-                                    Session.updateFuzzy { f -> f.copy(nearbyBefore = !f.nearbyBefore) }
-                                }
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (activeField == 3) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple(remember { MutableInteractionSource() }) { activeField = 3 }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                GgCheckBox(checked = fz.nearbyBefore, onCheckedChange = {
-                                    Session.updateFuzzy { f -> f.copy(nearbyBefore = it) }
-                                }, size = 18.dp)
-                                Spacer(Modifier.width(6.dp))
-                                Text(tr("之前"), color = Rose.Text, fontSize = fsp(13f))
+                                Text(tr("地址:"), color = Rose.TextSecond, fontSize = fsp(13.5f))
+                                Spacer(Modifier.width(8.dp))
+                                GgTextField(
+                                    value = addrTf,
+                                    onValueChange = {
+                                        activeField = 3
+                                        addrTf = it
+                                        Session.updateFuzzy { f -> f.copy(nearbyAddress = it.text) }
+                                    },
+                                    onFocus = { activeField = 3 },
+                                    modifier = Modifier.weight(1f).height(34.dp),
+                                    textStyle = monoStyle(14, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = fz.keyboardVisible
+                                )
                             }
-                            Spacer(Modifier.width(20.dp))
+
+                            Spacer(Modifier.height(6.dp))
+
                             Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.clickableWithTooltip {
-                                    Session.updateFuzzy { f -> f.copy(nearbyAfter = !f.nearbyAfter) }
-                                }
+                                Modifier.fillMaxWidth().padding(horizontal = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                GgCheckBox(checked = fz.nearbyAfter, onCheckedChange = {
-                                    Session.updateFuzzy { f -> f.copy(nearbyAfter = it) }
-                                }, size = 18.dp)
-                                Spacer(Modifier.width(6.dp))
-                                Text(tr("后"), color = Rose.Text, fontSize = fsp(13f))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.clickableWithTooltip {
+                                        Session.updateFuzzy { f -> f.copy(nearbyBefore = !f.nearbyBefore) }
+                                    }
+                                ) {
+                                    GgCheckBox(checked = fz.nearbyBefore, onCheckedChange = {
+                                        Session.updateFuzzy { f -> f.copy(nearbyBefore = it) }
+                                    }, size = 18.dp)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(tr("之前"), color = Rose.Text, fontSize = fsp(13f))
+                                }
+                                Spacer(Modifier.width(20.dp))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.clickableWithTooltip {
+                                        Session.updateFuzzy { f -> f.copy(nearbyAfter = !f.nearbyAfter) }
+                                    }
+                                ) {
+                                    GgCheckBox(checked = fz.nearbyAfter, onCheckedChange = {
+                                        Session.updateFuzzy { f -> f.copy(nearbyAfter = it) }
+                                    }, size = 18.dp)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(tr("后"), color = Rose.Text, fontSize = fsp(13f))
+                                }
                             }
-                        }
 
-                        Spacer(Modifier.height(6.dp))
+                            Spacer(Modifier.height(6.dp))
 
-                        // 距离: 500
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp)
-                                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(tr("距离:"), color = Rose.TextSecond, fontSize = fsp(13.5f))
-                            Spacer(Modifier.width(8.dp))
-                            GgTextField(
-                                value = distTf,
-                                onValueChange = {
-                                    distTf = it
-                                    Session.updateFuzzy { f -> f.copy(nearbyDistance = it.text) }
-                                },
-                                modifier = Modifier.weight(1f).height(34.dp),
-                                textStyle = monoStyle(14, Rose.Text),
-                                cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = fz.keyboardVisible,
-                                placeholder = "500"
-                            )
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (activeField == 4) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple(remember { MutableInteractionSource() }) { activeField = 4 }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(tr("距离:"), color = Rose.TextSecond, fontSize = fsp(13.5f))
+                                Spacer(Modifier.width(8.dp))
+                                GgTextField(
+                                    value = distTf,
+                                    onValueChange = {
+                                        activeField = 4
+                                        distTf = it
+                                        Session.updateFuzzy { f -> f.copy(nearbyDistance = it.text) }
+                                    },
+                                    onFocus = { activeField = 4 },
+                                    modifier = Modifier.weight(1f).height(34.dp),
+                                    textStyle = monoStyle(14, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = fz.keyboardVisible,
+                                    placeholder = "500"
+                                )
+                            }
                         }
                     }
                 }
@@ -1506,6 +1737,17 @@ fun FuzzySearchSheet(ui: Ui) {
                     modifier = Modifier.weight(1.2f).height(42.dp)
                 ) {
                     Session.runFuzzySearch(ValueType.SIGN_EQUAL, forceNew = true)
+                }
+            }
+
+            AnimatedVisibility(fz.extended && fz.rangeMode != 0 && fz.keyboardVisible, enter = expandEnter(), exit = expandExit()) {
+                Column(Modifier.padding(top = 8.dp)) {
+                    BuiltInKeyboard(
+                        value = activeFuzzyTf,
+                        onValueChange = ::onActiveChange,
+                        onHistory = { Session.openSheet(Sheet.HISTORY) },
+                        onDismiss = { Session.updateFuzzy { it.copy(keyboardVisible = false) } }
+                    )
                 }
             }
         } else {
@@ -1555,7 +1797,11 @@ fun FuzzySearchSheet(ui: Ui) {
                             Column {
                                 GgTextField(
                                     value = deltaTf,
-                                    onValueChange = { onActiveChange(it) },
+                                    onValueChange = {
+                                        activeField = 0
+                                        onActiveChange(it)
+                                    },
+                                    onFocus = { activeField = 0 },
                                     modifier = Modifier.fillMaxWidth().height(30.dp),
                                     textStyle = monoStyle(14, Rose.Text),
                                     cursorColor = Rose.Primary,
@@ -1574,14 +1820,16 @@ fun FuzzySearchSheet(ui: Ui) {
                     Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                         ValueType.order.forEach { t ->
                             val on = fz.type == t
+                            val bgCol by animateColorAsState(
+                                if (on) Rose.ChipSelected else Rose.CardHigh,
+                                Motion.ColorFast,
+                                label = "fzResTypeBg"
+                            )
                             Box(
                                 Modifier
                                     .weight(1f)
                                     .height(32.dp)
-                                    .background(
-                                        if (on) Rose.ChipSelected else Rose.CardHigh,
-                                        RoundedCornerShape(6.dp)
-                                    )
+                                    .background(bgCol, RoundedCornerShape(6.dp))
                                     .clickableWithTooltip {
                                         Session.updateFuzzy { it.copy(type = t) }
                                     },
@@ -1665,6 +1913,7 @@ fun FuzzySearchSheet(ui: Ui) {
                     height = 42,
                     modifier = Modifier.weight(1f)
                 ) {
+                    activeField = 0
                     Session.updateFuzzy { it.copy(extended = !it.extended) }
                 }
             }
@@ -1672,7 +1921,7 @@ fun FuzzySearchSheet(ui: Ui) {
             AnimatedVisibility(fz.keyboardVisible, enter = expandEnter(), exit = expandExit()) {
                 Column(Modifier.padding(top = 8.dp)) {
                     BuiltInKeyboard(
-                        value = deltaTf,
+                        value = activeFuzzyTf,
                         onValueChange = ::onActiveChange,
                         onHistory = { Session.openSheet(Sheet.HISTORY) },
                         onDismiss = { Session.updateFuzzy { it.copy(keyboardVisible = false) } }
@@ -1691,13 +1940,17 @@ private fun FuzzyOptionButton(
     onClick: () -> Unit
 ) {
     var pressed by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(if (pressed) 0.96f else 1f, Motion.Fast, label = "fzBtnScale")
+    val bg by animateColorAsState(
+        if (pressed) Rose.PrimaryDeep else Rose.CardHigh,
+        Motion.ColorFast,
+        label = "fzBtnBg"
+    )
     Box(
         modifier
             .height(height.dp)
-            .background(
-                if (pressed) Rose.PrimaryDeep else Rose.CardHigh,
-                RoundedCornerShape(8.dp)
-            )
+            .scale(scale)
+            .background(bg, RoundedCornerShape(8.dp))
             .border(1.dp, Rose.Divider, RoundedCornerShape(8.dp))
             .clickableWithTooltip(onPressChange = { pressed = it }, onClick = onClick),
         contentAlignment = Alignment.Center
@@ -1746,6 +1999,11 @@ fun MaskSearchSheet(ui: Ui) {
                     .fillMaxWidth()
                     .height(48.dp)
                     .background(Rose.CardHigh, RoundedCornerShape(10.dp))
+                    .border(
+                        width = 1.dp,
+                        color = if (!focusMask) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                        shape = RoundedCornerShape(10.dp)
+                    )
                     .clickableNoRipple(remember { MutableInteractionSource() }) { focusMask = false }
                     .padding(horizontal = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1786,6 +2044,11 @@ fun MaskSearchSheet(ui: Ui) {
                     .fillMaxWidth()
                     .height(48.dp)
                     .background(Rose.CardHigh, RoundedCornerShape(10.dp))
+                    .border(
+                        width = 1.dp,
+                        color = if (focusMask) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                        shape = RoundedCornerShape(10.dp)
+                    )
                     .clickableNoRipple(remember { MutableInteractionSource() }) { focusMask = true }
                     .padding(horizontal = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1799,6 +2062,7 @@ fun MaskSearchSheet(ui: Ui) {
                         maskTf = it
                         Session.updateSearch { s -> s.copy(mask = it.text) }
                     },
+                    onFocus = { focusMask = true },
                     modifier = Modifier.weight(1f).height(36.dp),
                     textStyle = monoStyle(15, Rose.Text),
                     cursorColor = Rose.Primary,

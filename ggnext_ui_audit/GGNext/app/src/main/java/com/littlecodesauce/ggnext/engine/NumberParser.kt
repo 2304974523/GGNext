@@ -24,10 +24,14 @@ object NumberParser {
         val numbers: List<Long> = emptyList(),
         /** 每个数字的类型 flags */
         val types: List<Int> = emptyList(),
-        /** 范围上界（仅 RANGE） */
+        /** 范围上界（RANGE 或 GROUP 各字段上界） */
         val to: List<Long> = emptyList(),
+        /** 联合搜索每个字段的操作符：0=EXACT, 1=RANGE_INC(~), 2=RANGE_INV(~~), 3=WILDCARD(0~~0 / *) */
+        val groupOps: List<Int> = emptyList(),
         val sign: Int = ValueType.SIGN_EQUAL,
         val xorKey: Long = 0L,
+        /** GG 异或偏移搜索（如 25X4, 25X8, 25X-4，表示 [addr] ^ [addr + xorOffset] == target） */
+        val xorOffset: Int = 0,
         val area: Int = 512,
         val ordered: Boolean = false,
         val notRange: Boolean = false,
@@ -48,7 +52,7 @@ object NumberParser {
         return t.length > 1 && (t[0] == '\'' || t[0] == '"' || t[0] == ':' || t[0] == ';')
     }
 
-    /** 解析一条完整输入（自动识别联合/范围/文本/异或） */
+    /** 解析一条完整输入（自动识别联合/范围/文本/异或/反向十六进制） */
     fun parse(raw: String, defaultType: Int, sign: Int = ValueType.SIGN_EQUAL): Query {
         var input = raw.trim()
         if (input.isEmpty()) throw ParseException("请输入要搜索的值")
@@ -77,17 +81,25 @@ object NumberParser {
 
         var effSign = sign
         when {
-            input.startsWith("!=") -> {
+            input.startsWith("!=") || input.startsWith("≠") -> {
                 effSign = ValueType.SIGN_NOT_EQUAL
-                input = input.substring(2).trim()
+                input = input.removePrefix("!=").removePrefix("≠").trim()
             }
-            input.startsWith(">=") -> {
+            input.startsWith(">=") || input.startsWith("≥") -> {
                 effSign = ValueType.SIGN_GREATER_EQ
-                input = input.substring(2).trim()
+                input = input.removePrefix(">=").removePrefix("≥").trim()
             }
-            input.startsWith("<=") -> {
+            input.startsWith("<=") || input.startsWith("≤") -> {
                 effSign = ValueType.SIGN_LESS_EQ
-                input = input.substring(2).trim()
+                input = input.removePrefix("<=").removePrefix("≤").trim()
+            }
+            input.startsWith(">") -> {
+                effSign = ValueType.SIGN_GREATER_EQ
+                input = input.substring(1).trim()
+            }
+            input.startsWith("<") -> {
+                effSign = ValueType.SIGN_LESS_EQ
+                input = input.substring(1).trim()
             }
             input.startsWith("=") -> {
                 effSign = ValueType.SIGN_EQUAL
@@ -96,20 +108,35 @@ object NumberParser {
         }
 
         if (input.contains(';')) return parseGroup(input, defaultType, effSign)
-        if (input.contains('~')) return parseRange(input, defaultType, effSign)
 
+        // 先提取外层 X 异或表达式（支持 25X4, 25X-4, 1000X5A5Ah, 以及 40~50X4）
         var body = input
         var xorKey = 0L
+        var xorOffset = 0
         val upper = body.uppercase()
         if (!upper.startsWith("0X") && !upper.endsWith("X")) {
-            val xIdx = upper.indexOf('X')
-            if (xIdx > 0) {
+            val xIdx = upper.lastIndexOf('X')
+            if (xIdx > 0 && body[xIdx - 1] != '0') {
                 val keyText = body.substring(xIdx + 1).trim()
                 if (keyText.isNotEmpty()) {
-                    xorKey = parseNumber(keyText, ValueType.DWORD).first
+                    val isExplicitHex = keyText.startsWith("0x", true) ||
+                        keyText.startsWith("h", true) ||
+                        keyText.endsWith("h", true) ||
+                        keyText.endsWith("r", true)
+                    val decOffset = if (!isExplicitHex) keyText.toIntOrNull() else null
+                    if (decOffset != null && decOffset != 0 && kotlin.math.abs(decOffset) <= 4096 && (kotlin.math.abs(decOffset) % 4 == 0)) {
+                        xorOffset = decOffset
+                    } else {
+                        xorKey = parseNumber(keyText, ValueType.DWORD).first
+                    }
                     body = body.substring(0, xIdx).trim()
                 }
             }
+        }
+
+        if (body.contains('~')) {
+            val rq = parseRange(body, defaultType, effSign)
+            return rq.copy(raw = input, xorKey = xorKey, xorOffset = xorOffset)
         }
 
         val parsed = parseNumber(body, defaultType)
@@ -119,7 +146,8 @@ object NumberParser {
             numbers = listOf(parsed.first),
             types = listOf(parsed.second),
             sign = effSign,
-            xorKey = xorKey
+            xorKey = xorKey,
+            xorOffset = xorOffset
         )
     }
 
@@ -128,25 +156,49 @@ object NumberParser {
         var s = text.trim().replace("_", "").replace(",", "")
         if (s.isEmpty()) throw ParseException("数值为空")
 
-        // 1. 优先识别显式十六进制前缀/后缀，防止 0x10F / 123Ah 末尾的 A/B/D/E/F 被误判为类型后缀
+        // 先识别末尾是否有显式类型后缀（如 12345678rD 或 1234hW）
+        var explicitSuffixType: Int? = null
+        if (s.length > 2) {
+            val lastChar = s.last().lowercaseChar()
+            val prevChar = s[s.length - 2].lowercaseChar()
+            if (TYPE_SUFFIX.containsKey(lastChar) && (prevChar == 'h' || prevChar == 'r')) {
+                explicitSuffixType = TYPE_SUFFIX.getValue(lastChar)
+                s = s.dropLast(1)
+            }
+        }
+
+        val resolvedHexType = explicitSuffixType ?: if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType
+
+        // 1. 识别反向十六进制 (Big-Endian / Reverse HEX: 12345678r 或 r12345678)
+        if (s.length > 1 && (s.last() == 'r' || s.last() == 'R')) {
+            val hex = s.dropLast(1).removePrefix("0x").removePrefix("0X")
+            if (hex.isNotEmpty() && hex.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) {
+                val padded = if (hex.length % 2 != 0) "0$hex" else hex
+                val reversedHex = padded.chunked(2).reversed().joinToString("")
+                val v = reversedHex.toULongOrNull(16)?.toLong() ?: throw ParseException("无效的反向十六进制: $s")
+                return v to (resolvedHexType and 0x7F)
+            }
+        }
+
+        // 2. 优先识别显式十六进制前缀/后缀，防止 0x10F / 123Ah 末尾的 A/B/D/E/F 被误判为类型后缀
         if (s.startsWith("0x", true)) {
             val hex = s.substring(2)
             val v = hex.toULongOrNull(16)?.toLong() ?: hex.toLongOrNull(16) ?: throw ParseException("无效的十六进制: $s")
-            return v to (if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType)
+            return v to (resolvedHexType and 0x7F)
         }
         if (s.length > 1 && (s[0] == 'h' || s[0] == 'H') && s.substring(1).all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }) {
             val hex = s.substring(1)
             val v = hex.toULongOrNull(16)?.toLong() ?: hex.toLongOrNull(16) ?: throw ParseException("无效的十六进制: $hex")
-            return v to (if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType)
+            return v to (resolvedHexType and 0x7F)
         }
         if (s.length > 1 && (s.last() == 'h' || s.last() == 'H')) {
             val hex = s.dropLast(1)
             val v = hex.toULongOrNull(16)?.toLong() ?: hex.toLongOrNull(16) ?: throw ParseException("无效的十六进制: $hex")
-            return v to (if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType)
+            return v to (resolvedHexType and 0x7F)
         }
 
-        // 2. 识别类型后缀 (B/W/D/X/F/Q/E/A)，仅当去掉后缀后是纯十进制整数或浮点数时才剥离后缀
-        var type = defaultType
+        // 3. 识别类型后缀 (B/W/D/X/F/Q/E/A)，仅当去掉后缀后是纯十进制整数或浮点数时才剥离后缀
+        var type = explicitSuffixType ?: defaultType
         val last = s.last().lowercaseChar()
         if (s.length > 1 && TYPE_SUFFIX.containsKey(last) && last !in "0123456789") {
             val suffixType = TYPE_SUFFIX.getValue(last)
@@ -240,26 +292,59 @@ object NumberParser {
         }
         val items = listPart.split(';').map { it.trim() }.filter { it.isNotEmpty() }
         if (items.size < 2) throw ParseException("联合搜索至少需要两个数值")
-        if (items.size > 32) throw ParseException("联合搜索最多 32 个数值")
+        if (items.size > 64) throw ParseException("联合搜索最多 64 个数值")
 
         val values = ArrayList<Long>(items.size)
+        val maxValues = ArrayList<Long>(items.size)
         val types = ArrayList<Int>(items.size)
+        val ops = ArrayList<Int>(items.size)
+
         items.forEach { item ->
-            if (item.contains('~')) {
-                val r = parseRange(item, defaultType, ValueType.SIGN_EQUAL)
-                values.add(r.numbers.first())
-                types.add(r.types.first())
-            } else {
-                val p = parseNumber(item, defaultType)
-                values.add(p.first)
-                types.add(p.second)
+            val clean = item.trim()
+            when {
+                clean == "*" || clean == "?" || clean.startsWith("0~~0", true) -> {
+                    // 通配任意值 (如 0~~0, 0~~0D, *, ?)
+                    val suffixChar = clean.last().lowercaseChar()
+                    val wcType = TYPE_SUFFIX[suffixChar]
+                        ?: (if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType)
+                    values.add(0L)
+                    maxValues.add(0L)
+                    types.add(wcType and 0x7F)
+                    ops.add(3) // 3 = WILDCARD
+                }
+                clean.contains('~') -> {
+                    val r = parseRange(clean, defaultType, ValueType.SIGN_EQUAL)
+                    val vMin = r.numbers.first()
+                    val vMax = r.to.firstOrNull() ?: vMin
+                    val t = r.types.first()
+                    if (r.notRange && vMin == 0L && vMax == 0L) {
+                        values.add(0L)
+                        maxValues.add(0L)
+                        types.add(t)
+                        ops.add(3) // 0~~0 -> WILDCARD
+                    } else {
+                        values.add(vMin)
+                        maxValues.add(vMax)
+                        types.add(t)
+                        ops.add(if (r.notRange) 2 else 1) // 2 = RANGE_INV (~~), 1 = RANGE_INC (~)
+                    }
+                }
+                else -> {
+                    val p = parseNumber(clean, defaultType)
+                    values.add(p.first)
+                    maxValues.add(p.first)
+                    types.add(p.second)
+                    ops.add(0) // 0 = EXACT
+                }
             }
         }
         return Query(
             kind = Kind.GROUP,
             raw = input,
             numbers = values,
+            to = maxValues,
             types = types,
+            groupOps = ops,
             sign = sign,
             area = area,
             ordered = ordered

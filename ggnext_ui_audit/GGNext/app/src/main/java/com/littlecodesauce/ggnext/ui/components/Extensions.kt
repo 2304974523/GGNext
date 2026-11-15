@@ -11,12 +11,21 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import kotlinx.coroutines.launch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -41,6 +50,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.InterceptPlatformTextInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -577,7 +587,10 @@ fun GgTextField(
     val currentVal by androidx.compose.runtime.rememberUpdatedState(value)
     val currentOnValueChange by androidx.compose.runtime.rememberUpdatedState(onValueChange)
 
-    Box(modifier = modifier) {
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.CenterStart
+    ) {
         InterceptPlatformTextInput(
             interceptor = { request, nextHandler ->
                 if (suppressSystemKeyboard) {
@@ -651,28 +664,32 @@ fun GgTextField(
                                 overflow = TextOverflow.Ellipsis
                             )
                         }
-                        innerTextField()
+                        Box(contentAlignment = Alignment.CenterStart) {
+                            innerTextField()
+                        }
                     }
                 }
             )
         }
 
+        // 界面问题 6：长按文本工具改为横向紧凑排列，单按钮体积适中不臃肿
         androidx.compose.material3.DropdownMenu(
             expanded = showContextMenu,
             onDismissRequest = { showContextMenu = false },
             modifier = Modifier.background(Rose.CardHigh)
         ) {
-            androidx.compose.material3.DropdownMenuItem(
-                text = { Text(tr("全选"), color = Rose.Text, fontSize = fsp(13f)) },
-                onClick = {
+            Row(
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                ContextToolbarBtn(tr("全选"), Rose.Text) {
                     showContextMenu = false
                     val t = currentVal.text
                     currentOnValueChange(currentVal.copy(selection = androidx.compose.ui.text.TextRange(0, t.length)))
                 }
-            )
-            androidx.compose.material3.DropdownMenuItem(
-                text = { Text(tr("复制"), color = Rose.Text, fontSize = fsp(13f)) },
-                onClick = {
+                ContextToolbarDivider()
+                ContextToolbarBtn(tr("复制"), Rose.Text) {
                     showContextMenu = false
                     val sel = currentVal.selection
                     val textToCopy = if (!sel.collapsed) {
@@ -685,10 +702,8 @@ fun GgTextField(
                         com.littlecodesauce.ggnext.core.Session.toast("已复制: $textToCopy")
                     }
                 }
-            )
-            androidx.compose.material3.DropdownMenuItem(
-                text = { Text(tr("粘贴"), color = Rose.Text, fontSize = fsp(13f)) },
-                onClick = {
+                ContextToolbarDivider()
+                ContextToolbarBtn(tr("粘贴"), Rose.Text) {
                     showContextMenu = false
                     val clipText = clipboard.getText()?.text.orEmpty()
                     if (clipText.isNotEmpty()) {
@@ -705,10 +720,8 @@ fun GgTextField(
                         )
                     }
                 }
-            )
-            androidx.compose.material3.DropdownMenuItem(
-                text = { Text(tr("剪切"), color = Rose.Text, fontSize = fsp(13f)) },
-                onClick = {
+                ContextToolbarDivider()
+                ContextToolbarBtn(tr("剪切"), Rose.Text) {
                     showContextMenu = false
                     val sel = currentVal.selection
                     if (!sel.collapsed) {
@@ -723,13 +736,149 @@ fun GgTextField(
                         currentOnValueChange(TextFieldValue(text = "", selection = androidx.compose.ui.text.TextRange(0)))
                     }
                 }
-            )
-            androidx.compose.material3.DropdownMenuItem(
-                text = { Text(tr("清空"), color = Rose.Red, fontSize = fsp(13f)) },
-                onClick = {
+                ContextToolbarDivider()
+                ContextToolbarBtn(tr("清空"), Rose.Red) {
                     showContextMenu = false
                     currentOnValueChange(TextFieldValue(text = "", selection = androidx.compose.ui.text.TextRange(0)))
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContextToolbarBtn(
+    label: String,
+    color: Color,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            color = color,
+            fontSize = fsp(12f),
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun ContextToolbarDivider() {
+    Box(
+        modifier = Modifier
+            .size(width = 1.dp, height = 14.dp)
+            .background(Rose.Divider)
+    )
+}
+
+/**
+ * 其他改进 1：列表右侧快速滑动条 (VerticalFastScrollbar)
+ * - 颜色跟随当前主题色 (Rose.Primary)
+ * - 视觉滑块纤细精致 (常态 3.5.dp，按住拖拽时平滑加宽至 5.5.dp)，右侧触控响应宽度 18.dp（兼顾易按住与不遮挡列表按钮）
+ */
+@Composable
+fun VerticalFastScrollbar(
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    modifier: Modifier = Modifier
+) {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val layoutInfo = listState.layoutInfo
+    val totalItems = layoutInfo.totalItemsCount
+    val visibleItems = layoutInfo.visibleItemsInfo.size
+    if (totalItems <= 0 || visibleItems <= 0 || totalItems <= visibleItems) return
+
+    var isDragging by remember { mutableStateOf(false) }
+    var dragFraction by remember { androidx.compose.runtime.mutableFloatStateOf(0f) }
+
+    val scrollFraction = if (isDragging) {
+        dragFraction
+    } else {
+        val firstIndex = listState.firstVisibleItemIndex.toFloat()
+        val maxIndex = (totalItems - visibleItems).coerceAtLeast(1).toFloat()
+        (firstIndex / maxIndex).coerceIn(0f, 1f)
+    }
+
+    val thumbAlpha by animateFloatAsState(
+        targetValue = when {
+            isDragging -> 0.95f
+            listState.isScrollInProgress -> 0.80f
+            else -> 0.42f
+        },
+        animationSpec = tween(180),
+        label = "sbAlpha"
+    )
+    val thumbWidthDp by animateFloatAsState(
+        targetValue = if (isDragging) 5.5f else 3.5f,
+        animationSpec = tween(150),
+        label = "sbWidth"
+    )
+    val primaryColor = Rose.Primary
+    val trackColor = Rose.Divider.copy(alpha = if (isDragging) 0.32f else 0.12f)
+
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxHeight()
+            .width(18.dp)
+            .pointerInput(totalItems, visibleItems) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val down = awaitPointerEvent()
+                        val change = down.changes.firstOrNull() ?: continue
+                        if (change.pressed) {
+                            isDragging = true
+                            val h = size.height.toFloat().coerceAtLeast(1f)
+                            val frac = (change.position.y / h).coerceIn(0f, 1f)
+                            dragFraction = frac
+                            val targetIdx = (frac * (totalItems - visibleItems).coerceAtLeast(1)).toInt().coerceIn(0, totalItems - 1)
+                            scope.launch { listState.scrollToItem(targetIdx) }
+                            change.consume()
+
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val dragChange = event.changes.firstOrNull() ?: break
+                                if (!dragChange.pressed) {
+                                    isDragging = false
+                                    break
+                                }
+                                val nextFrac = (dragChange.position.y / h).coerceIn(0f, 1f)
+                                dragFraction = nextFrac
+                                val nextIdx = (nextFrac * (totalItems - visibleItems).coerceAtLeast(1)).toInt().coerceIn(0, totalItems - 1)
+                                scope.launch { listState.scrollToItem(nextIdx) }
+                                dragChange.consume()
+                            }
+                            isDragging = false
+                        }
+                    }
+                }
+            }
+    ) {
+        val density = LocalDensity.current
+        val trackHeightPx = with(density) { maxHeight.toPx() }
+        val thumbRatio = (visibleItems.toFloat() / totalItems.toFloat()).coerceIn(0.08f, 0.55f)
+        val thumbHeightPx = (trackHeightPx * thumbRatio).coerceAtLeast(with(density) { 28.dp.toPx() })
+        val availableRangePx = (trackHeightPx - thumbHeightPx).coerceAtLeast(0f)
+        val thumbTopPx = availableRangePx * scrollFraction
+
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val wPx = thumbWidthDp.dp.toPx()
+            val xLeft = this.size.width - wPx - 2.dp.toPx()
+            drawRoundRect(
+                color = trackColor,
+                topLeft = Offset(xLeft, 4.dp.toPx()),
+                size = Size(wPx, (this.size.height - 8.dp.toPx()).coerceAtLeast(1f)),
+                cornerRadius = CornerRadius(wPx / 2f, wPx / 2f)
+            )
+            drawRoundRect(
+                color = primaryColor.copy(alpha = thumbAlpha),
+                topLeft = Offset(xLeft, thumbTopPx),
+                size = Size(wPx, thumbHeightPx),
+                cornerRadius = CornerRadius(wPx / 2f, wPx / 2f)
             )
         }
     }

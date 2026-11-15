@@ -20,8 +20,11 @@ namespace mem_engine {
 struct GroupFieldItem {
     DataType type      = DataType::INT32;
     int64_t  iVal      = 0;
+    int64_t  iMax      = 0;
     double   fVal      = 0.0;
+    double   fMax      = 0.0;
     double   epsilon   = 1e-4;
+    uint8_t  op        = 0; // 0=EXACT, 1=RANGE_INC (~), 2=RANGE_INV (~~), 3=WILDCARD (0~~0)
     size_t   origIndex = 0; // Original index in user query (for ordered constraint)
 
     // Computes heuristic selectivity score: higher score = rarer pattern = better anchor
@@ -82,7 +85,8 @@ public:
     MmapCandidateStore& candidates() noexcept { return m_candidates; }
     size_t candidateCount() const noexcept { return m_candidates.size(); }
     size_t totalMatchedCount() const noexcept {
-        return m_totalMatchedCount > m_candidates.size() ? m_totalMatchedCount : m_candidates.size();
+        const size_t matched = m_totalMatchedCount.load(std::memory_order_relaxed);
+        return matched > m_candidates.size() ? matched : m_candidates.size();
     }
     bool hasFuzzySnapshot() const noexcept { return m_hasFullSnapshot; }
     void fetchCandidates(size_t offset, size_t limit, std::vector<CandidateEntry>& out) const;
@@ -172,7 +176,7 @@ public:
     );
 
     // ------------------------------------------------------------------------
-    // 4. Encoded & 6. XOR Search (Offset, Static XOR, XOR Pair 32/64, Addr XOR)
+    // 4. Encoded & 6. XOR Search (Offset, Static XOR, XOR Pair 32/64, Addr XOR, GG_AUTO, XOR_OFFSET)
     // ------------------------------------------------------------------------
     EngineErrc searchEncoded(
         DataType type,
@@ -191,7 +195,8 @@ public:
         int64_t logicalInt,
         double logicalFloat,
         uint64_t keyOrMask = 0,
-        CancellationToken* token = nullptr
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
     );
 
     // ------------------------------------------------------------------------
@@ -233,8 +238,12 @@ private:
     MmapCandidateStore       m_candidates;
     MmapRegionSnapshotStore  m_snapshotStore;
     bool                     m_hasFullSnapshot   = false;
+    bool                     m_encryptedSnapshot = false;
+    int64_t                  m_encPrevLogicalInt = 0;
+    double                   m_encPrevLogicalFlt = 0.0;
+    uint64_t                 m_encPrevTargetBits = 0;
     DataType                 m_snapshotType      = DataType::INT32;
-    size_t                   m_totalMatchedCount = 0;
+    std::atomic<size_t>      m_totalMatchedCount{0};
     ScanTelemetry            m_lastTelemetry{};
 };
 

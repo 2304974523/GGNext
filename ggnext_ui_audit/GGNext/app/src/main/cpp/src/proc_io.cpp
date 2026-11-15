@@ -42,6 +42,7 @@ EngineErrc ProcIO::mapErrnoToErrc(int err) noexcept {
 ProcIO::ProcIO()
     : m_pid(-1),
       m_memFd(-1),
+      m_pagemapFd(-1),
       m_pageSize(querySystemPageSize()),
       m_iovMax(querySystemIovMax()) {}
 
@@ -56,11 +57,14 @@ ProcIO::~ProcIO() {
 ProcIO::ProcIO(ProcIO&& other) noexcept
     : m_pid(other.m_pid),
       m_memFd(other.m_memFd),
+      m_pagemapFd(other.m_pagemapFd),
       m_pageSize(other.m_pageSize),
       m_iovMax(other.m_iovMax),
-      m_pvmSupported(other.m_pvmSupported.load(std::memory_order_relaxed)) {
+      m_pvmSupported(other.m_pvmSupported.load(std::memory_order_relaxed)),
+      m_pagemapUsable(other.m_pagemapUsable.load(std::memory_order_relaxed)) {
     other.m_pid = -1;
     other.m_memFd = -1;
+    other.m_pagemapFd = -1;
 }
 
 ProcIO& ProcIO::operator=(ProcIO&& other) noexcept {
@@ -68,11 +72,14 @@ ProcIO& ProcIO::operator=(ProcIO&& other) noexcept {
         detach();
         m_pid = other.m_pid;
         m_memFd = other.m_memFd;
+        m_pagemapFd = other.m_pagemapFd;
         m_pageSize = other.m_pageSize;
         m_iovMax = other.m_iovMax;
         m_pvmSupported.store(other.m_pvmSupported.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        m_pagemapUsable.store(other.m_pagemapUsable.load(std::memory_order_relaxed), std::memory_order_relaxed);
         other.m_pid = -1;
         other.m_memFd = -1;
+        other.m_pagemapFd = -1;
     }
     return *this;
 }
@@ -108,14 +115,38 @@ EngineErrc ProcIO::attach(int pid) {
         }
     }
 
+    // Open /proc/[pid]/pagemap to skip unallocated/non-resident demand-zero pages without faulting them in
+    char pagemapPath[64];
+    std::snprintf(pagemapPath, sizeof(pagemapPath), "/proc/%d/pagemap", pid);
+    m_pagemapFd = ::open(pagemapPath, O_RDONLY | O_CLOEXEC);
+    if (m_pagemapFd >= 0) {
+        // Probe /proc/self/pagemap on a live stack variable to confirm kernel populates PM_PRESENT (bit 63)
+        volatile uint64_t stackProbe = 0x5A5AA5A512345678ULL;
+        (void)stackProbe;
+        int selfPm = (pid == ::getpid()) ? m_pagemapFd : ::open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+        if (selfPm >= 0) {
+            uintptr_t probePage = reinterpret_cast<uintptr_t>(&stackProbe) / m_pageSize;
+            uint64_t pte = 0;
+            ssize_t n = ::pread64(selfPm, &pte, sizeof(uint64_t), static_cast<off64_t>(probePage * sizeof(uint64_t)));
+            if (selfPm != m_pagemapFd) ::close(selfPm);
+            constexpr uint64_t kPresentOrSwapped = (1ULL << 63) | (1ULL << 62);
+            m_pagemapUsable.store(n == sizeof(uint64_t) && (pte & kPresentOrSwapped) != 0, std::memory_order_relaxed);
+        }
+    }
+
     return EngineErrc::OK;
 }
 
 void ProcIO::detach() noexcept {
+    if (m_pagemapFd >= 0) {
+        ::close(m_pagemapFd);
+        m_pagemapFd = -1;
+    }
     if (m_memFd >= 0) {
         ::close(m_memFd);
         m_memFd = -1;
     }
+    m_pagemapUsable.store(false, std::memory_order_relaxed);
     m_pid = -1;
 }
 
@@ -214,7 +245,77 @@ EngineErrc ProcIO::readChunkFaultTolerant(
 
     outValidPageMask.assign(numPages, 1);
 
-    // Fast path: attempt single contiguous read first
+    // 1. Pagemap resident-page pre-filtering (prevents reading or faulting in unallocated demand-zero pages!)
+    if (m_pagemapFd >= 0 && m_pagemapUsable.load(std::memory_order_relaxed)) {
+        uintptr_t canonicalStart = firstPage & 0x00FFFFFFFFFFFFFFULL;
+        off64_t pmOffset = static_cast<off64_t>((canonicalStart / ps) * sizeof(uint64_t));
+        std::vector<uint64_t> ptes(numPages, 0);
+        ssize_t pmRead = ::pread64(m_pagemapFd, ptes.data(), numPages * sizeof(uint64_t), pmOffset);
+        if (pmRead == static_cast<ssize_t>(numPages * sizeof(uint64_t))) {
+            constexpr uint64_t kPresentOrSwapped = (1ULL << 63) | (1ULL << 62);
+            size_t residentPages = 0;
+            for (size_t p = 0; p < numPages; ++p) {
+                if ((ptes[p] & kPresentOrSwapped) != 0) {
+                    outValidPageMask[p] = 1;
+                    residentPages++;
+                } else {
+                    outValidPageMask[p] = 0;
+                }
+            }
+            if (residentPages == 0) {
+                if (outReadableBytes) *outReadableBytes = 0;
+                return EngineErrc::OK;
+            }
+            if (residentPages < numPages) {
+                // Only read contiguous runs of resident pages so unallocated pages are never faulted in
+                size_t totalValidBytes = 0;
+                size_t p = 0;
+                while (p < numPages) {
+                    if (outValidPageMask[p] == 0) {
+                        uintptr_t pageStart = std::max(startAddr, firstPage + p * ps);
+                        uintptr_t pageEnd   = std::min(endAddr, firstPage + (p + 1) * ps);
+                        if (pageEnd > pageStart) {
+                            std::memset(buf + (pageStart - startAddr), 0, pageEnd - pageStart);
+                        }
+                        p++;
+                        continue;
+                    }
+                    size_t runStart = p;
+                    while (p < numPages && outValidPageMask[p] != 0) p++;
+                    uintptr_t runAddr = std::max(startAddr, firstPage + runStart * ps);
+                    uintptr_t runEnd  = std::min(endAddr, firstPage + p * ps);
+                    if (runEnd <= runAddr) continue;
+                    size_t runSize = runEnd - runAddr;
+                    size_t runBufOff = runAddr - startAddr;
+                    size_t runRead = 0;
+                    EngineErrc rrc = readMemory(runAddr, buf + runBufOff, runSize, &runRead);
+                    if (rrc == EngineErrc::OK) {
+                        totalValidBytes += runSize;
+                    } else if (rrc == EngineErrc::ERR_PERM || rrc == EngineErrc::ERR_SRCH) {
+                        return rrc;
+                    } else {
+                        // Isolate faulting page(s) inside this resident run
+                        for (size_t sp = runStart; sp < p; ++sp) {
+                            uintptr_t spAddr = std::max(startAddr, firstPage + sp * ps);
+                            uintptr_t spEnd  = std::min(endAddr, firstPage + (sp + 1) * ps);
+                            size_t spLen = spEnd - spAddr;
+                            size_t spOff = spAddr - startAddr;
+                            if (readMemory(spAddr, buf + spOff, spLen) == EngineErrc::OK) {
+                                totalValidBytes += spLen;
+                            } else {
+                                outValidPageMask[sp] = 0;
+                                std::memset(buf + spOff, 0, spLen);
+                            }
+                        }
+                    }
+                }
+                if (outReadableBytes) *outReadableBytes = totalValidBytes;
+                return totalValidBytes > 0 ? EngineErrc::OK : EngineErrc::ERR_FAULT;
+            }
+        }
+    }
+
+    // 2. Fast path: all pages in chunk are resident (or pagemap unavailable), attempt single contiguous read
     size_t fastRead = 0;
     EngineErrc rc = readMemory(startAddr, buf, size, &fastRead);
     if (rc == EngineErrc::OK) {
@@ -226,15 +327,11 @@ EngineErrc ProcIO::readChunkFaultTolerant(
         return rc;
     }
 
-    // A guard page (PROT_NONE / EFAULT) exists inside [startAddr, startAddr + size).
-    // Note: process_vm_readv stops at the first faulting iovec/page and returns the number of
-    // bytes transferred before the fault! We leverage this exact kernel behavior to skip only
-    // the faulting page(s) in O(guard_pages) syscalls instead of O(total_pages)!
+    // 3. Guard page (PROT_NONE / EFAULT) fallback isolation
     size_t totalValidBytes = 0;
     size_t curOffset = 0;
 
     while (curOffset < size) {
-        // If fastRead > 0 on the first iteration, those bytes are already valid in buf!
         if (fastRead > 0) {
             totalValidBytes += fastRead;
             curOffset += fastRead;
@@ -242,7 +339,6 @@ EngineErrc ProcIO::readChunkFaultTolerant(
             if (curOffset >= size) break;
         }
 
-        // Align the faulting address to the next page boundary and mark current page invalid
         uintptr_t faultAddr = startAddr + curOffset;
         size_t pageIdx = (faultAddr - firstPage) / ps;
         if (pageIdx < numPages) {
@@ -259,7 +355,6 @@ EngineErrc ProcIO::readChunkFaultTolerant(
 
         if (curOffset >= size) break;
 
-        // Try reading the remainder of the chunk from nextPageAddr
         size_t remSize = size - curOffset;
         size_t subRead = 0;
         EngineErrc subRc = readMemory(startAddr + curOffset, buf + curOffset, remSize, &subRead);

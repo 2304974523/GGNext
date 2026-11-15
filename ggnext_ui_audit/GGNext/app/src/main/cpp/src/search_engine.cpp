@@ -13,6 +13,10 @@ namespace mem_engine {
 // GroupFieldItem Selectivity Scoring
 // ============================================================================
 uint32_t GroupFieldItem::computeSelectivityScore() const noexcept {
+    if (op == 3) return 0u;  // Wildcard (0~~0) must not be chosen as anchor unless all fields are wildcards
+    if (op == 2) return 2u;  // Inverse range (~~) has very low selectivity
+    if (op == 1) return 20u; // Range (~) has moderate-low selectivity
+
     // Base score by byte width (8B > 4B > 2B > 1B)
     uint32_t score = static_cast<uint32_t>(dataTypeSize(type)) * 100u;
 
@@ -71,6 +75,10 @@ void SearchEngine::clearSession() noexcept {
     m_candidates.clear();
     m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
+    m_encPrevLogicalInt = 0;
+    m_encPrevLogicalFlt = 0.0;
+    m_encPrevTargetBits = 0;
     m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 }
@@ -974,6 +982,7 @@ EngineErrc SearchEngine::startUnknownSnapshot(
     m_candidates.clear();
     m_snapshotStore.clear();
     m_hasFullSnapshot   = false;
+    m_encryptedSnapshot = false;
     m_snapshotType      = (type == DataType::AUTO) ? DataType::INT32 : type;
     m_totalMatchedCount = 0;
     m_lastTelemetry     = ScanTelemetry{};
@@ -1018,17 +1027,33 @@ EngineErrc SearchEngine::startUnknownSnapshot(
                 size_t chunkReadable = 0;
                 EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.logicalLen, validMask, &chunkReadable);
                 syscalls.fetch_add(1, std::memory_order_relaxed);
-                size_t totalReadSoFar = readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed) + chunkReadable;
-                m_totalMatchedCount = totalReadSoFar / elemSz;
-
-                size_t chunkGuards = 0;
-                for (uint8_t v : validMask) {
-                    if (v == 0) chunkGuards++;
-                }
-                guardPages.fetch_add(chunkGuards, std::memory_order_relaxed);
 
                 if (rc == EngineErrc::OK && chunkReadable > 0) {
                     size_t numPages = validMask.size();
+                    // Filter out untouched demand-zero pages (4KB pages of 100% zeros that were faulted to ZERO_PAGE)
+                    for (size_t p = 0; p < numPages; ++p) {
+                        if (validMask[p] == 0) continue;
+                        size_t pOff = p * pageSize;
+                        if (pOff >= task.logicalLen) {
+                            validMask[p] = 0;
+                            continue;
+                        }
+                        size_t pLen = std::min(pageSize, task.logicalLen - pOff);
+                        if (pLen >= pageSize) {
+                            const uint64_t* w64 = reinterpret_cast<const uint64_t*>(buf.data() + pOff);
+                            size_t words = pLen / sizeof(uint64_t);
+                            uint64_t acc = 0;
+                            for (size_t w = 0; w < words; ++w) {
+                                acc |= w64[w];
+                                if (acc != 0) break;
+                            }
+                            if (acc == 0) {
+                                validMask[p] = 0;
+                                if (chunkReadable >= pLen) chunkReadable -= pLen;
+                            }
+                        }
+                    }
+
                     size_t p = 0;
                     while (p < numPages) {
                         if (validMask[p] == 0) {
@@ -1050,6 +1075,15 @@ EngineErrc SearchEngine::startUnknownSnapshot(
                         }
                     }
                 }
+
+                size_t totalReadSoFar = readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed) + chunkReadable;
+                m_totalMatchedCount = totalReadSoFar / elemSz;
+
+                size_t chunkGuards = 0;
+                for (uint8_t v : validMask) {
+                    if (v == 0) chunkGuards++;
+                }
+                guardPages.fetch_add(chunkGuards, std::memory_order_relaxed);
 
                 size_t done = processedBytes.fetch_add(task.logicalLen, std::memory_order_relaxed) + task.logicalLen;
                 if (progress) progress(done, totalPlannedBytes);
@@ -1379,8 +1413,58 @@ EngineErrc SearchEngine::refineFuzzy(
 }
 
 // ============================================================================
-// 4. Encoded & 6. XOR Search (Offset, Static XOR, XOR Pair 32/64, Address XOR)
+// 4. Encoded & 6. XOR Search (Offset, Static XOR, XOR Pair 32/64, Address XOR, GG_AUTO, XOR_OFFSET)
 // ============================================================================
+namespace {
+
+uint64_t encodeTargetBits(DataType type, int64_t logicalInt, double logicalFloat) noexcept {
+    switch (type) {
+        case DataType::INT8:
+            return static_cast<uint8_t>(logicalInt);
+        case DataType::INT16:
+            return static_cast<uint16_t>(logicalInt);
+        case DataType::INT32:
+            return static_cast<uint32_t>(logicalInt);
+        case DataType::INT64:
+            return static_cast<uint64_t>(logicalInt);
+        case DataType::FLOAT: {
+            float fv = static_cast<float>(logicalFloat);
+            uint32_t bits = 0;
+            std::memcpy(&bits, &fv, 4);
+            return bits;
+        }
+        case DataType::DOUBLE: {
+            uint64_t bits = 0;
+            std::memcpy(&bits, &logicalFloat, 8);
+            return bits;
+        }
+        default:
+            return static_cast<uint32_t>(logicalInt);
+    }
+}
+
+int64_t signExtendRaw(uint64_t raw, DataType dt) noexcept {
+    switch (dt) {
+        case DataType::INT8:   return static_cast<int8_t>(raw & 0xFFu);
+        case DataType::INT16:  return static_cast<int16_t>(raw & 0xFFFFu);
+        case DataType::INT32:  return static_cast<int32_t>(raw & 0xFFFFFFFFu);
+        default:               return static_cast<int64_t>(raw);
+    }
+}
+
+bool evalGroupField(const uint8_t* ptr, const GroupFieldItem& fld) noexcept {
+    if (fld.op == 3) return true; // Wildcard (0~~0)
+    if (fld.op == 1) {
+        return evalSingleRange(ptr, fld.type, fld.iVal, fld.iMax, fld.fVal, fld.fMax, true);
+    }
+    if (fld.op == 2) {
+        return !evalSingleRange(ptr, fld.type, fld.iVal, fld.iMax, fld.fVal, fld.fMax, true);
+    }
+    return evalSingleExact(ptr, fld.type, fld.iVal, fld.fVal, fld.epsilon);
+}
+
+} // anonymous namespace
+
 EngineErrc SearchEngine::searchEncoded(
     DataType type,
     EncodedMode mode,
@@ -1391,25 +1475,29 @@ EngineErrc SearchEngine::searchEncoded(
     CancellationToken* token,
     ProgressCallback progress
 ) {
+    DataType effectiveType = (type == DataType::AUTO) ? DataType::INT32 : type;
+
+    // Stateful GG Encrypted Search (Initial Snapshot for V1)
+    if (mode == EncodedMode::GG_AUTO) {
+        EngineErrc rc = startUnknownSnapshot(effectiveType, token, progress);
+        if (rc == EngineErrc::OK) {
+            m_encryptedSnapshot = true;
+            m_encPrevLogicalInt = logicalInt;
+            m_encPrevLogicalFlt = logicalFloat;
+            m_encPrevTargetBits = encodeTargetBits(effectiveType, logicalInt, logicalFloat);
+        }
+        return rc;
+    }
+
     if (mode == EncodedMode::OFFSET_ADDED) {
         int64_t offsetKey = static_cast<int64_t>(keyOrMask);
-        return searchExact(type, logicalInt + offsetKey, logicalFloat + static_cast<double>(offsetKey), 1e-4, aligned, token, progress);
+        return searchExact(effectiveType, logicalInt + offsetKey, logicalFloat + static_cast<double>(offsetKey), 1e-4, aligned, token, progress);
     }
     if (mode == EncodedMode::XOR_STATIC) {
-        uint64_t rawLogical = 0;
-        if (type == DataType::FLOAT) {
-            float fv = static_cast<float>(logicalFloat);
-            uint32_t bits = 0;
-            std::memcpy(&bits, &fv, 4);
-            rawLogical = bits;
-        } else if (type == DataType::DOUBLE) {
-            std::memcpy(&rawLogical, &logicalFloat, 8);
-        } else {
-            rawLogical = static_cast<uint64_t>(logicalInt);
-        }
+        uint64_t rawLogical = encodeTargetBits(effectiveType, logicalInt, logicalFloat);
         int64_t encodedTarget = static_cast<int64_t>(rawLogical ^ keyOrMask);
-        DataType intEquiv = (type == DataType::FLOAT) ? DataType::INT32
-                          : (type == DataType::DOUBLE) ? DataType::INT64 : type;
+        DataType intEquiv = (effectiveType == DataType::FLOAT) ? DataType::INT32
+                          : (effectiveType == DataType::DOUBLE) ? DataType::INT64 : effectiveType;
         return searchExact(intEquiv, encodedTarget, 0.0, 0.0, aligned, token, progress);
     }
 
@@ -1417,15 +1505,22 @@ EngineErrc SearchEngine::searchEncoded(
     m_candidates.clear();
     m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
     m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
     if (m_regions.empty()) refreshRegions();
 
+    size_t elemSz = std::max<size_t>(1, dataTypeSize(effectiveType));
+    int64_t xorByteOffset = static_cast<int64_t>(keyOrMask);
+    size_t absOffset = (mode == EncodedMode::XOR_OFFSET)
+        ? static_cast<size_t>(std::min<int64_t>(std::llabs(xorByteOffset), 4096))
+        : 0;
     size_t spanBytes = (mode == EncodedMode::XOR_PAIR_64) ? 16
-                     : (mode == EncodedMode::XOR_PAIR_32) ? 8 : 4;
-    size_t step = aligned ? 4 : 1;
-    size_t overlap = spanBytes - 1;
+                     : (mode == EncodedMode::XOR_PAIR_32) ? 8
+                     : (mode == EncodedMode::XOR_OFFSET)  ? (elemSz + absOffset) : 4;
+    size_t step = aligned ? elemSz : 1;
+    size_t overlap = spanBytes > 1 ? (spanBytes - 1) : 0;
 
     auto tasks = buildChunkTasks(overlap);
     if (tasks.empty()) return EngineErrc::OK;
@@ -1433,19 +1528,8 @@ EngineErrc SearchEngine::searchEncoded(
     size_t totalPlannedBytes = 0;
     for (const auto& t : tasks) totalPlannedBytes += t.logicalLen;
 
-    uint64_t targetBits64 = 0;
-    uint32_t targetBits32 = 0;
-    if (type == DataType::FLOAT) {
-        float fv = static_cast<float>(logicalFloat);
-        std::memcpy(&targetBits32, &fv, 4);
-        targetBits64 = targetBits32;
-    } else if (type == DataType::DOUBLE) {
-        std::memcpy(&targetBits64, &logicalFloat, 8);
-        targetBits32 = static_cast<uint32_t>(targetBits64);
-    } else {
-        targetBits64 = static_cast<uint64_t>(logicalInt);
-        targetBits32 = static_cast<uint32_t>(logicalInt);
-    }
+    uint64_t targetBits64 = encodeTargetBits(effectiveType, logicalInt, logicalFloat);
+    uint32_t targetBits32 = static_cast<uint32_t>(targetBits64);
 
     std::atomic<size_t> nextIdx{0};
     std::atomic<size_t> processedBytes{0};
@@ -1482,12 +1566,26 @@ EngineErrc SearchEngine::searchEncoded(
                 if (rc == EngineErrc::OK && chunkReadable > 0) {
                     offsets.clear();
                     if (mode == EncodedMode::XOR_PAIR_32) {
-                        SimdKernel::scanXorPair32(buf.data(), task.readLen, targetBits32, step, offsets);
+                        SimdKernel::scanXorPair32(buf.data(), task.readLen, targetBits32, aligned ? 4 : 1, offsets);
                     } else if (mode == EncodedMode::XOR_PAIR_64) {
                         SimdKernel::scanXorPair64(buf.data(), task.readLen, targetBits64, aligned ? 8 : 1, offsets);
                     } else if (mode == EncodedMode::XOR_ADDRESS) {
                         uint32_t mask32 = (keyOrMask == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>(keyOrMask);
-                        SimdKernel::scanAddressXor32(task.startAddr, buf.data(), task.readLen, targetBits32, mask32, step, offsets);
+                        SimdKernel::scanAddressXor32(task.startAddr, buf.data(), task.readLen, targetBits32, mask32, aligned ? 4 : 1, offsets);
+                    } else if (mode == EncodedMode::XOR_OFFSET) {
+                        size_t startOff = (xorByteOffset < 0) ? absOffset : 0;
+                        if (step > 1 && (startOff % step) != 0) {
+                            startOff += step - (startOff % step);
+                        }
+                        for (size_t off = startOff; off + elemSz <= task.logicalLen; off += step) {
+                            int64_t keyPos = static_cast<int64_t>(off) + xorByteOffset;
+                            if (keyPos < 0 || static_cast<size_t>(keyPos) + elemSz > task.readLen) continue;
+                            uint64_t v = extractRawValue(buf.data() + off, effectiveType);
+                            uint64_t k = extractRawValue(buf.data() + static_cast<size_t>(keyPos), effectiveType);
+                            if (v != 0 && k != 0 && (v ^ k) == targetBits64) {
+                                offsets.push_back(off);
+                            }
+                        }
                     }
 
                     uint8_t rTag = regionFlagToIndex(task.regionFlag);
@@ -1496,14 +1594,16 @@ EngineErrc SearchEngine::searchEncoded(
 
                     for (size_t off : offsets) {
                         if (off >= task.logicalLen) continue;
-                        if (!isRangeInValidPages(off, spanBytes, task.startAddr, pageSize, validMask)) continue;
+                        size_t checkStart = (mode == EncodedMode::XOR_OFFSET && xorByteOffset < 0)
+                            ? (off - absOffset) : off;
+                        if (!isRangeInValidPages(checkStart, spanBytes, task.startAddr, pageSize, validMask)) continue;
 
                         chunkMatches++;
                         if (!storeAlreadyFull) {
                             CandidateEntry entry{};
                             entry.address   = task.startAddr + off;
-                            entry.rawValue  = targetBits64;
-                            entry.type      = static_cast<uint8_t>(type);
+                            entry.rawValue  = extractRawValue(buf.data() + off, effectiveType);
+                            entry.type      = static_cast<uint8_t>(effectiveType);
                             entry.regionTag = rTag;
                             entry.flags     = static_cast<uint32_t>(mode);
                             localHits.push_back(entry);
@@ -1557,49 +1657,281 @@ EngineErrc SearchEngine::refineEncoded(
     int64_t logicalInt,
     double logicalFloat,
     uint64_t keyOrMask,
-    CancellationToken* token
+    CancellationToken* token,
+    ProgressCallback progress
 ) {
+    DataType effectiveType = (type == DataType::AUTO) ? m_snapshotType : type;
+
     if (mode == EncodedMode::OFFSET_ADDED) {
         int64_t offsetKey = static_cast<int64_t>(keyOrMask);
-        return refineExact(type, logicalInt + offsetKey, logicalFloat + static_cast<double>(offsetKey), 1e-4, token);
+        return refineExact(effectiveType, logicalInt + offsetKey, logicalFloat + static_cast<double>(offsetKey), 1e-4, token, progress);
     }
     if (mode == EncodedMode::XOR_STATIC) {
-        uint64_t rawLogical = 0;
-        if (type == DataType::FLOAT) {
-            float fv = static_cast<float>(logicalFloat);
-            uint32_t bits = 0;
-            std::memcpy(&bits, &fv, 4);
-            rawLogical = bits;
-        } else if (type == DataType::DOUBLE) {
-            std::memcpy(&rawLogical, &logicalFloat, 8);
-        } else {
-            rawLogical = static_cast<uint64_t>(logicalInt);
+        uint64_t rawLogical = encodeTargetBits(effectiveType, logicalInt, logicalFloat);
+        DataType intEquiv = (effectiveType == DataType::FLOAT) ? DataType::INT32
+                          : (effectiveType == DataType::DOUBLE) ? DataType::INT64 : effectiveType;
+        return refineExact(intEquiv, static_cast<int64_t>(rawLogical ^ keyOrMask), 0.0, 0.0, token, progress);
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    uint64_t targetBits64 = encodeTargetBits(effectiveType, logicalInt, logicalFloat);
+    uint32_t targetBits32 = static_cast<uint32_t>(targetBits64);
+
+    // ========================================================================
+    // Stateful GG Encrypted Search Refinement (EncodedMode::GG_AUTO)
+    // ========================================================================
+    if (mode == EncodedMode::GG_AUTO) {
+        const uint64_t uPrev = m_encPrevTargetBits;
+        const uint64_t uCur  = targetBits64;
+        const int64_t  iPrev = m_encPrevLogicalInt;
+        const int64_t  iCur  = logicalInt;
+        const DataType dt    = m_hasFullSnapshot ? m_snapshotType : effectiveType;
+        const size_t elemSz  = std::max<size_t>(1, dataTypeSize(dt));
+        const bool isFloatType = (dt == DataType::FLOAT || dt == DataType::DOUBLE);
+
+        // Pass 1: Refine directly against full resident snapshot (V1 -> V2)
+        if (m_hasFullSnapshot && m_candidates.empty()) {
+            const auto& blocks = m_snapshotStore.blocks();
+            if (blocks.empty()) {
+                m_totalMatchedCount = 0;
+                return EngineErrc::OK;
+            }
+
+            const size_t totalSnapBytes = std::max<size_t>(1, m_snapshotStore.totalSnapshotBytes());
+            std::atomic<size_t> nextBlock{0};
+            std::atomic<size_t> syscalls{0};
+            std::atomic<size_t> bytesScanned{0};
+            std::atomic<size_t> totalMatches{0};
+            std::atomic<size_t> storedCount{0};
+            std::mutex storeMutex;
+
+            size_t numThreads = std::min(m_workerThreads, blocks.size());
+            std::vector<std::thread> workers;
+
+            for (size_t tid = 0; tid < numThreads; ++tid) {
+                workers.emplace_back([&]() {
+                    std::vector<uint8_t> curBuf;
+                    std::vector<uint8_t> validMask;
+                    std::vector<CandidateEntry> blockHits;
+                    blockHits.reserve(4096);
+
+                    while (true) {
+                        if (token && token->isCancelled()) break;
+                        size_t bIdx = nextBlock.fetch_add(1, std::memory_order_relaxed);
+                        if (bIdx >= blocks.size()) break;
+
+                        const auto& blk = blocks[bIdx];
+                        uint8_t* oldPtr = m_snapshotStore.getBlockDataMut(blk);
+                        if (!oldPtr) continue;
+
+                        if (curBuf.size() < blk.length) curBuf.resize(blk.length);
+                        size_t chunkReadable = 0;
+                        EngineErrc rc = m_io.readChunkFaultTolerant(blk.startAddress, curBuf.data(), blk.length, validMask, &chunkReadable);
+                        syscalls.fetch_add(1, std::memory_order_relaxed);
+                        size_t doneBytes = bytesScanned.fetch_add(blk.length, std::memory_order_relaxed) + blk.length;
+
+                        if (rc != EngineErrc::OK || chunkReadable == 0) {
+                            if (progress) progress(doneBytes, totalSnapBytes);
+                            continue;
+                        }
+
+                        blockHits.clear();
+                        uint8_t rTag = regionFlagToIndex(blk.regionFlag);
+
+                        for (size_t off = 0; off + elemSz <= blk.length; off += elemSz) {
+                            uint64_t e1 = extractRawValue(oldPtr + off, dt);
+                            uint64_t e2 = extractRawValue(curBuf.data() + off, dt);
+                            if (e1 == 0 && e2 == 0) continue;
+
+                            uint32_t matchFlags = 0;
+
+                            // 1. Constant XOR Key Invariant: (E1 ^ U1) == (E2 ^ U2)
+                            if (uCur != uPrev) {
+                                if (e1 != e2 && ((e1 ^ uPrev) == (e2 ^ uCur))) {
+                                    matchFlags |= 1u;
+                                }
+                            } else {
+                                if (e1 == e2 && e1 != 0) {
+                                    matchFlags |= 1u;
+                                }
+                            }
+
+                            // 2. Dynamic Neighbor XOR Key Invariant (e.g. ObscuredInt / struct [key, val] at ±4, ±8)
+                            if (elemSz == 4 || elemSz == 8) {
+                                const int deltas[4] = {-8, -4, 4, 8};
+                                for (int d : deltas) {
+                                    if (elemSz == 8 && (d == -4 || d == 4)) continue;
+                                    int64_t nPos = static_cast<int64_t>(off) + d;
+                                    if (nPos < 0 || static_cast<size_t>(nPos) + elemSz > blk.length) continue;
+                                    uint64_t n1 = extractRawValue(oldPtr + static_cast<size_t>(nPos), dt);
+                                    uint64_t n2 = extractRawValue(curBuf.data() + static_cast<size_t>(nPos), dt);
+                                    if (n1 != 0 && n2 != 0 && ((e1 ^ n1) == uPrev) && ((e2 ^ n2) == uCur)) {
+                                        if (uCur == uPrev || e1 != e2 || n1 != n2) {
+                                            matchFlags |= 2u;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Constant Additive Offset Invariant: (E2 - E1) == (V2 - V1) or (E1 - E2) == (V2 - V1)
+                            if (!isFloatType && iCur != iPrev && e1 != 0 && e2 != 0) {
+                                int64_t s1 = signExtendRaw(e1, dt);
+                                int64_t s2 = signExtendRaw(e2, dt);
+                                int64_t vDiff = iCur - iPrev;
+                                if ((s2 - s1) == vDiff) {
+                                    matchFlags |= 4u;
+                                } else if ((s1 - s2) == vDiff) {
+                                    matchFlags |= 8u;
+                                }
+                            }
+
+                            if (matchFlags != 0) {
+                                CandidateEntry entry{};
+                                entry.address   = blk.startAddress + off;
+                                entry.rawValue  = e2;
+                                entry.type      = static_cast<uint8_t>(dt);
+                                entry.regionTag = rTag;
+                                entry.flags     = matchFlags;
+                                blockHits.push_back(entry);
+                            }
+                        }
+
+                        // Update snapshot block in-place
+                        std::memcpy(oldPtr, curBuf.data(), blk.length);
+
+                        if (!blockHits.empty()) {
+                            size_t newTotal = totalMatches.fetch_add(blockHits.size(), std::memory_order_relaxed) + blockHits.size();
+                            m_totalMatchedCount = newTotal;
+
+                            if (storedCount.load(std::memory_order_relaxed) < MmapCandidateStore::MAX_STORED_CANDIDATES) {
+                                std::lock_guard<std::mutex> lk(storeMutex);
+                                m_candidates.appendBatch(blockHits.data(), blockHits.size());
+                                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                            }
+                        }
+
+                        if (progress) progress(doneBytes, totalSnapBytes);
+                    }
+                });
+            }
+
+            for (auto& w : workers) w.join();
+            if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
+
+            m_encPrevLogicalInt = logicalInt;
+            m_encPrevLogicalFlt = logicalFloat;
+            m_encPrevTargetBits = targetBits64;
+
+            size_t matched = totalMatches.load();
+            if (uCur == uPrev && matched > MmapCandidateStore::MAX_STORED_CANDIDATES) {
+                m_candidates.clear();
+                m_hasFullSnapshot = true;
+                m_totalMatchedCount = matched;
+            } else {
+                m_snapshotStore.clear();
+                m_hasFullSnapshot = false;
+                m_candidates.sortByAddress();
+                m_totalMatchedCount = std::max(matched, m_candidates.size());
+            }
+
+            auto t1 = std::chrono::steady_clock::now();
+            m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            m_lastTelemetry.totalBytesScanned = bytesScanned.load();
+            m_lastTelemetry.readableBytes     = bytesScanned.load();
+            m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
+            m_lastTelemetry.syscallsIssued    = syscalls.load();
+            return EngineErrc::OK;
         }
-        DataType intEquiv = (type == DataType::FLOAT) ? DataType::INT32
-                          : (type == DataType::DOUBLE) ? DataType::INT64 : type;
-        return refineExact(intEquiv, static_cast<int64_t>(rawLogical ^ keyOrMask), 0.0, 0.0, token);
+
+        // Pass 2+: Refine existing m_candidates (V2 -> V3 -> ...)
+        if (m_candidates.empty()) {
+            m_totalMatchedCount = 0;
+            return EngineErrc::OK;
+        }
+
+        MmapCandidateStore nextStore(MmapCandidateStore::DEFAULT_MEMORY_THRESHOLD, m_spillDir);
+        size_t syscalls = 0;
+        uint8_t winBuf[24];
+
+        for (size_t i = 0; i < m_candidates.size(); ++i) {
+            if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
+            CandidateEntry cand = m_candidates[i];
+            DataType cDt = static_cast<DataType>(cand.type);
+            size_t cSz = std::max<size_t>(1, dataTypeSize(cDt));
+
+            uint64_t e1 = cand.rawValue;
+            uint64_t e2 = 0;
+            bool hasWin = false;
+            if (cand.address >= 8 && m_io.readMemory(cand.address - 8, winBuf, 24) == EngineErrc::OK) {
+                hasWin = true;
+                e2 = extractRawValue(winBuf + 8, cDt);
+            } else if (m_io.readMemory(cand.address, winBuf + 8, cSz) == EngineErrc::OK) {
+                e2 = extractRawValue(winBuf + 8, cDt);
+            } else {
+                continue;
+            }
+            syscalls++;
+
+            uint32_t prevFlags = (cand.flags == 0) ? 0x0Fu : cand.flags;
+            uint32_t nextFlags = 0;
+
+            if (prevFlags & 1u) {
+                if (uCur != uPrev) {
+                    if (e1 != e2 && ((e1 ^ uPrev) == (e2 ^ uCur))) nextFlags |= 1u;
+                } else {
+                    if (e1 == e2) nextFlags |= 1u;
+                }
+            }
+            if ((prevFlags & 2u) && hasWin && (cSz == 4 || cSz == 8)) {
+                const int offsetsInWin[4] = {0, 4, 12, 16}; // -8, -4, +4, +8 relative to winBuf+8
+                for (int wOff : offsetsInWin) {
+                    if (cSz == 8 && (wOff == 4 || wOff == 12)) continue;
+                    uint64_t n2 = extractRawValue(winBuf + wOff, cDt);
+                    if (n2 != 0 && ((e2 ^ n2) == uCur)) {
+                        nextFlags |= 2u;
+                        break;
+                    }
+                }
+            }
+            if ((prevFlags & 4u) && !isFloatType) {
+                int64_t s1 = signExtendRaw(e1, cDt);
+                int64_t s2 = signExtendRaw(e2, cDt);
+                if ((s2 - s1) == (iCur - iPrev)) nextFlags |= 4u;
+            }
+            if ((prevFlags & 8u) && !isFloatType) {
+                int64_t s1 = signExtendRaw(e1, cDt);
+                int64_t s2 = signExtendRaw(e2, cDt);
+                if ((s1 - s2) == (iCur - iPrev)) nextFlags |= 8u;
+            }
+
+            if (nextFlags != 0) {
+                cand.rawValue = e2;
+                cand.flags    = nextFlags;
+                nextStore.append(cand);
+            }
+        }
+
+        m_encPrevLogicalInt = logicalInt;
+        m_encPrevLogicalFlt = logicalFloat;
+        m_encPrevTargetBits = targetBits64;
+        m_candidates = std::move(nextStore);
+        m_totalMatchedCount = m_candidates.size();
+
+        auto t1 = std::chrono::steady_clock::now();
+        m_lastTelemetry.elapsedMs       = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        m_lastTelemetry.candidatesFound = m_totalMatchedCount;
+        m_lastTelemetry.syscallsIssued  = syscalls;
+        return EngineErrc::OK;
     }
 
     if (m_candidates.empty()) {
         m_totalMatchedCount = 0;
         return EngineErrc::OK;
     }
-    auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t targetBits64 = 0;
-    uint32_t targetBits32 = 0;
-    if (type == DataType::FLOAT) {
-        float fv = static_cast<float>(logicalFloat);
-        std::memcpy(&targetBits32, &fv, 4);
-        targetBits64 = targetBits32;
-    } else if (type == DataType::DOUBLE) {
-        std::memcpy(&targetBits64, &logicalFloat, 8);
-        targetBits32 = static_cast<uint32_t>(targetBits64);
-    } else {
-        targetBits64 = static_cast<uint64_t>(logicalInt);
-        targetBits32 = static_cast<uint32_t>(logicalInt);
-    }
-
+    size_t elemSz = std::max<size_t>(1, dataTypeSize(effectiveType));
+    int64_t xorByteOffset = static_cast<int64_t>(keyOrMask);
     size_t spanBytes = (mode == EncodedMode::XOR_PAIR_64) ? 16
                      : (mode == EncodedMode::XOR_PAIR_32) ? 8 : 4;
 
@@ -1610,30 +1942,48 @@ EngineErrc SearchEngine::refineEncoded(
     for (size_t i = 0; i < m_candidates.size(); ++i) {
         if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
         CandidateEntry cand = m_candidates[i];
-        if (m_io.readMemory(cand.address, rawBuf, spanBytes) != EngineErrc::OK) continue;
-        syscalls++;
 
         bool matched = false;
-        if (mode == EncodedMode::XOR_PAIR_32) {
-            uint32_t w0 = 0, w1 = 0;
-            std::memcpy(&w0, rawBuf, 4);
-            std::memcpy(&w1, rawBuf + 4, 4);
-            matched = (w0 != 0 && w1 != 0 && (w0 ^ w1) == targetBits32);
-        } else if (mode == EncodedMode::XOR_PAIR_64) {
-            uint64_t q0 = 0, q1 = 0;
-            std::memcpy(&q0, rawBuf, 8);
-            std::memcpy(&q1, rawBuf + 8, 8);
-            matched = (q0 != 0 && q1 != 0 && (q0 ^ q1) == targetBits64);
-        } else if (mode == EncodedMode::XOR_ADDRESS) {
-            uint32_t stored = 0;
-            std::memcpy(&stored, rawBuf, 4);
-            uint32_t mask32 = (keyOrMask == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>(keyOrMask);
-            uint32_t addrKey = static_cast<uint32_t>(cand.address) & mask32;
-            matched = ((stored ^ addrKey) == targetBits32);
+        uint64_t curRaw = cand.rawValue;
+
+        if (mode == EncodedMode::XOR_OFFSET) {
+            uint8_t vBuf[8] = {0};
+            uint8_t kBuf[8] = {0};
+            uintptr_t kAddr = static_cast<uintptr_t>(static_cast<int64_t>(cand.address) + xorByteOffset);
+            if (m_io.readMemory(cand.address, vBuf, elemSz) != EngineErrc::OK) continue;
+            if (m_io.readMemory(kAddr, kBuf, elemSz) != EngineErrc::OK) continue;
+            syscalls += 2;
+            uint64_t v = extractRawValue(vBuf, effectiveType);
+            uint64_t k = extractRawValue(kBuf, effectiveType);
+            matched = (v != 0 && k != 0 && (v ^ k) == targetBits64);
+            curRaw = v;
+        } else {
+            if (m_io.readMemory(cand.address, rawBuf, spanBytes) != EngineErrc::OK) continue;
+            syscalls++;
+            if (mode == EncodedMode::XOR_PAIR_32) {
+                uint32_t w0 = 0, w1 = 0;
+                std::memcpy(&w0, rawBuf, 4);
+                std::memcpy(&w1, rawBuf + 4, 4);
+                matched = (w0 != 0 && w1 != 0 && (w0 ^ w1) == targetBits32);
+                curRaw = w0;
+            } else if (mode == EncodedMode::XOR_PAIR_64) {
+                uint64_t q0 = 0, q1 = 0;
+                std::memcpy(&q0, rawBuf, 8);
+                std::memcpy(&q1, rawBuf + 8, 8);
+                matched = (q0 != 0 && q1 != 0 && (q0 ^ q1) == targetBits64);
+                curRaw = q0;
+            } else if (mode == EncodedMode::XOR_ADDRESS) {
+                uint32_t stored = 0;
+                std::memcpy(&stored, rawBuf, 4);
+                uint32_t mask32 = (keyOrMask == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>(keyOrMask);
+                uint32_t addrKey = static_cast<uint32_t>(cand.address) & mask32;
+                matched = ((stored ^ addrKey) == targetBits32);
+                curRaw = stored;
+            }
         }
 
         if (matched) {
-            cand.rawValue = targetBits64;
+            cand.rawValue = curRaw;
             nextStore.append(cand);
         }
     }
@@ -1660,6 +2010,7 @@ EngineErrc SearchEngine::searchGroup(
     m_candidates.clear();
     m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
     m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
@@ -1726,27 +2077,58 @@ EngineErrc SearchEngine::searchGroup(
                 size_t anchorSz = dataTypeSize(anchor.type);
                 size_t anchorStep = query.aligned ? anchorSz : 1;
 
-                switch (anchor.type) {
-                    case DataType::INT8:
-                        SimdKernel::scanExactI8(buf.data(), task.readLen, static_cast<int8_t>(anchor.iVal), anchorOffsets);
-                        break;
-                    case DataType::INT16:
-                        SimdKernel::scanExactI16(buf.data(), task.readLen, static_cast<int16_t>(anchor.iVal), anchorStep, anchorOffsets);
-                        break;
-                    case DataType::INT32:
-                        SimdKernel::scanExactI32(buf.data(), task.readLen, static_cast<int32_t>(anchor.iVal), anchorStep, anchorOffsets);
-                        break;
-                    case DataType::INT64:
-                        SimdKernel::scanExactI64(buf.data(), task.readLen, anchor.iVal, anchorStep, anchorOffsets);
-                        break;
-                    case DataType::FLOAT:
-                        SimdKernel::scanExactF32(buf.data(), task.readLen, static_cast<float>(anchor.fVal), static_cast<float>(anchor.epsilon), anchorStep, anchorOffsets);
-                        break;
-                    case DataType::DOUBLE:
-                        SimdKernel::scanExactF64(buf.data(), task.readLen, anchor.fVal, anchor.epsilon, anchorStep, anchorOffsets);
-                        break;
-                    default:
-                        break;
+                if (anchor.op == 1) {
+                    switch (anchor.type) {
+                        case DataType::INT8:
+                            SimdKernel::scanRange<int8_t>(buf.data(), task.readLen, static_cast<int8_t>(anchor.iVal), static_cast<int8_t>(anchor.iMax), true, 1, anchorOffsets);
+                            break;
+                        case DataType::INT16:
+                            SimdKernel::scanRange<int16_t>(buf.data(), task.readLen, static_cast<int16_t>(anchor.iVal), static_cast<int16_t>(anchor.iMax), true, anchorStep, anchorOffsets);
+                            break;
+                        case DataType::INT32:
+                            SimdKernel::scanRange<int32_t>(buf.data(), task.readLen, static_cast<int32_t>(anchor.iVal), static_cast<int32_t>(anchor.iMax), true, anchorStep, anchorOffsets);
+                            break;
+                        case DataType::INT64:
+                            SimdKernel::scanRange<int64_t>(buf.data(), task.readLen, anchor.iVal, anchor.iMax, true, anchorStep, anchorOffsets);
+                            break;
+                        case DataType::FLOAT:
+                            SimdKernel::scanRangeF32(buf.data(), task.readLen, static_cast<float>(anchor.fVal), static_cast<float>(anchor.fMax), true, anchorStep, anchorOffsets);
+                            break;
+                        case DataType::DOUBLE:
+                            SimdKernel::scanRange<double>(buf.data(), task.readLen, anchor.fVal, anchor.fMax, true, anchorStep, anchorOffsets);
+                            break;
+                        default:
+                            break;
+                    }
+                } else if (anchor.op == 0) {
+                    switch (anchor.type) {
+                        case DataType::INT8:
+                            SimdKernel::scanExactI8(buf.data(), task.readLen, static_cast<int8_t>(anchor.iVal), anchorOffsets);
+                            break;
+                        case DataType::INT16:
+                            SimdKernel::scanExactI16(buf.data(), task.readLen, static_cast<int16_t>(anchor.iVal), anchorStep, anchorOffsets);
+                            break;
+                        case DataType::INT32:
+                            SimdKernel::scanExactI32(buf.data(), task.readLen, static_cast<int32_t>(anchor.iVal), anchorStep, anchorOffsets);
+                            break;
+                        case DataType::INT64:
+                            SimdKernel::scanExactI64(buf.data(), task.readLen, anchor.iVal, anchorStep, anchorOffsets);
+                            break;
+                        case DataType::FLOAT:
+                            SimdKernel::scanExactF32(buf.data(), task.readLen, static_cast<float>(anchor.fVal), static_cast<float>(anchor.epsilon), anchorStep, anchorOffsets);
+                            break;
+                        case DataType::DOUBLE:
+                            SimdKernel::scanExactF64(buf.data(), task.readLen, anchor.fVal, anchor.epsilon, anchorStep, anchorOffsets);
+                            break;
+                        default:
+                            break;
+                    }
+                } else {
+                    for (size_t off = 0; off + anchorSz <= task.readLen; off += anchorStep) {
+                        if (evalGroupField(buf.data() + off, anchor)) {
+                            anchorOffsets.push_back(off);
+                        }
+                    }
                 }
 
                 uint8_t rTag = regionFlagToIndex(task.regionFlag);
@@ -1785,7 +2167,7 @@ EngineErrc SearchEngine::searchGroup(
 
                             bool foundField = false;
                             for (size_t pos = maxPos; pos >= winStart; ) {
-                                if (evalSingleExact(buf.data() + pos, fld.type, fld.iVal, fld.fVal, fld.epsilon)) {
+                                if (evalGroupField(buf.data() + pos, fld)) {
                                     curUpperBound = pos;
                                     if (fIdx == 0) firstFieldOffset = pos;
                                     foundField = true;
@@ -1817,7 +2199,7 @@ EngineErrc SearchEngine::searchGroup(
 
                             bool foundField = false;
                             for (size_t pos = alignedStart; pos + fSz <= allowedEnd; pos += fStep) {
-                                if (evalSingleExact(buf.data() + pos, fld.type, fld.iVal, fld.fVal, fld.epsilon)) {
+                                if (evalGroupField(buf.data() + pos, fld)) {
                                     prevEnd = pos + fSz;
                                     maxMatchedEnd = prevEnd;
                                     foundField = true;
@@ -1847,7 +2229,7 @@ EngineErrc SearchEngine::searchGroup(
                                 size_t candMax = std::max(maxMatchedEnd, pos + fSz);
                                 if ((candMax - candMin) > query.maxSpanBytes) continue;
 
-                                if (evalSingleExact(buf.data() + pos, fld.type, fld.iVal, fld.fVal, fld.epsilon)) {
+                                if (evalGroupField(buf.data() + pos, fld)) {
                                     minMatchedOffset = candMin;
                                     maxMatchedEnd    = candMax;
                                     foundField       = true;

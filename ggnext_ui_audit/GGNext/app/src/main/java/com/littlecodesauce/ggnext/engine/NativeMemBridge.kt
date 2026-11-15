@@ -50,6 +50,8 @@ object NativeMemBridge {
     const val ENC_XOR_PAIR_32 = 2
     const val ENC_XOR_PAIR_64 = 3
     const val ENC_XOR_ADDRESS = 4
+    const val ENC_GG_AUTO = 5
+    const val ENC_XOR_OFFSET = 6
 
     // C++ RegionFlag 位掩码
     private val REGION_FLAG_MAP = mapOf(
@@ -180,11 +182,23 @@ object NativeMemBridge {
         inclusive: Boolean,
         aligned: Boolean
     ): Int
+    @JvmStatic external fun nativeRefineRange(
+        handle: Long,
+        dataType: Int,
+        intMin: Long,
+        intMax: Long,
+        floatMin: Double,
+        floatMax: Double,
+        inclusive: Boolean
+    ): Int
     @JvmStatic external fun nativeSearchGroup(
         handle: Long,
         types: IntArray,
         intVals: LongArray,
         floatVals: DoubleArray,
+        intMaxVals: LongArray,
+        floatMaxVals: DoubleArray,
+        fieldOps: IntArray,
         windowSize: Int,
         ordered: Boolean,
         aligned: Boolean
@@ -202,6 +216,14 @@ object NativeMemBridge {
         logicalFloat: Double,
         keyOrMask: Long,
         aligned: Boolean
+    ): Int
+    @JvmStatic external fun nativeRefineEncoded(
+        handle: Long,
+        dataType: Int,
+        encodedMode: Int,
+        logicalInt: Long,
+        logicalFloat: Double,
+        keyOrMask: Long
     ): Int
     @JvmStatic external fun nativeStartUnknownSnapshot(handle: Long, dataType: Int): Int
     @JvmStatic external fun nativeRefineFuzzy(

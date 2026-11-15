@@ -31,8 +31,8 @@ class MemoryEngine {
     )
 
     companion object {
-        /** Kotlin 层缓存的最大候选条目数（避免 maxShow=2000 时丢弃后续搜索结果，同时 C++ 层保留 2,000,000 条全量候选） */
-        const val MAX_CACHED_CANDIDATES = 25000
+        /** Kotlin 层缓存的最大候选条目数（上限调整为 100,000，同时 C++ 层保留全量候选） */
+        const val MAX_CACHED_CANDIDATES = 100000
     }
 
     data class Criteria(
@@ -44,7 +44,10 @@ class MemoryEngine {
         val notRange: Boolean = false,
         val sign: Int = ValueType.SIGN_EQUAL,
         val xorKey: Long = 0L,
+        val xorOffset: Int = 0,
         val orderedGroup: List<Long> = emptyList(),
+        val groupTo: List<Long> = emptyList(),
+        val groupOps: List<Int> = emptyList(),
         val ordered: Boolean = false,
         val groupTypes: List<Int> = emptyList(),
         val area: Int = 512,
@@ -886,6 +889,9 @@ class MemoryEngine {
             else -> c.to.toDouble()
         }
 
+        val isXorType = (c.type and 0x7F) == ValueType.XOR
+        val useEncryptedAuto = c.encryptedXor || isXorType
+
         val totalFound: Long = if (newSearch) {
             when {
                 c.isText && c.textBytes.isNotEmpty() -> {
@@ -907,12 +913,37 @@ class MemoryEngine {
                             else -> raw.toDouble()
                         }
                     }
+                    val intMaxArr = LongArray(count) { i -> c.groupTo.getOrElse(i) { c.orderedGroup[i] } }
+                    val fltMaxArr = DoubleArray(count) { i ->
+                        val gt = c.groupTypes.getOrElse(i) { c.type } and 0x7F
+                        val raw = c.groupTo.getOrElse(i) { c.orderedGroup[i] }
+                        when (gt) {
+                            ValueType.FLOAT -> Float.fromBits(raw.toInt()).toDouble()
+                            ValueType.DOUBLE -> Double.fromBits(raw)
+                            else -> raw.toDouble()
+                        }
+                    }
+                    val opsArr = IntArray(count) { i -> c.groupOps.getOrElse(i) { 0 } }
                     RootMemDaemon.searchGroup(
                         typesArr,
                         intArr,
                         fltArr,
-                        c.area.coerceIn(16, 65536),
+                        c.area.coerceIn(2, 65536),
                         c.ordered,
+                        true,
+                        onProgress,
+                        intMaxArr,
+                        fltMaxArr,
+                        opsArr
+                    )
+                }
+                c.xorOffset != 0 -> {
+                    RootMemDaemon.searchEncoded(
+                        nativeDt,
+                        NativeMemBridge.ENC_XOR_OFFSET,
+                        c.value,
+                        fVal1,
+                        c.xorOffset.toLong(),
                         true,
                         onProgress
                     )
@@ -928,14 +959,10 @@ class MemoryEngine {
                         onProgress
                     )
                 }
-                c.encryptedXor -> {
+                useEncryptedAuto -> {
                     RootMemDaemon.searchEncoded(
                         nativeDt,
-                        if ((c.type and 0x7F) == ValueType.QWORD || (c.type and 0x7F) == ValueType.DOUBLE) {
-                            NativeMemBridge.ENC_XOR_PAIR_64
-                        } else {
-                            NativeMemBridge.ENC_XOR_PAIR_32
-                        },
+                        NativeMemBridge.ENC_GG_AUTO,
                         c.value,
                         fVal1,
                         0L,
@@ -943,7 +970,7 @@ class MemoryEngine {
                         onProgress
                     )
                 }
-                c.isRange && !c.notRange -> {
+                c.isRange -> {
                     RootMemDaemon.searchRange(
                         nativeDt,
                         minOf(c.from, c.to),
@@ -971,14 +998,56 @@ class MemoryEngine {
                 }
             }
         } else {
-            if (!c.isRange && !c.isText && c.orderedGroup.size <= 1 &&
-                c.xorKey == 0L && !c.encryptedXor &&
-                (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL
-            ) {
-                RootMemDaemon.refineExact(nativeDt, c.value, fVal1, 1e-4, onProgress)
-            } else {
-                val refined = refineLoadedCandidates(c, current, maxResults)
-                return SearchResult(refined, refined.size.toLong())
+            when {
+                c.xorOffset != 0 -> {
+                    RootMemDaemon.refineEncoded(
+                        nativeDt,
+                        NativeMemBridge.ENC_XOR_OFFSET,
+                        c.value,
+                        fVal1,
+                        c.xorOffset.toLong(),
+                        onProgress
+                    )
+                }
+                c.xorKey != 0L -> {
+                    RootMemDaemon.refineEncoded(
+                        nativeDt,
+                        NativeMemBridge.ENC_XOR_STATIC,
+                        c.value,
+                        fVal1,
+                        c.xorKey,
+                        onProgress
+                    )
+                }
+                useEncryptedAuto -> {
+                    RootMemDaemon.refineEncoded(
+                        nativeDt,
+                        NativeMemBridge.ENC_GG_AUTO,
+                        c.value,
+                        fVal1,
+                        0L,
+                        onProgress
+                    )
+                }
+                c.isRange && !c.notRange -> {
+                    RootMemDaemon.refineRange(
+                        nativeDt,
+                        minOf(c.from, c.to),
+                        maxOf(c.from, c.to),
+                        minOf(fVal1, fVal2),
+                        maxOf(fVal1, fVal2),
+                        true,
+                        onProgress
+                    )
+                }
+                !c.isRange && !c.isText && c.orderedGroup.size <= 1 &&
+                    (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL -> {
+                    RootMemDaemon.refineExact(nativeDt, c.value, fVal1, 1e-4, onProgress)
+                }
+                else -> {
+                    val refined = refineLoadedCandidates(c, current, maxResults)
+                    return SearchResult(refined, refined.size.toLong())
+                }
             }
         }
 
@@ -1030,6 +1099,8 @@ class MemoryEngine {
             ValueType.DOUBLE -> Double.fromBits(c.to)
             else -> c.to.toDouble()
         }
+        val isXorType = (c.type and 0x7F) == ValueType.XOR
+        val useEncryptedAuto = c.encryptedXor || isXorType
 
         if (newSearch) {
             when {
@@ -1052,13 +1123,38 @@ class MemoryEngine {
                             else -> raw.toDouble()
                         }
                     }
+                    val intMaxArr = LongArray(count) { i -> c.groupTo.getOrElse(i) { c.orderedGroup[i] } }
+                    val fltMaxArr = DoubleArray(count) { i ->
+                        val gt = c.groupTypes.getOrElse(i) { c.type } and 0x7F
+                        val raw = c.groupTo.getOrElse(i) { c.orderedGroup[i] }
+                        when (gt) {
+                            ValueType.FLOAT -> Float.fromBits(raw.toInt()).toDouble()
+                            ValueType.DOUBLE -> Double.fromBits(raw)
+                            else -> raw.toDouble()
+                        }
+                    }
+                    val opsArr = IntArray(count) { i -> c.groupOps.getOrElse(i) { 0 } }
                     NativeMemBridge.nativeSearchGroup(
                         nativeHandle,
                         typesArr,
                         intArr,
                         fltArr,
-                        c.area.coerceIn(16, 65536),
+                        c.area.coerceIn(2, 65536),
                         c.ordered,
+                        true,
+                        intMaxArr,
+                        fltMaxArr,
+                        opsArr
+                    )
+                }
+                c.xorOffset != 0 -> {
+                    NativeMemBridge.nativeSearchEncoded(
+                        nativeHandle,
+                        nativeDt,
+                        NativeMemBridge.ENC_XOR_OFFSET,
+                        c.value,
+                        fVal1,
+                        c.xorOffset.toLong(),
                         true
                     )
                 }
@@ -1073,15 +1169,11 @@ class MemoryEngine {
                         true
                     )
                 }
-                c.encryptedXor -> {
+                useEncryptedAuto -> {
                     NativeMemBridge.nativeSearchEncoded(
                         nativeHandle,
                         nativeDt,
-                        if ((c.type and 0x7F) == ValueType.QWORD || (c.type and 0x7F) == ValueType.DOUBLE) {
-                            NativeMemBridge.ENC_XOR_PAIR_64
-                        } else {
-                            NativeMemBridge.ENC_XOR_PAIR_32
-                        },
+                        NativeMemBridge.ENC_GG_AUTO,
                         c.value,
                         fVal1,
                         0L,
@@ -1116,14 +1208,56 @@ class MemoryEngine {
                 }
             }
         } else {
-            if (!c.isRange && !c.isText && c.orderedGroup.size <= 1 &&
-                c.xorKey == 0L && !c.encryptedXor &&
-                (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL
-            ) {
-                NativeMemBridge.nativeRefineExact(nativeHandle, nativeDt, c.value, fVal1, 1e-4)
-            } else {
-                val refined = refineLoadedCandidates(c, current, maxResults)
-                return SearchResult(refined, refined.size.toLong())
+            when {
+                c.xorOffset != 0 -> {
+                    NativeMemBridge.nativeRefineEncoded(
+                        nativeHandle,
+                        nativeDt,
+                        NativeMemBridge.ENC_XOR_OFFSET,
+                        c.value,
+                        fVal1,
+                        c.xorOffset.toLong()
+                    )
+                }
+                c.xorKey != 0L -> {
+                    NativeMemBridge.nativeRefineEncoded(
+                        nativeHandle,
+                        nativeDt,
+                        NativeMemBridge.ENC_XOR_STATIC,
+                        c.value,
+                        fVal1,
+                        c.xorKey
+                    )
+                }
+                useEncryptedAuto -> {
+                    NativeMemBridge.nativeRefineEncoded(
+                        nativeHandle,
+                        nativeDt,
+                        NativeMemBridge.ENC_GG_AUTO,
+                        c.value,
+                        fVal1,
+                        0L
+                    )
+                }
+                c.isRange && !c.notRange -> {
+                    NativeMemBridge.nativeRefineRange(
+                        nativeHandle,
+                        nativeDt,
+                        minOf(c.from, c.to),
+                        maxOf(c.from, c.to),
+                        minOf(fVal1, fVal2),
+                        maxOf(fVal1, fVal2),
+                        true
+                    )
+                }
+                !c.isRange && !c.isText && c.orderedGroup.size <= 1 &&
+                    (c.sign and ValueType.SIGN_MASK) == ValueType.SIGN_EQUAL -> {
+                    NativeMemBridge.nativeRefineExact(nativeHandle, nativeDt, c.value, fVal1, 1e-4)
+                }
+                else -> {
+                    val refined = refineLoadedCandidates(c, current, maxResults)
+                    return SearchResult(refined, refined.size.toLong())
+                }
             }
         }
 
@@ -1481,9 +1615,23 @@ class MemoryEngine {
      * 核心数值匹配函数（支持有符号整数与 IEEE-754 浮点数精确与范围比较）：
      */
     private fun matches(v: Long, c: Criteria, prevMap: Map<Long, Long>, addr: Long): Boolean {
+        val itemSize = ValueType.sizeOf(if (c.type == ValueType.AUTO) ValueType.DWORD else (c.type and 0x7F))
         val logicalVal = when {
+            c.xorOffset != 0 -> {
+                val keyAtOff = read(addr + c.xorOffset, itemSize)
+                v xor keyAtOff
+            }
             c.xorKey != 0L -> v xor c.xorKey
-            c.encryptedXor -> v xor 0x5A5A5A5AL
+            c.encryptedXor -> {
+                val prevRaw = prevMap[addr]
+                if (prevRaw != null) {
+                    val keyAfter = read(addr + itemSize, itemSize)
+                    v xor keyAfter
+                } else {
+                    val keyAfter = read(addr + itemSize, itemSize)
+                    v xor keyAfter
+                }
+            }
             else -> v
         }
         val evalType = if (c.type == ValueType.AUTO) ValueType.DWORD else (c.type and 0x7F)

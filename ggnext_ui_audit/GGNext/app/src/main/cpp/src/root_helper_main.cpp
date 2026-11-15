@@ -350,6 +350,15 @@ int main(int argc, char** argv) {
             scanner.searchRange(static_cast<mem_engine::DataType>(dt), iMin, iMax, fMin, fMax, inclusive != 0, aligned != 0, &cancelToken, makeProgressReporter());
             std::printf("OK %zu\n", scanner.totalMatchedCount());
             std::fflush(stdout);
+        } else if (cmd == "REFINE_RANGE") {
+            int dt = 0, inclusive = 1;
+            int64_t iMin = 0, iMax = 0;
+            double fMin = 0.0, fMax = 0.0;
+            iss >> dt >> iMin >> iMax >> fMin >> fMax >> inclusive;
+            cancelToken.reset();
+            scanner.refineRange(static_cast<mem_engine::DataType>(dt), iMin, iMax, fMin, fMax, inclusive != 0, &cancelToken, makeProgressReporter());
+            std::printf("OK %zu\n", scanner.totalMatchedCount());
+            std::fflush(stdout);
         } else if (cmd == "SEARCH_GROUP") {
             int windowSize = 512, ordered = 0, aligned = 1, count = 0;
             iss >> windowSize >> ordered >> aligned >> count;
@@ -358,14 +367,17 @@ int main(int argc, char** argv) {
             query.ordered = (ordered != 0);
             query.aligned = (aligned != 0);
             for (int i = 0; i < count; ++i) {
-                int dt = 0;
-                int64_t iv = 0;
-                double fv = 0.0;
-                iss >> dt >> iv >> fv;
+                int dt = 0, op = 0;
+                int64_t iv = 0, iMax = 0;
+                double fv = 0.0, fMax = 0.0;
+                iss >> dt >> iv >> fv >> iMax >> fMax >> op;
                 mem_engine::GroupFieldItem f;
                 f.type = static_cast<mem_engine::DataType>(dt);
                 f.iVal = iv;
                 f.fVal = fv;
+                f.iMax = iMax;
+                f.fMax = fMax;
+                f.op = static_cast<uint8_t>(op);
                 f.epsilon = 1e-4;
                 f.origIndex = static_cast<size_t>(i);
                 query.fields.push_back(f);
@@ -400,6 +412,24 @@ int main(int argc, char** argv) {
                 logicalFloat,
                 keyOrMask,
                 aligned != 0,
+                &cancelToken,
+                makeProgressReporter()
+            );
+            std::printf("OK %zu\n", scanner.totalMatchedCount());
+            std::fflush(stdout);
+        } else if (cmd == "REFINE_ENCODED") {
+            int dt = 0, encMode = 0;
+            int64_t logicalInt = 0;
+            double logicalFloat = 0.0;
+            uint64_t keyOrMask = 0;
+            iss >> dt >> encMode >> logicalInt >> logicalFloat >> keyOrMask;
+            cancelToken.reset();
+            scanner.refineEncoded(
+                static_cast<mem_engine::DataType>(dt),
+                static_cast<mem_engine::EncodedMode>(encMode),
+                logicalInt,
+                logicalFloat,
+                keyOrMask,
                 &cancelToken,
                 makeProgressReporter()
             );

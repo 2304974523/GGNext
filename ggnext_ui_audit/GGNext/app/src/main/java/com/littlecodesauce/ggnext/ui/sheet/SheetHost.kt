@@ -58,6 +58,7 @@ fun SheetHost(ui: Ui) {
                     Sheet.VALUE_FORMAT -> FormatSheet(ui)
                     Sheet.EDITOR -> EditSheet(ui)
                     Sheet.OFFSET -> OffsetSheet(ui)
+                    Sheet.CALC_OFFSET -> CalcOffsetXorSheet(ui)
                     Sheet.REMOVE -> RemoveSheet(ui)
                     Sheet.TOOLBAR_ORDER -> ToolbarSheet(ui)
                     Sheet.TOOLBAR_PICK -> ToolbarPickSheet(ui)

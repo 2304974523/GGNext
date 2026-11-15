@@ -43,6 +43,7 @@ import com.littlecodesauce.ggnext.core.Ui
 import com.littlecodesauce.ggnext.engine.Formatter
 import com.littlecodesauce.ggnext.model.MemoryItem
 import com.littlecodesauce.ggnext.ui.components.GgCheckBox
+import com.littlecodesauce.ggnext.ui.components.VerticalFastScrollbar
 import com.littlecodesauce.ggnext.ui.components.clickableLongPress
 import com.littlecodesauce.ggnext.ui.components.clickableWithTooltip
 import com.littlecodesauce.ggnext.ui.components.fsp
@@ -97,23 +98,29 @@ fun MemoryScreen(ui: Ui) {
         if (ui.memoryRows.isEmpty()) {
             EmptyMemory()
         } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(vertical = 2.dp, horizontal = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                itemsIndexed(
-                    items = ui.memoryRows,
-                    key = { _, i -> i.address },
-                    contentType = { _, _ -> "mem_row" }
-                ) { _, item ->
-                    MemoryRow(
-                        item = item,
-                        mask = ui.valueMask,
-                        isJumpTarget = (item.address == ui.memoryHighlightAddress)
-                    )
+            Box(Modifier.fillMaxSize()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(vertical = 2.dp, horizontal = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    itemsIndexed(
+                        items = ui.memoryRows,
+                        key = { _, i -> i.address },
+                        contentType = { _, _ -> "mem_row" }
+                    ) { _, item ->
+                        MemoryRow(
+                            item = item,
+                            mask = ui.valueMask,
+                            isJumpTarget = (item.address == ui.memoryHighlightAddress)
+                        )
+                    }
                 }
+                VerticalFastScrollbar(
+                    listState = listState,
+                    modifier = Modifier.align(Alignment.CenterEnd)
+                )
             }
         }
     }

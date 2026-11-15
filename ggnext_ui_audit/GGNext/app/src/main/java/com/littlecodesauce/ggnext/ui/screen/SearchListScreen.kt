@@ -41,6 +41,7 @@ import com.littlecodesauce.ggnext.model.ValueType
 import com.littlecodesauce.ggnext.ui.components.GgCheckBox
 import com.littlecodesauce.ggnext.ui.components.ItemEnter
 import com.littlecodesauce.ggnext.ui.components.ScaledNumber
+import com.littlecodesauce.ggnext.ui.components.VerticalFastScrollbar
 import com.littlecodesauce.ggnext.ui.components.clickableLongPress
 import com.littlecodesauce.ggnext.ui.components.clickableWithTooltip
 import com.littlecodesauce.ggnext.ui.components.fsp
@@ -58,18 +59,24 @@ fun SearchListScreen(ui: Ui) {
         return
     }
     val state = rememberLazyListState()
-    LazyColumn(
-        state = state,
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(vertical = 2.dp)
-    ) {
-        itemsIndexed(
-            items = ui.results,
-            key = { _, i -> i.address },
-            contentType = { _, _ -> "addr_row" }
-        ) { idx, item ->
-            AddressRow(item, ui.valueMask, idx)
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = state,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(vertical = 2.dp)
+        ) {
+            itemsIndexed(
+                items = ui.results,
+                key = { _, i -> i.address },
+                contentType = { _, _ -> "addr_row" }
+            ) { idx, item ->
+                AddressRow(item, ui.valueMask, idx)
+            }
         }
+        VerticalFastScrollbar(
+            listState = state,
+            modifier = Modifier.align(Alignment.CenterEnd)
+        )
     }
 }
 

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Delete
@@ -46,6 +47,7 @@ import com.littlecodesauce.ggnext.model.ValueType
 import com.littlecodesauce.ggnext.ui.components.GgCheckBox
 import com.littlecodesauce.ggnext.ui.components.ItemEnter
 import com.littlecodesauce.ggnext.ui.components.ScaledNumber
+import com.littlecodesauce.ggnext.ui.components.VerticalFastScrollbar
 import com.littlecodesauce.ggnext.ui.components.clickableLongPress
 import com.littlecodesauce.ggnext.ui.components.clickableWithTooltip
 import com.littlecodesauce.ggnext.ui.components.fsp
@@ -78,17 +80,25 @@ fun SavedListScreen(ui: Ui) {
         }
         return
     }
-    LazyColumn(
-        Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(vertical = 2.dp)
-    ) {
-        itemsIndexed(
-            items = ui.saved,
-            key = { _, i -> i.address },
-            contentType = { _, _ -> "saved_row" }
-        ) { idx, item ->
-            SavedRow(item, ui.valueMaskSaved, idx)
+    val listState = rememberLazyListState()
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(vertical = 2.dp)
+        ) {
+            itemsIndexed(
+                items = ui.saved,
+                key = { _, i -> i.address },
+                contentType = { _, _ -> "saved_row" }
+            ) { idx, item ->
+                SavedRow(item, ui.valueMaskSaved, idx)
+            }
         }
+        VerticalFastScrollbar(
+            listState = listState,
+            modifier = Modifier.align(Alignment.CenterEnd)
+        )
     }
 }
 

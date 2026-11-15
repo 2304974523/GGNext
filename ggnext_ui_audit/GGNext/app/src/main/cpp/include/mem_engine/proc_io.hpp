@@ -78,11 +78,13 @@ public:
     static size_t querySystemIovMax() noexcept;
 
 private:
-    int    m_pid       = -1;
-    int    m_memFd     = -1;
-    size_t m_pageSize  = 4096;
-    size_t m_iovMax    = 1024;
+    int    m_pid        = -1;
+    int    m_memFd      = -1;
+    int    m_pagemapFd  = -1;
+    size_t m_pageSize   = 4096;
+    size_t m_iovMax     = 1024;
     mutable std::atomic<bool> m_pvmSupported{true};
+    mutable std::atomic<bool> m_pagemapUsable{false};
 
     static EngineErrc mapErrnoToErrc(int err) noexcept;
 };

@@ -133,7 +133,9 @@ enum class EncodedMode : uint8_t {
     XOR_STATIC   = 1, // stored = logical_val ^ static_key
     XOR_PAIR_32  = 2, // ACTk ObscuredInt / ObscuredFloat: [uint32_t key][uint32_t hidden] where key ^ hidden == logical_bits
     XOR_PAIR_64  = 3, // ACTk ObscuredLong / ObscuredDouble: [uint64_t key][uint64_t hidden]
-    XOR_ADDRESS  = 4  // stored = logical_val ^ (uint32_t(address) & mask)
+    XOR_ADDRESS  = 4, // stored = logical_val ^ (uint32_t(address) & mask)
+    GG_AUTO      = 5, // Stateful GG Encrypted Search (Constant XOR, Dynamic Neighbor XOR ±4/±8, Additive Offset)
+    XOR_OFFSET   = 6  // GG ValueXOffset syntax (e.g. 25X4, 25X8, 25X-4): (val_at(addr) ^ val_at(addr + offset)) == logical_bits
 };
 
 // ============================================================================

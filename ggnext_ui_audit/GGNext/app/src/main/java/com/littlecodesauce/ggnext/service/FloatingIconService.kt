@@ -190,14 +190,22 @@ class FloatingIconService : Service() {
 
     private fun startForegroundNotification() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(
-            NotificationChannel(CHANNEL, "GGNext 悬浮窗", NotificationManager.IMPORTANCE_LOW)
-        )
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL, "GGNext 悬浮窗", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
         val pi = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val n: Notification = Notification.Builder(this, CHANNEL)
+        val builder = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        val n: Notification = builder
             .setContentTitle("GGNext 正在运行")
             .setContentText("短按悬浮球打开修改器，长按悬浮球调节变速")
             .setSmallIcon(android.R.drawable.ic_menu_manage)

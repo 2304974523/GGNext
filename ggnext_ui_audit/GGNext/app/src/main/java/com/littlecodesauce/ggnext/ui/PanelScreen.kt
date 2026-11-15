@@ -29,7 +29,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.ui.text.font.FontWeight
-import com.littlecodesauce.ggnext.ui.components.monoStyle
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
@@ -347,7 +346,8 @@ private fun handleTool(
         ToolId.LOAD_RESULTS -> Session.loadCheckedAsResults()
         ToolId.LOAD_CHANGED -> Session.loadChangedAsResults()
         ToolId.FORMAT -> Session.openSheet(Sheet.VALUE_FORMAT)
-        ToolId.OFFSET, ToolId.CALC_OFFSET -> Session.openSheet(Sheet.OFFSET)
+        ToolId.OFFSET -> Session.openSheet(Sheet.OFFSET)
+        ToolId.CALC_OFFSET -> Session.openSheet(Sheet.CALC_OFFSET)
         ToolId.ADDRESS -> {
             val first = Session.checkedItems().firstOrNull() ?: ui.results.firstOrNull() ?: ui.saved.firstOrNull()
             Session.openSheet(Sheet.ADDRESS_EDIT, first)
