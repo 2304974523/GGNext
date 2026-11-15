@@ -70,7 +70,7 @@ private:
 // ============================================================================
 class MmapRegionSnapshotStore {
 public:
-    static constexpr size_t MAX_SNAPSHOT_BYTES = 512ULL * 1024ULL * 1024ULL; // 512 MB cap
+    static constexpr size_t MAX_SNAPSHOT_BYTES = 256ULL * 1024ULL * 1024ULL; // 256 MB cap
 
     struct SnapshotBlock {
         uintptr_t startAddress = 0;

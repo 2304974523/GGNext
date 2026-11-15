@@ -90,10 +90,10 @@ fun HomeScreen(
     onStartOverlay: () -> Unit,
     onStopOverlay: () -> Unit
 ) {
-    var showSettingsPage by remember { mutableStateOf(false) }
+    val showSettingsPage = ui.homeSettingsOpen
 
     BackHandler(enabled = showSettingsPage && ui.sheet == Sheet.NONE && !ui.panelVisible) {
-        showSettingsPage = false
+        Session.setHomeSettingsOpen(false)
     }
 
     Box(
@@ -120,12 +120,12 @@ fun HomeScreen(
                     ui = ui,
                     onStartOverlay = onStartOverlay,
                     onStopOverlay = onStopOverlay,
-                    onOpenSettings = { showSettingsPage = true }
+                    onOpenSettings = { Session.setHomeSettingsOpen(true) }
                 )
             } else {
                 HomeSettingsPage(
                     ui = ui,
-                    onBack = { showSettingsPage = false }
+                    onBack = { Session.setHomeSettingsOpen(false) }
                 )
             }
         }
@@ -174,7 +174,7 @@ private fun SingleHomePage(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("GGNext", color = Rose.Text, fontSize = fsp(21f), fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.width(8.dp))
-                    Text("v0.4", color = Rose.TextDim, fontSize = fsp(12f), fontWeight = FontWeight.Medium)
+                    Text("v0.5", color = Rose.TextDim, fontSize = fsp(12f), fontWeight = FontWeight.Medium)
                 }
                 Text(
                     text = tr("Android 内存调试工具"),

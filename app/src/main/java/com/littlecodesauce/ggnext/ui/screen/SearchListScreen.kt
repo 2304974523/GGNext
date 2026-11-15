@@ -67,7 +67,7 @@ fun SearchListScreen(ui: Ui) {
         ) {
             itemsIndexed(
                 items = ui.results,
-                key = { _, i -> i.address },
+                key = { idx, i -> "${i.address}_${i.flags}_$idx" },
                 contentType = { _, _ -> "addr_row" }
             ) { idx, item ->
                 AddressRow(item, ui.valueMask, idx)

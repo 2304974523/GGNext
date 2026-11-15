@@ -281,12 +281,11 @@ EngineErrc SearchEngine::searchExact(
     m_candidates.clear();
     m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
     m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
-    if (m_regions.empty()) {
-        refreshRegions();
-    }
+    refreshRegions();
 
     size_t maxItemSize = (type == DataType::AUTO) ? 8 : dataTypeSize(type);
     size_t overlap = (maxItemSize > 1) ? (maxItemSize - 1) : 0;
@@ -462,6 +461,110 @@ EngineErrc SearchEngine::refineExact(
     ProgressCallback progress
 ) {
     auto t0 = std::chrono::steady_clock::now();
+
+    // If refining directly after a Fuzzy Snapshot (or high-cardinality UNCHANGED snapshot)
+    // where candidates are still stored in m_snapshotStore, scan the snapshot blocks against live memory!
+    if (m_hasFullSnapshot && m_candidates.empty()) {
+        const auto& blocks = m_snapshotStore.blocks();
+        if (blocks.empty()) {
+            m_snapshotStore.clear();
+            m_hasFullSnapshot = false;
+            m_encryptedSnapshot = false;
+            m_totalMatchedCount = 0;
+            return EngineErrc::OK;
+        }
+
+        const DataType snapDt = (type == DataType::AUTO) ? m_snapshotType : type;
+        const size_t elemSz = std::max<size_t>(1, dataTypeSize(snapDt));
+        const size_t totalSnapBytes = std::max<size_t>(1, m_snapshotStore.totalSnapshotBytes());
+
+        std::atomic<size_t> nextBlock{0};
+        std::atomic<size_t> syscalls{0};
+        std::atomic<size_t> bytesScanned{0};
+        std::atomic<size_t> totalMatches{0};
+        std::atomic<size_t> storedCount{0};
+        std::mutex storeMutex;
+
+        size_t numThreads = std::min(m_workerThreads, blocks.size());
+        std::vector<std::thread> workers;
+
+        for (size_t tid = 0; tid < numThreads; ++tid) {
+            workers.emplace_back([&]() {
+                std::vector<uint8_t> curBuf;
+                std::vector<uint8_t> validMask;
+                std::vector<CandidateEntry> blockHits;
+                blockHits.reserve(4096);
+
+                while (true) {
+                    if (token && token->isCancelled()) break;
+                    size_t bIdx = nextBlock.fetch_add(1, std::memory_order_relaxed);
+                    if (bIdx >= blocks.size()) break;
+
+                    const auto& blk = blocks[bIdx];
+                    if (curBuf.size() < blk.length) curBuf.resize(blk.length);
+                    size_t chunkReadable = 0;
+                    EngineErrc rc = m_io.readChunkFaultTolerant(blk.startAddress, curBuf.data(), blk.length, validMask, &chunkReadable);
+                    syscalls.fetch_add(1, std::memory_order_relaxed);
+                    size_t doneBytes = bytesScanned.fetch_add(blk.length, std::memory_order_relaxed) + blk.length;
+
+                    if (rc != EngineErrc::OK || chunkReadable == 0) {
+                        if (progress) progress(doneBytes, totalSnapBytes);
+                        continue;
+                    }
+
+                    blockHits.clear();
+                    uint8_t rTag = regionFlagToIndex(blk.regionFlag);
+                    for (size_t off = 0; off + elemSz <= blk.length; off += elemSz) {
+                        const uint8_t* valPtr = curBuf.data() + off;
+                        if (evalSingleExact(valPtr, snapDt, intTarget, floatTarget, epsilon)) {
+                            CandidateEntry entry{};
+                            entry.address   = blk.startAddress + off;
+                            entry.rawValue  = extractRawValue(valPtr, snapDt);
+                            entry.type      = static_cast<uint8_t>(snapDt);
+                            entry.regionTag = rTag;
+                            blockHits.push_back(entry);
+                        }
+                    }
+
+                    if (!blockHits.empty()) {
+                        size_t newTotal = totalMatches.fetch_add(blockHits.size(), std::memory_order_relaxed) + blockHits.size();
+                        m_totalMatchedCount = newTotal;
+                        if (storedCount.load(std::memory_order_relaxed) < MmapCandidateStore::MAX_STORED_CANDIDATES) {
+                            std::lock_guard<std::mutex> lk(storeMutex);
+                            m_candidates.appendBatch(blockHits.data(), blockHits.size());
+                            storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                        }
+                    }
+
+                    if (progress) progress(doneBytes, totalSnapBytes);
+                }
+            });
+        }
+
+        for (auto& w : workers) w.join();
+        m_snapshotStore.clear();
+        m_hasFullSnapshot = false;
+        m_encryptedSnapshot = false;
+
+        if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
+
+        m_candidates.sortByAddress();
+        m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
+
+        auto t1 = std::chrono::steady_clock::now();
+        m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        m_lastTelemetry.totalBytesScanned = bytesScanned.load();
+        m_lastTelemetry.readableBytes     = bytesScanned.load();
+        m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
+        m_lastTelemetry.syscallsIssued    = syscalls.load();
+        m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
+        return EngineErrc::OK;
+    }
+
+    m_snapshotStore.clear();
+    m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
+
     if (m_candidates.empty()) {
         m_totalMatchedCount = 0;
         return EngineErrc::OK;
@@ -588,10 +691,11 @@ EngineErrc SearchEngine::searchBytePattern(
     m_candidates.clear();
     m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
     m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
-    if (m_regions.empty()) refreshRegions();
+    refreshRegions();
 
     const size_t patLen = pattern.size();
     const size_t overlap = (patLen > 1) ? (patLen - 1) : 0;
@@ -738,12 +842,14 @@ EngineErrc SearchEngine::searchRange(
     m_candidates.clear();
     m_snapshotStore.clear();
     m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
     m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
-    if (m_regions.empty()) refreshRegions();
+    refreshRegions();
 
-    size_t itemSz = dataTypeSize(type);
+    DataType effectiveType = (type == DataType::AUTO) ? DataType::INT32 : type;
+    size_t itemSz = std::max<size_t>(1, dataTypeSize(effectiveType));
     size_t overlap = (itemSz > 1) ? (itemSz - 1) : 0;
     auto tasks = buildChunkTasks(overlap);
     if (tasks.empty()) return EngineErrc::OK;
@@ -787,7 +893,7 @@ EngineErrc SearchEngine::searchRange(
 
                 if (rc == EngineErrc::OK && chunkReadable > 0) {
                     offsets.clear();
-                    switch (type) {
+                    switch (effectiveType) {
                         case DataType::INT8:
                             SimdKernel::scanRange<int8_t>(buf.data(), task.readLen, static_cast<int8_t>(intMin), static_cast<int8_t>(intMax), inclusive, 1, offsets);
                             break;
@@ -822,8 +928,8 @@ EngineErrc SearchEngine::searchRange(
                         if (!storeAlreadyFull) {
                             CandidateEntry entry{};
                             entry.address   = task.startAddr + off;
-                            entry.rawValue  = extractRawValue(buf.data() + off, type);
-                            entry.type      = static_cast<uint8_t>(type);
+                            entry.rawValue  = extractRawValue(buf.data() + off, effectiveType);
+                            entry.type      = static_cast<uint8_t>(effectiveType);
                             entry.regionTag = rTag;
                             localHits.push_back(entry);
 
@@ -881,6 +987,108 @@ EngineErrc SearchEngine::refineRange(
     ProgressCallback progress
 ) {
     auto t0 = std::chrono::steady_clock::now();
+
+    if (m_hasFullSnapshot && m_candidates.empty()) {
+        const auto& blocks = m_snapshotStore.blocks();
+        if (blocks.empty()) {
+            m_snapshotStore.clear();
+            m_hasFullSnapshot = false;
+            m_encryptedSnapshot = false;
+            m_totalMatchedCount = 0;
+            return EngineErrc::OK;
+        }
+
+        const DataType snapDt = (type == DataType::AUTO) ? m_snapshotType : type;
+        const size_t elemSz = std::max<size_t>(1, dataTypeSize(snapDt));
+        const size_t totalSnapBytes = std::max<size_t>(1, m_snapshotStore.totalSnapshotBytes());
+
+        std::atomic<size_t> nextBlock{0};
+        std::atomic<size_t> syscalls{0};
+        std::atomic<size_t> bytesScanned{0};
+        std::atomic<size_t> totalMatches{0};
+        std::atomic<size_t> storedCount{0};
+        std::mutex storeMutex;
+
+        size_t numThreads = std::min(m_workerThreads, blocks.size());
+        std::vector<std::thread> workers;
+
+        for (size_t tid = 0; tid < numThreads; ++tid) {
+            workers.emplace_back([&]() {
+                std::vector<uint8_t> curBuf;
+                std::vector<uint8_t> validMask;
+                std::vector<CandidateEntry> blockHits;
+                blockHits.reserve(4096);
+
+                while (true) {
+                    if (token && token->isCancelled()) break;
+                    size_t bIdx = nextBlock.fetch_add(1, std::memory_order_relaxed);
+                    if (bIdx >= blocks.size()) break;
+
+                    const auto& blk = blocks[bIdx];
+                    if (curBuf.size() < blk.length) curBuf.resize(blk.length);
+                    size_t chunkReadable = 0;
+                    EngineErrc rc = m_io.readChunkFaultTolerant(blk.startAddress, curBuf.data(), blk.length, validMask, &chunkReadable);
+                    syscalls.fetch_add(1, std::memory_order_relaxed);
+                    size_t doneBytes = bytesScanned.fetch_add(blk.length, std::memory_order_relaxed) + blk.length;
+
+                    if (rc != EngineErrc::OK || chunkReadable == 0) {
+                        if (progress) progress(doneBytes, totalSnapBytes);
+                        continue;
+                    }
+
+                    blockHits.clear();
+                    uint8_t rTag = regionFlagToIndex(blk.regionFlag);
+                    for (size_t off = 0; off + elemSz <= blk.length; off += elemSz) {
+                        const uint8_t* valPtr = curBuf.data() + off;
+                        if (evalSingleRange(valPtr, snapDt, intMin, intMax, floatMin, floatMax, inclusive)) {
+                            CandidateEntry entry{};
+                            entry.address   = blk.startAddress + off;
+                            entry.rawValue  = extractRawValue(valPtr, snapDt);
+                            entry.type      = static_cast<uint8_t>(snapDt);
+                            entry.regionTag = rTag;
+                            blockHits.push_back(entry);
+                        }
+                    }
+
+                    if (!blockHits.empty()) {
+                        size_t newTotal = totalMatches.fetch_add(blockHits.size(), std::memory_order_relaxed) + blockHits.size();
+                        m_totalMatchedCount = newTotal;
+                        if (storedCount.load(std::memory_order_relaxed) < MmapCandidateStore::MAX_STORED_CANDIDATES) {
+                            std::lock_guard<std::mutex> lk(storeMutex);
+                            m_candidates.appendBatch(blockHits.data(), blockHits.size());
+                            storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                        }
+                    }
+
+                    if (progress) progress(doneBytes, totalSnapBytes);
+                }
+            });
+        }
+
+        for (auto& w : workers) w.join();
+        m_snapshotStore.clear();
+        m_hasFullSnapshot = false;
+        m_encryptedSnapshot = false;
+
+        if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
+
+        m_candidates.sortByAddress();
+        m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
+
+        auto t1 = std::chrono::steady_clock::now();
+        m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        m_lastTelemetry.totalBytesScanned = bytesScanned.load();
+        m_lastTelemetry.readableBytes     = bytesScanned.load();
+        m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
+        m_lastTelemetry.syscallsIssued    = syscalls.load();
+        m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
+        return EngineErrc::OK;
+    }
+
+    m_snapshotStore.clear();
+    m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
+
     if (m_candidates.empty()) {
         m_totalMatchedCount = 0;
         return EngineErrc::OK;
@@ -901,14 +1109,17 @@ EngineErrc SearchEngine::refineRange(
     size_t idx = 0;
     while (idx < count) {
         uintptr_t addr = m_candidates[idx].address;
-        size_t itemSz = dataTypeSize(type);
+        DataType dt = (type == DataType::AUTO) ? static_cast<DataType>(m_candidates[idx].type) : type;
+        size_t itemSz = std::max<size_t>(1, dataTypeSize(dt));
         uintptr_t spanStart = addr;
         uintptr_t spanEnd   = addr + itemSz;
         size_t firstIdx = idx++;
 
         while (idx < count) {
             uintptr_t nextAddr = m_candidates[idx].address;
-            uintptr_t nextEnd  = nextAddr + itemSz;
+            DataType nextDt = (type == DataType::AUTO) ? static_cast<DataType>(m_candidates[idx].type) : type;
+            size_t nextSz = std::max<size_t>(1, dataTypeSize(nextDt));
+            uintptr_t nextEnd  = nextAddr + nextSz;
             if (nextAddr <= spanEnd + 256 && (nextEnd - spanStart) <= pageSize) {
                 if (nextEnd > spanEnd) spanEnd = nextEnd;
                 idx++;
@@ -948,9 +1159,10 @@ EngineErrc SearchEngine::refineRange(
             const auto& grp = groups[i];
             for (size_t cIdx = grp.firstCandIdx; cIdx < grp.lastCandIdx; ++cIdx) {
                 CandidateEntry cand = m_candidates[cIdx];
+                DataType dt = (type == DataType::AUTO) ? static_cast<DataType>(cand.type) : type;
                 const uint8_t* valPtr = br.localBuf + (cand.address - grp.startPageAddr);
-                if (evalSingleRange(valPtr, type, intMin, intMax, floatMin, floatMax, inclusive)) {
-                    cand.rawValue = extractRawValue(valPtr, type);
+                if (evalSingleRange(valPtr, dt, intMin, intMax, floatMin, floatMax, inclusive)) {
+                    cand.rawValue = extractRawValue(valPtr, dt);
                     nextStore.append(cand);
                 }
             }
@@ -987,7 +1199,7 @@ EngineErrc SearchEngine::startUnknownSnapshot(
     m_totalMatchedCount = 0;
     m_lastTelemetry     = ScanTelemetry{};
 
-    if (m_regions.empty()) refreshRegions();
+    refreshRegions();
 
     auto tasks = buildChunkTasks(0);
     if (tasks.empty()) return EngineErrc::OK;
@@ -1509,7 +1721,7 @@ EngineErrc SearchEngine::searchEncoded(
     m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
-    if (m_regions.empty()) refreshRegions();
+    refreshRegions();
 
     size_t elemSz = std::max<size_t>(1, dataTypeSize(effectiveType));
     int64_t xorByteOffset = static_cast<int64_t>(keyOrMask);
@@ -2014,7 +2226,7 @@ EngineErrc SearchEngine::searchGroup(
     m_totalMatchedCount = 0;
     m_lastTelemetry = ScanTelemetry{};
 
-    if (m_regions.empty()) refreshRegions();
+    refreshRegions();
 
     // 1. Anchor-First Selectivity Scheduling: pick the field with highest entropy score
     size_t anchorIdx = 0;

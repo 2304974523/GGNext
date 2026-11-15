@@ -159,7 +159,7 @@ fun ProcessSheet(ui: Ui) {
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        itemsIndexed(list, key = { _, p -> p.packageName + p.pid }) { idx, p ->
+                        itemsIndexed(list, key = { idx, p -> "${p.pid}_${p.packageName}_$idx" }) { idx, p ->
                             ProcessRow(p, idx) { Session.attach(p) }
                         }
                     }

@@ -27,6 +27,10 @@ object RootMemDaemon {
     private var process: Process? = null
     private var writer: BufferedWriter? = null
     private var reader: BufferedReader? = null
+    private var lastAppContext: Context? = null
+    private var lastAttachedPid: Int = 0
+    private var lastRegionMask: Int = 0x3FFF
+    private var isRecovering: Boolean = false
 
     data class RawCandidate(
         val address: Long,
@@ -36,12 +40,16 @@ object RootMemDaemon {
 
     @Synchronized
     fun ensureStarted(context: Context?): Boolean {
+        if (context != null) {
+            lastAppContext = context.applicationContext ?: context
+        }
         if (isAlive()) return true
         stop()
         if (!Shell.hasRoot()) return false
 
-        val binPath = resolveExecutablePath(context) ?: return false
-        val spillDir = context?.cacheDir?.absolutePath ?: "/data/local/tmp"
+        val ctx = context ?: lastAppContext
+        val binPath = resolveExecutablePath(ctx) ?: return false
+        val spillDir = ctx?.cacheDir?.absolutePath ?: "/data/local/tmp"
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
 
         return try {
@@ -52,7 +60,7 @@ object RootMemDaemon {
             val r = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
 
             val binDir = File(binPath).parent ?: "/data/local/tmp"
-            val nativeDir = context?.applicationInfo?.nativeLibraryDir
+            val nativeDir = ctx?.applicationInfo?.nativeLibraryDir
             val libDirs = listOfNotNull(nativeDir, binDir, "/system/lib64", "/system/lib")
                 .distinct()
                 .joinToString(":")
@@ -66,7 +74,7 @@ object RootMemDaemon {
             writer = w
             reader = r
 
-            val pong = sendCommandLocked("PING")
+            val pong = sendRawLocked("PING")
             val ok = pong != null && pong.startsWith("OK")
             if (ok) {
                 AppLog.i("RootMemDaemon", "Started uid=0 C++20 MemEngine daemon: $binPath")
@@ -162,13 +170,13 @@ object RootMemDaemon {
         }
     }
 
-    private fun sendCommandLocked(
+    private fun sendRawLocked(
         cmd: String,
         onProgress: ((doneBytes: Long, totalBytes: Long, foundCount: Long) -> Unit)? = null
     ): String? {
         val w = writer ?: return null
         val r = reader ?: return null
-        return try {
+        try {
             w.write(cmd)
             w.write("\n")
             w.flush()
@@ -188,19 +196,56 @@ object RootMemDaemon {
             }
         } catch (_: Throwable) {
             stop()
-            null
+            return null
         }
+    }
+
+    private fun ensureRecoveredAndAttached(): Boolean {
+        if (isAlive() && writer != null && reader != null) return true
+        if (isRecovering) return false
+        isRecovering = true
+        return try {
+            if (!ensureStarted(lastAppContext)) {
+                false
+            } else {
+                if (lastAttachedPid > 0) {
+                    sendRawLocked("ATTACH $lastAttachedPid")
+                    val uMask = lastRegionMask.toLong() and 0xFFFFFFFFL
+                    sendRawLocked("SET_MASK $uMask")
+                }
+                true
+            }
+        } finally {
+            isRecovering = false
+        }
+    }
+
+    private fun sendCommandLocked(
+        cmd: String,
+        onProgress: ((doneBytes: Long, totalBytes: Long, foundCount: Long) -> Unit)? = null
+    ): String? {
+        if (!ensureRecoveredAndAttached()) return null
+        val firstTry = sendRawLocked(cmd, onProgress)
+        if (firstTry != null) return firstTry
+        // 若守护进程在命令执行期间意外断开，自动重连恢复并重试一次
+        if (!ensureRecoveredAndAttached()) return null
+        return sendRawLocked(cmd, onProgress)
     }
 
     @Synchronized
     fun attach(context: Context?, pid: Int): Boolean {
-        if (!ensureStarted(context)) return false
-        val resp = sendCommandLocked("ATTACH $pid") ?: return false
+        if (context != null) {
+            lastAppContext = context.applicationContext ?: context
+        }
+        lastAttachedPid = pid
+        if (!ensureStarted(lastAppContext)) return false
+        val resp = sendRawLocked("ATTACH $pid") ?: return false
         return resp.startsWith("OK ")
     }
 
     @Synchronized
     fun setRegionMask(mask: Int): Boolean {
+        lastRegionMask = mask
         val uMask = mask.toLong() and 0xFFFFFFFFL
         val resp = sendCommandLocked("SET_MASK $uMask") ?: return false
         return resp.startsWith("OK")
@@ -253,8 +298,7 @@ object RootMemDaemon {
      */
     @Synchronized
     fun batchReadValues(items: List<Pair<Long, Int>>): Map<Long, Long> {
-        if (items.isEmpty() || !isAlive()) return emptyMap()
-        val r = reader ?: return emptyMap()
+        if (items.isEmpty() || lastAttachedPid <= 0) return emptyMap()
         val result = HashMap<Long, Long>(items.size)
         return try {
             for (chunk in items.chunked(512)) {
@@ -265,6 +309,7 @@ object RootMemDaemon {
                 }
                 val header = sendCommandLocked(sb.toString()) ?: break
                 if (!header.startsWith("OK ")) break
+                val r = reader ?: break
                 val count = header.removePrefix("OK ").trim().toIntOrNull() ?: 0
                 for (i in 0 until count) {
                     val line = r.readLine() ?: break

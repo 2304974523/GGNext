@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -139,7 +140,7 @@ fun EditSheet(ui: Ui) {
         }
     }
 
-    // 优化 2：编辑地址数值时，输入栏填充的数值默认为全选状态，便于一键覆盖
+    // 编辑地址数值时，仅默认主数值输入栏为全选状态，其余输入框不进行全选
     var valueTf by remember(firstItem) {
         mutableStateOf(TextFieldValue(initialValueText, TextRange(0, initialValueText.length)))
     }
@@ -147,7 +148,7 @@ fun EditSheet(ui: Ui) {
         mutableStateOf(TextFieldValue("", TextRange(0)))
     }
     var noteTf by remember(firstItem) {
-        mutableStateOf(TextFieldValue(firstItem.note, TextRange(0, firstItem.note.length)))
+        mutableStateOf(TextFieldValue(firstItem.note, TextRange(firstItem.note.length)))
     }
     var moreExpanded by remember { mutableStateOf(false) }
     var activeFillIndex by remember { mutableIntStateOf(-1) }
@@ -232,6 +233,7 @@ fun EditSheet(ui: Ui) {
                         activeFillIndex = -1
                     },
                     onFocus = { keyboardTarget = 1 },
+                    initialFocus = true,
                     modifier = Modifier.weight(1f).height(40.dp),
                     textStyle = monoStyle(16, Rose.Text),
                     cursorColor = Rose.Primary,
@@ -843,7 +845,7 @@ fun OffsetSheet(ui: Ui) {
     val clip = LocalClipboardManager.current
     val baseDefault = ui.contextItem?.cachedAddressHex
         ?: java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
-    var baseHex by remember { mutableStateOf(TextFieldValue(baseDefault, TextRange(0, baseDefault.length))) }
+    var baseHex by remember { mutableStateOf(TextFieldValue(baseDefault, TextRange(baseDefault.length))) }
     var offTf by remember { mutableStateOf(TextFieldValue("0", TextRange(0, 1))) }
     var focusField by remember { mutableIntStateOf(1) } // 0: baseHex, 1: offTf
     var isHex by remember { mutableStateOf(true) }
@@ -942,6 +944,7 @@ fun OffsetSheet(ui: Ui) {
                         offTf = it
                     },
                     onFocus = { focusField = 1 },
+                    initialFocus = true,
                     modifier = Modifier.weight(1f).height(36.dp),
                     textStyle = monoStyle(15, Rose.Text),
                     cursorColor = Rose.Primary,
@@ -1065,10 +1068,11 @@ fun CalcOffsetXorSheet(ui: Ui) {
     val initAddr2 = item2?.cachedAddressHex ?: java.lang.Long.toHexString((ui.memoryHighlightAddress ?: ui.memoryBase) + 4L).uppercase()
     val initVal2 = item2?.let { Formatter.signed(it.value, it.size).toString() } ?: "0"
 
+    // 仅默认主输入框 (addr1Tf) 初始全选，其余输入框不进行全选
     var addr1Tf by remember { mutableStateOf(TextFieldValue(initAddr1, TextRange(0, initAddr1.length))) }
-    var val1Tf by remember { mutableStateOf(TextFieldValue(initVal1, TextRange(0, initVal1.length))) }
-    var addr2Tf by remember { mutableStateOf(TextFieldValue(initAddr2, TextRange(0, initAddr2.length))) }
-    var val2Tf by remember { mutableStateOf(TextFieldValue(initVal2, TextRange(0, initVal2.length))) }
+    var val1Tf by remember { mutableStateOf(TextFieldValue(initVal1, TextRange(initVal1.length))) }
+    var addr2Tf by remember { mutableStateOf(TextFieldValue(initAddr2, TextRange(initAddr2.length))) }
+    var val2Tf by remember { mutableStateOf(TextFieldValue(initVal2, TextRange(initVal2.length))) }
 
     // 0: addr1Tf, 1: val1Tf, 2: addr2Tf, 3: val2Tf
     var focusField by remember { mutableIntStateOf(0) }
@@ -1095,15 +1099,20 @@ fun CalcOffsetXorSheet(ui: Ui) {
     val val2 = parseFlexLong(val2Tf.text, defaultHex = false)
 
     val offsetDiff = addr2 - addr1
-    val offsetHexStr = if (offsetDiff >= 0) {
-        "+0x" + java.lang.Long.toHexString(offsetDiff).uppercase()
-    } else {
-        "-0x" + java.lang.Long.toHexString(-offsetDiff).uppercase()
-    }
-    val addrXorHex = "0x" + java.lang.Long.toHexString(addr1 xor addr2).uppercase()
+    val absOffsetHex = java.lang.Long.toHexString(kotlin.math.abs(offsetDiff)).uppercase()
+    val offsetHexDisplay = if (offsetDiff >= 0) "+0x$absOffsetHex" else "-0x$absOffsetHex"
+    val offsetCopyRaw = if (offsetDiff >= 0) absOffsetHex else "-$absOffsetHex"
+
+    val addrXor = addr1 xor addr2
+    val addrXorHex = "0x" + java.lang.Long.toHexString(addrXor).uppercase()
+
     val valXor = val1 xor val2
-    val valXorHex = "0x" + java.lang.Long.toHexString(valXor and 0xFFFFFFFFL).uppercase() + "h"
+    val valXorHex = java.lang.Long.toHexString(valXor and 0xFFFFFFFFL).uppercase() + "h"
     val valDiff = val2 - val1
+    val valDiffDisplay = if (valDiff >= 0) "+$valDiff" else "$valDiff"
+
+    val addrKeyXor = (val1.toInt() xor addr1.toInt()).toLong() and 0xFFFFFFFFL
+    val addrKeyXorHex = "0x" + java.lang.Long.toHexString(addrKeyXor).uppercase()
 
     val activeTf = when (focusField) {
         1 -> val1Tf
@@ -1123,185 +1132,172 @@ fun CalcOffsetXorSheet(ui: Ui) {
 
     NextSheetCard(
         title = "偏移量 & 异或计算",
-        subtitle = "计算两个地址/数值间的偏移差值与异或结果（点击任意计算结果可直接复制）",
+        subtitle = "对比两组地址与数值的偏移差值及异或结果，点击结果卡片可直接复制",
         onDismiss = Session::closeSheet,
         maxBodyHeight = 760
     ) {
         Column(Modifier.verticalScroll(rememberScrollState())) {
-            // 第一组：地址 1 & 数值 1
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(
+            // 顶部快捷操作栏：状态提示 + 交换 A/B + 键盘开关
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Box(
                     Modifier
-                        .weight(1.15f)
-                        .height(44.dp)
+                        .weight(1f)
+                        .height(32.dp)
                         .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                        .border(
-                            width = 1.dp,
-                            color = if (focusField == 0) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
-                            shape = RoundedCornerShape(8.dp)
-                        )
-                        .clickableNoRipple(remember { MutableInteractionSource() }) { focusField = 0 }
                         .padding(horizontal = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    contentAlignment = Alignment.CenterStart
                 ) {
-                    Text("地址1:", color = Rose.TextSecond, fontSize = fsp(12.5f))
-                    Spacer(Modifier.width(6.dp))
-                    GgTextField(
-                        value = addr1Tf,
-                        onValueChange = { focusField = 0; addr1Tf = it },
-                        onFocus = { focusField = 0 },
-                        modifier = Modifier.weight(1f).height(34.dp),
-                        textStyle = monoStyle(13, Rose.Primary, FontWeight.SemiBold),
-                        cursorColor = Rose.Primary,
-                        suppressSystemKeyboard = showKeyboard
+                    Text(
+                        text = if (checkedList.size >= 2) {
+                            tr("已自动载入勾选列表中的前 2 个地址")
+                        } else {
+                            tr("支持十六进制地址与十进制数值实时计算")
+                        },
+                        color = Rose.TextSecond,
+                        fontSize = fsp(11.5f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
-                Row(
+                Box(
                     Modifier
-                        .weight(0.85f)
-                        .height(44.dp)
-                        .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                        .border(
-                            width = 1.dp,
-                            color = if (focusField == 1) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
-                            shape = RoundedCornerShape(8.dp)
-                        )
-                        .clickableNoRipple(remember { MutableInteractionSource() }) { focusField = 1 }
+                        .height(32.dp)
+                        .background(Rose.Chip, RoundedCornerShape(8.dp))
+                        .clickableWithTooltip {
+                            val tmpA = addr1Tf.text
+                            val tmpV = val1Tf.text
+                            addr1Tf = TextFieldValue(addr2Tf.text, TextRange(addr2Tf.text.length))
+                            val1Tf = TextFieldValue(val2Tf.text, TextRange(val2Tf.text.length))
+                            addr2Tf = TextFieldValue(tmpA, TextRange(tmpA.length))
+                            val2Tf = TextFieldValue(tmpV, TextRange(tmpV.length))
+                        }
                         .padding(horizontal = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    contentAlignment = Alignment.Center
                 ) {
-                    Text("值1:", color = Rose.TextSecond, fontSize = fsp(12.5f))
-                    Spacer(Modifier.width(6.dp))
-                    GgTextField(
-                        value = val1Tf,
-                        onValueChange = { focusField = 1; val1Tf = it },
-                        onFocus = { focusField = 1 },
-                        modifier = Modifier.weight(1f).height(34.dp),
-                        textStyle = monoStyle(13, Rose.Text),
-                        cursorColor = Rose.Primary,
-                        suppressSystemKeyboard = showKeyboard
-                    )
+                    Text(tr("交换 A/B"), color = Rose.Primary, fontSize = fsp(12f), fontWeight = FontWeight.SemiBold)
+                }
+                Box(
+                    Modifier
+                        .height(32.dp)
+                        .background(if (showKeyboard) Rose.ChipSelected else Rose.Chip, RoundedCornerShape(8.dp))
+                        .clickableWithTooltip { showKeyboard = !showKeyboard }
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(tr(if (showKeyboard) "收起键盘" else "内置键盘"), color = Rose.Text, fontSize = fsp(12f))
                 }
             }
 
-            Spacer(Modifier.height(6.dp))
+            // 输入组 A（基准地址 & 基准数值）
+            CalcEndpointInputCard(
+                badge = "A",
+                badgeColor = Rose.Primary,
+                addrLabel = "基准地址",
+                valLabel = "基准数值",
+                addrTf = addr1Tf,
+                valTf = val1Tf,
+                addrFocused = focusField == 0,
+                valFocused = focusField == 1,
+                initialAddrFocus = true,
+                suppressSystemKeyboard = showKeyboard,
+                onAddrFocus = { focusField = 0 },
+                onValFocus = { focusField = 1 },
+                onAddrChange = { focusField = 0; addr1Tf = it },
+                onValChange = { focusField = 1; val1Tf = it }
+            )
 
-            // 第二组：地址 2 & 数值 2
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(
-                    Modifier
-                        .weight(1.15f)
-                        .height(44.dp)
-                        .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                        .border(
-                            width = 1.dp,
-                            color = if (focusField == 2) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
-                            shape = RoundedCornerShape(8.dp)
-                        )
-                        .clickableNoRipple(remember { MutableInteractionSource() }) { focusField = 2 }
-                        .padding(horizontal = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("地址2:", color = Rose.TextSecond, fontSize = fsp(12.5f))
-                    Spacer(Modifier.width(6.dp))
-                    GgTextField(
-                        value = addr2Tf,
-                        onValueChange = { focusField = 2; addr2Tf = it },
-                        onFocus = { focusField = 2 },
-                        modifier = Modifier.weight(1f).height(34.dp),
-                        textStyle = monoStyle(13, Rose.Primary, FontWeight.SemiBold),
-                        cursorColor = Rose.Primary,
-                        suppressSystemKeyboard = showKeyboard
-                    )
-                }
-                Row(
-                    Modifier
-                        .weight(0.85f)
-                        .height(44.dp)
-                        .background(Rose.CardHigh, RoundedCornerShape(8.dp))
-                        .border(
-                            width = 1.dp,
-                            color = if (focusField == 3) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
-                            shape = RoundedCornerShape(8.dp)
-                        )
-                        .clickableNoRipple(remember { MutableInteractionSource() }) { focusField = 3 }
-                        .padding(horizontal = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("值2:", color = Rose.TextSecond, fontSize = fsp(12.5f))
-                    Spacer(Modifier.width(6.dp))
-                    GgTextField(
-                        value = val2Tf,
-                        onValueChange = { focusField = 3; val2Tf = it },
-                        onFocus = { focusField = 3 },
-                        modifier = Modifier.weight(1f).height(34.dp),
-                        textStyle = monoStyle(13, Rose.Text),
-                        cursorColor = Rose.Primary,
-                        suppressSystemKeyboard = showKeyboard
-                    )
-                }
-            }
+            Spacer(Modifier.height(8.dp))
+
+            // 输入组 B（目标地址 & 目标数值）
+            CalcEndpointInputCard(
+                badge = "B",
+                badgeColor = Rose.Cyan,
+                addrLabel = "目标地址",
+                valLabel = "目标数值",
+                addrTf = addr2Tf,
+                valTf = val2Tf,
+                addrFocused = focusField == 2,
+                valFocused = focusField == 3,
+                initialAddrFocus = false,
+                suppressSystemKeyboard = showKeyboard,
+                onAddrFocus = { focusField = 2 },
+                onValFocus = { focusField = 3 },
+                onAddrChange = { focusField = 2; addr2Tf = it },
+                onValChange = { focusField = 3; val2Tf = it }
+            )
 
             Spacer(Modifier.height(10.dp))
 
-            // 实时计算结果面板（点击任意行直接复制）
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .background(Rose.Row, RoundedCornerShape(10.dp))
-                    .border(1.dp, Rose.Divider, RoundedCornerShape(10.dp))
-                    .padding(10.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                CalcResultRow(
-                    label = "地址偏移 (HEX / DEC):",
-                    value = "$offsetHexStr  ($offsetDiff)",
-                    valueColor = Rose.Green
+            // 双列核心计算结果网格（点击任意卡片一键复制）
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CalcMetricTile(
+                    title = "地址偏移 (B - A)",
+                    primaryValue = offsetHexDisplay,
+                    secondaryValue = "DEC: $offsetDiff",
+                    accentColor = Rose.Green,
+                    modifier = Modifier.weight(1f)
                 ) {
-                    val copyStr = java.lang.Long.toHexString(kotlin.math.abs(offsetDiff)).uppercase()
-                    clip.setText(AnnotatedString( if (offsetDiff < 0) "-$copyStr" else copyStr ))
-                    Session.toast("已复制偏移量: $offsetHexStr")
+                    clip.setText(AnnotatedString(offsetCopyRaw))
+                    Session.toast("已复制偏移量: $offsetCopyRaw")
                 }
-                CalcResultRow(
-                    label = "数值异或 (Val1 ^ Val2):",
-                    value = "$valXor  ($valXorHex)",
-                    valueColor = Rose.Primary
+                CalcMetricTile(
+                    title = "数值异或 (A ^ B)",
+                    primaryValue = "$valXor",
+                    secondaryValue = "HEX: $valXorHex",
+                    accentColor = Rose.Primary,
+                    modifier = Modifier.weight(1f)
                 ) {
                     clip.setText(AnnotatedString(valXor.toString()))
-                    Session.toast("已复制数值异或: $valXor ($valXorHex)")
+                    Session.toast("已复制数值异或: $valXor")
                 }
-                CalcResultRow(
-                    label = "数值差值 (Val2 - Val1):",
-                    value = "${if (valDiff >= 0) "+$valDiff" else "$valDiff"}",
-                    valueColor = Rose.Yellow
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CalcMetricTile(
+                    title = "数值差值 (B - A)",
+                    primaryValue = valDiffDisplay,
+                    secondaryValue = "HEX: 0x${java.lang.Long.toHexString(kotlin.math.abs(valDiff)).uppercase()}",
+                    accentColor = Rose.Yellow,
+                    modifier = Modifier.weight(1f)
                 ) {
                     clip.setText(AnnotatedString(valDiff.toString()))
                     Session.toast("已复制数值差值: $valDiff")
                 }
-                CalcResultRow(
-                    label = "地址异或 (Addr1 ^ Addr2):",
-                    value = addrXorHex,
-                    valueColor = Rose.Cyan
+                CalcMetricTile(
+                    title = "地址异或 / 特征键",
+                    primaryValue = addrXorHex,
+                    secondaryValue = "V^A: $addrKeyXorHex",
+                    accentColor = Rose.Cyan,
+                    modifier = Modifier.weight(1f)
                 ) {
                     clip.setText(AnnotatedString(addrXorHex.removePrefix("0x")))
                     Session.toast("已复制地址异或: $addrXorHex")
                 }
             }
 
-            // 如果已勾选 ≥ 2 项，额外展示全部勾选项目的两两偏移与异或列表
+            // 如果已勾选 ≥ 2 项，展示勾选项目的快速对比列表
             if (checkedList.size >= 2) {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(10.dp))
                 Text(
-                    tr("已勾选地址两两偏移 & 异或:"),
+                    tr("已勾选地址相对于基准 A 的偏移 & 异或（点击可填入 B 并复制）"),
                     color = Rose.TextSecond,
-                    fontSize = fsp(12f),
-                    fontWeight = FontWeight.SemiBold
+                    fontSize = fsp(11.5f),
+                    fontWeight = FontWeight.Medium
                 )
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(5.dp))
                 Column(
                     Modifier
                         .fillMaxWidth()
-                        .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                        .background(Rose.CardHigh, RoundedCornerShape(10.dp))
+                        .border(1.dp, Rose.Divider, RoundedCornerShape(10.dp))
                         .padding(8.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
@@ -1313,15 +1309,18 @@ fun CalcOffsetXorSheet(ui: Ui) {
                         Row(
                             Modifier
                                 .fillMaxWidth()
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Rose.Row)
                                 .clickableWithTooltip {
                                     addr1Tf = TextFieldValue(baseItem.cachedAddressHex, TextRange(baseItem.cachedAddressHex.length))
                                     val1Tf = TextFieldValue(Formatter.signed(baseItem.value, baseItem.size).toString())
                                     addr2Tf = TextFieldValue(target.cachedAddressHex, TextRange(target.cachedAddressHex.length))
                                     val2Tf = TextFieldValue(Formatter.signed(target.value, target.size).toString())
-                                    clip.setText(AnnotatedString(offHex))
-                                    Session.toast("已填入并复制偏移 $offHex")
+                                    val rawOff = (if (off < 0) "-" else "") + java.lang.Long.toHexString(kotlin.math.abs(off)).uppercase()
+                                    clip.setText(AnnotatedString(rawOff))
+                                    Session.toast("已填入并复制偏移: $offHex")
                                 }
-                                .padding(vertical = 3.dp),
+                                .padding(horizontal = 8.dp, vertical = 5.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
@@ -1330,7 +1329,7 @@ fun CalcOffsetXorSheet(ui: Ui) {
                                 modifier = Modifier.weight(1f)
                             )
                             Text(
-                                "偏移 $offHex  异或 ${java.lang.Long.toHexString(vx).uppercase()}h",
+                                "$offHex  |  ^${java.lang.Long.toHexString(vx).uppercase()}h",
                                 style = monoStyle(11, Rose.Green, FontWeight.SemiBold)
                             )
                         }
@@ -1341,20 +1340,19 @@ fun CalcOffsetXorSheet(ui: Ui) {
             Spacer(Modifier.height(10.dp))
 
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                RoseButton("复制偏移", Modifier.weight(1f)) {
-                    val copyStr = (if (offsetDiff < 0) "-" else "") + java.lang.Long.toHexString(kotlin.math.abs(offsetDiff)).uppercase()
-                    clip.setText(AnnotatedString(copyStr))
-                    Session.toast("已复制偏移量: $copyStr")
+                RoseButton("复制偏移", Modifier.weight(1f).height(40.dp)) {
+                    clip.setText(AnnotatedString(offsetCopyRaw))
+                    Session.toast("已复制偏移量: $offsetCopyRaw")
                 }
-                RoseButton("复制异或", Modifier.weight(1f)) {
-                    val xorHex = java.lang.Long.toHexString(valXor and 0xFFFFFFFFL).uppercase() + "h"
-                    clip.setText(AnnotatedString(xorHex))
-                    Session.toast("已复制异或值: $xorHex")
+                RoseButton("复制异或", Modifier.weight(1f).height(40.dp)) {
+                    clip.setText(AnnotatedString(valXorHex))
+                    Session.toast("已复制异或值: $valXorHex")
                 }
-                RoseButton(if (showKeyboard) "收起键盘" else "键盘", Modifier.weight(1f)) {
-                    showKeyboard = !showKeyboard
+                RoseButton("转到 B", Modifier.weight(1f).height(40.dp)) {
+                    Session.goto(addr2, recordHistory = true, highlightTarget = true)
+                    Session.closeSheet()
                 }
-                RoseButton("关闭", Modifier.weight(0.9f), filled = true) {
+                RoseButton("关闭", Modifier.weight(0.9f).height(40.dp), filled = true) {
                     Session.closeSheet()
                 }
             }
@@ -1374,23 +1372,138 @@ fun CalcOffsetXorSheet(ui: Ui) {
 }
 
 @Composable
-private fun CalcResultRow(
-    label: String,
-    value: String,
-    valueColor: Color,
-    onClick: () -> Unit
+private fun CalcEndpointInputCard(
+    badge: String,
+    badgeColor: Color,
+    addrLabel: String,
+    valLabel: String,
+    addrTf: TextFieldValue,
+    valTf: TextFieldValue,
+    addrFocused: Boolean,
+    valFocused: Boolean,
+    initialAddrFocus: Boolean,
+    suppressSystemKeyboard: Boolean,
+    onAddrFocus: () -> Unit,
+    onValFocus: () -> Unit,
+    onAddrChange: (TextFieldValue) -> Unit,
+    onValChange: (TextFieldValue) -> Unit
 ) {
     Row(
         Modifier
             .fillMaxWidth()
-            .clickableWithTooltip(onClick = onClick)
-            .padding(vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .background(Rose.Row, RoundedCornerShape(11.dp))
+            .border(1.dp, Rose.Divider, RoundedCornerShape(11.dp))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Text(tr(label), color = Rose.TextSecond, fontSize = fsp(12.5f), modifier = Modifier.weight(1f))
-        Text(value, style = monoStyle(13, valueColor, FontWeight.Bold))
-        Spacer(Modifier.width(6.dp))
-        Icon(Icons.Rounded.ContentCopy, null, tint = Rose.TextDim, modifier = Modifier.size(14.dp))
+        Box(
+            Modifier
+                .size(28.dp)
+                .background(badgeColor.copy(alpha = 0.18f), RoundedCornerShape(8.dp))
+                .border(1.dp, badgeColor.copy(alpha = 0.45f), RoundedCornerShape(8.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(badge, color = badgeColor, fontSize = fsp(13f), fontWeight = FontWeight.Bold)
+        }
+
+        Column(
+            Modifier
+                .weight(1.18f)
+                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                .border(
+                    width = 1.dp,
+                    color = if (addrFocused) badgeColor.copy(alpha = 0.7f) else Rose.Divider,
+                    shape = RoundedCornerShape(8.dp)
+                )
+                .clickableNoRipple(remember { MutableInteractionSource() }, onClick = onAddrFocus)
+                .padding(horizontal = 9.dp, vertical = 5.dp)
+        ) {
+            Text(tr(addrLabel), color = Rose.TextDim, fontSize = fsp(10.5f))
+            GgTextField(
+                value = addrTf,
+                onValueChange = onAddrChange,
+                onFocus = onAddrFocus,
+                initialFocus = initialAddrFocus,
+                modifier = Modifier.fillMaxWidth().height(26.dp),
+                textStyle = monoStyle(13, badgeColor, FontWeight.SemiBold),
+                cursorColor = badgeColor,
+                suppressSystemKeyboard = suppressSystemKeyboard,
+                placeholder = "HEX 地址"
+            )
+        }
+
+        Column(
+            Modifier
+                .weight(0.92f)
+                .background(Rose.CardHigh, RoundedCornerShape(8.dp))
+                .border(
+                    width = 1.dp,
+                    color = if (valFocused) badgeColor.copy(alpha = 0.7f) else Rose.Divider,
+                    shape = RoundedCornerShape(8.dp)
+                )
+                .clickableNoRipple(remember { MutableInteractionSource() }, onClick = onValFocus)
+                .padding(horizontal = 9.dp, vertical = 5.dp)
+        ) {
+            Text(tr(valLabel), color = Rose.TextDim, fontSize = fsp(10.5f))
+            GgTextField(
+                value = valTf,
+                onValueChange = onValChange,
+                onFocus = onValFocus,
+                modifier = Modifier.fillMaxWidth().height(26.dp),
+                textStyle = monoStyle(13, Rose.Text),
+                cursorColor = badgeColor,
+                suppressSystemKeyboard = suppressSystemKeyboard,
+                placeholder = "数值"
+            )
+        }
+    }
+}
+
+@Composable
+private fun CalcMetricTile(
+    title: String,
+    primaryValue: String,
+    secondaryValue: String,
+    accentColor: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(Rose.Row)
+            .border(1.dp, Rose.Divider, RoundedCornerShape(10.dp))
+            .clickableWithTooltip(onClick = onClick)
+            .padding(horizontal = 11.dp, vertical = 8.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                tr(title),
+                color = Rose.TextSecond,
+                fontSize = fsp(11.5f),
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Icon(Icons.Rounded.ContentCopy, null, tint = Rose.TextDim, modifier = Modifier.size(13.dp))
+        }
+        Spacer(Modifier.height(3.dp))
+        Text(
+            text = primaryValue,
+            style = monoStyle(14, accentColor, FontWeight.Bold),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = secondaryValue,
+            style = monoStyle(11, Rose.TextDim),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -2170,7 +2283,10 @@ fun FileBrowserSheet(ui: Ui) {
                     .heightIn(min = 240.dp, max = 360.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(entries, key = { it.fullPath }) { entry ->
+                itemsIndexed(
+                    entries,
+                    key = { idx, it -> "${idx}_${it.fullPath}" }
+                ) { _, entry ->
                     BrowserEntryRow(
                         entry = entry,
                         onClick = {
@@ -2509,8 +2625,8 @@ private fun loadBrowserEntries(
 fun CopyMemorySheet(ui: Ui) {
     val initHex = java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
     var fromTf by remember { mutableStateOf(TextFieldValue(initHex, TextRange(0, initHex.length))) }
-    var toTf by remember { mutableStateOf(TextFieldValue("00000000", TextRange(0, 8))) }
-    var bytesTf by remember { mutableStateOf(TextFieldValue("0", TextRange(0, 1))) }
+    var toTf by remember { mutableStateOf(TextFieldValue("00000000", TextRange(8))) }
+    var bytesTf by remember { mutableStateOf(TextFieldValue("0", TextRange(1))) }
     var focusField by remember { mutableStateOf(0) } // 0: from, 1: to, 2: bytes
     var showKeyboard by remember { mutableStateOf(true) }
 
@@ -2539,6 +2655,7 @@ fun CopyMemorySheet(ui: Ui) {
                         fromTf = it
                     },
                     onFocus = { focusField = 0 },
+                    initialFocus = true,
                     modifier = Modifier.weight(1f).height(36.dp),
                     textStyle = monoStyle(15, Rose.Text),
                     cursorColor = Rose.Primary,
@@ -2681,14 +2798,14 @@ fun CopyMemorySheet(ui: Ui) {
 fun DumpSheet(ui: Ui) {
     var fromTf by remember {
         val hex = java.lang.Long.toHexString(ui.memoryBase).uppercase()
-        mutableStateOf(TextFieldValue(hex, TextRange(0, hex.length)))
+        mutableStateOf(TextFieldValue(hex, TextRange(hex.length)))
     }
     var toTf by remember {
         val endHex = java.lang.Long.toHexString(ui.memoryBase + 0x10000L).uppercase()
         mutableStateOf(TextFieldValue(endHex, TextRange(0, endHex.length)))
     }
     var pathTf by remember(ui.dumpDirPath) {
-        mutableStateOf(TextFieldValue(ui.dumpDirPath, TextRange(0, ui.dumpDirPath.length)))
+        mutableStateOf(TextFieldValue(ui.dumpDirPath, TextRange(ui.dumpDirPath.length)))
     }
     var focusTarget by remember { mutableIntStateOf(1) } // 0=from, 1=to, 2=path
     var showKeyboard by remember { mutableStateOf(true) }
@@ -3059,13 +3176,12 @@ fun SpeedSheet(ui: Ui) {
 @Composable
 fun LanguageSheet() {
     val ui = Session.ui.value
-    val cur = ui.settings["language"] ?: "0"
+    val cur = if (ui.settings["language"] == "1") "1" else "0"
     val langs = listOf(
-        "0" to "简体中文 (Simplified Chinese)",
-        "2" to "繁體中文 (Traditional Chinese)",
+        "0" to "简体中文",
         "1" to "English"
     )
-    NextSheetCard(title = "选择语言 (Language)", onDismiss = Session::closeSheet) {
+    NextSheetCard(title = "选择语言", onDismiss = Session::closeSheet) {
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             langs.forEach { (code, name) ->
                 val selected = cur == code
@@ -3234,7 +3350,7 @@ fun AboutSheet(ui: Ui) {
                     .padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Text("GGNext v0.4", color = Rose.Text, fontSize = fsp(15.5f), fontWeight = FontWeight.SemiBold)
+                Text("GGNext v0.5", color = Rose.Text, fontSize = fsp(15.5f), fontWeight = FontWeight.SemiBold)
                 Text(
                     tr("开源内存分析与调试工具，遵循 GNU General Public License v3.0 协议发布。"),
                     color = Rose.TextSecond,

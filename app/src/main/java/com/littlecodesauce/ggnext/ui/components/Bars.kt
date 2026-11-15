@@ -228,36 +228,9 @@ private fun NavIcon(
 ) {
     var pressed by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(
-        targetValue = when {
-            pressed -> 0.88f
-            selected -> 1.08f
-            else -> 1f
-        },
-        animationSpec = spring(
-            dampingRatio = 0.58f,
-            stiffness = Spring.StiffnessMedium
-        ),
+        targetValue = if (pressed) 0.9f else 1f,
+        animationSpec = Motion.Fast,
         label = "navScale"
-    )
-    val iconLiftPx by animateFloatAsState(
-        targetValue = if (selected) -3.5f else 0f,
-        animationSpec = spring(
-            dampingRatio = 0.62f,
-            stiffness = Spring.StiffnessMediumLow
-        ),
-        label = "navLift"
-    )
-    val iconTiltDeg by animateFloatAsState(
-        targetValue = when {
-            pressed -> -8f
-            selected -> if (desc == "设置") 24f else -5f
-            else -> 0f
-        },
-        animationSpec = spring(
-            dampingRatio = 0.55f,
-            stiffness = Spring.StiffnessLow
-        ),
-        label = "navTilt"
     )
     val tint by animateColorAsState(
         if (selected) primary else Rose.Text,
@@ -280,12 +253,7 @@ private fun NavIcon(
             imageVector = icon,
             contentDescription = desc,
             tint = tint,
-            modifier = Modifier
-                .size(22.dp)
-                .graphicsLayer {
-                    translationY = iconLiftPx
-                    rotationZ = iconTiltDeg
-                }
+            modifier = Modifier.size(22.dp)
         )
         if (badgeCount > 0) {
             Box(

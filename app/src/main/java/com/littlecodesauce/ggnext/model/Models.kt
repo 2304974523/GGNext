@@ -17,6 +17,8 @@ data class MemoryItem(
     var pointer: Int = 0,
     /** 上一次搜索/修改前的值，用于“恢复所选”与“模糊搜索/仅保留有变化的结果” */
     var previousValue: Long = value,
+    /** 是否由用户手动修改（仅在手动修改时在数值后显示修改前的值） */
+    var manuallyEdited: Boolean = false,
     /** 自定义备注（批量修改时可写入） */
     var note: String = ""
 ) {

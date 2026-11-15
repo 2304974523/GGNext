@@ -44,7 +44,10 @@ class ParserTest {
         assertEquals(ValueType.SIGN_EQUAL, r.sign)
 
         val inv = NumberParser.parse("10~~20", ValueType.DWORD)
-        assertEquals(ValueType.SIGN_NOT_EQUAL, inv.sign)
+        assertEquals(NumberParser.Kind.RANGE, inv.kind)
+        assertTrue(inv.notRange)
+        assertEquals(10L, inv.numbers[0])
+        assertEquals(20L, inv.to[0])
     }
 
     @Test
@@ -74,9 +77,15 @@ class ParserTest {
 
     @Test
     fun parseXorQuery() {
-        val x = NumberParser.parse("100X8", ValueType.DWORD)
-        assertEquals(100L, x.numbers[0])
-        assertEquals(8L, x.xorKey)
+        val off = NumberParser.parse("100X8", ValueType.DWORD)
+        assertEquals(100L, off.numbers[0])
+        assertEquals(8, off.xorOffset)
+        assertEquals(0L, off.xorKey)
+
+        val key = NumberParser.parse("100X8h", ValueType.DWORD)
+        assertEquals(100L, key.numbers[0])
+        assertEquals(8L, key.xorKey)
+        assertEquals(0, key.xorOffset)
     }
 
     @Test

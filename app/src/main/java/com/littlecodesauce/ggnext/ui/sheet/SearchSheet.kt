@@ -75,22 +75,22 @@ fun SearchSheet(ui: Ui) {
     // 界面问题 7：统一提升搜索面板全部输入框状态，支持在不同输入框（主搜索词 / 从 / 到 / 附近地址 / 附近距离 / 地址蒙版）间自由切换焦点与光标
     var tf by remember { mutableStateOf(TextFieldValue(ui.search.text, TextRange(0, ui.search.text.length))) }
     var fromTf by remember {
-        mutableStateOf(TextFieldValue(ui.search.rangeFrom, TextRange(0, ui.search.rangeFrom.length)))
+        mutableStateOf(TextFieldValue(ui.search.rangeFrom, TextRange(ui.search.rangeFrom.length)))
     }
     var toTf by remember {
-        mutableStateOf(TextFieldValue(ui.search.rangeTo, TextRange(0, ui.search.rangeTo.length)))
+        mutableStateOf(TextFieldValue(ui.search.rangeTo, TextRange(ui.search.rangeTo.length)))
     }
     var addrTf by remember {
         val cur = ui.search.nearbyAddress.ifEmpty {
             java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
         }
-        mutableStateOf(TextFieldValue(cur, TextRange(0, cur.length)))
+        mutableStateOf(TextFieldValue(cur, TextRange(cur.length)))
     }
     var distTf by remember {
-        mutableStateOf(TextFieldValue(ui.search.nearbyDistance, TextRange(0, ui.search.nearbyDistance.length)))
+        mutableStateOf(TextFieldValue(ui.search.nearbyDistance, TextRange(ui.search.nearbyDistance.length)))
     }
     var maskTf by remember {
-        mutableStateOf(TextFieldValue(ui.search.mask, TextRange(0, ui.search.mask.length)))
+        mutableStateOf(TextFieldValue(ui.search.mask, TextRange(ui.search.mask.length)))
     }
     // 0: 主搜索框 tf, 1: 从(fromTf), 2: 到(toTf), 3: 附近地址(addrTf), 4: 附近距离(distTf), 5: 地址蒙版(maskTf)
     var activeField by remember { mutableIntStateOf(0) }
@@ -233,6 +233,7 @@ fun SearchSheet(ui: Ui) {
                         Session.updateSearch { s -> s.copy(text = it.text) }
                     },
                     onFocus = { activeField = 0 },
+                    initialFocus = true,
                     modifier = Modifier.weight(1f).height(40.dp),
                     textStyle = monoStyle(15, Rose.Text),
                     cursorColor = Rose.Primary,
@@ -696,19 +697,19 @@ fun FilterSearchSheet(ui: Ui) {
         mutableStateOf(TextFieldValue(s, TextRange(0, s.length)))
     }
     var addrGreatTf by remember(ui.filter.addrGreat) {
-        mutableStateOf(TextFieldValue(ui.filter.addrGreat, TextRange(0, ui.filter.addrGreat.length)))
+        mutableStateOf(TextFieldValue(ui.filter.addrGreat, TextRange(ui.filter.addrGreat.length)))
     }
     var addrLessTf by remember(ui.filter.addrLess) {
-        mutableStateOf(TextFieldValue(ui.filter.addrLess, TextRange(0, ui.filter.addrLess.length)))
+        mutableStateOf(TextFieldValue(ui.filter.addrLess, TextRange(ui.filter.addrLess.length)))
     }
     var valGreatTf by remember(ui.filter.valGreat) {
-        mutableStateOf(TextFieldValue(ui.filter.valGreat, TextRange(0, ui.filter.valGreat.length)))
+        mutableStateOf(TextFieldValue(ui.filter.valGreat, TextRange(ui.filter.valGreat.length)))
     }
     var valLessTf by remember(ui.filter.valLess) {
-        mutableStateOf(TextFieldValue(ui.filter.valLess, TextRange(0, ui.filter.valLess.length)))
+        mutableStateOf(TextFieldValue(ui.filter.valLess, TextRange(ui.filter.valLess.length)))
     }
     var fracTf by remember(ui.filter.fractional) {
-        mutableStateOf(TextFieldValue(ui.filter.fractional, TextRange(0, ui.filter.fractional.length)))
+        mutableStateOf(TextFieldValue(ui.filter.fractional, TextRange(ui.filter.fractional.length)))
     }
 
     val activeTf = when (focusedField) {
@@ -767,6 +768,7 @@ fun FilterSearchSheet(ui: Ui) {
         Modifier
             .padding(horizontal = 10.dp)
             .fillMaxWidth()
+            .clickableNoRipple(remember { MutableInteractionSource() }) {}
             .background(Rose.Card.copy(alpha = cardAlpha), RoundedCornerShape(corner))
             .border(1.dp, Rose.Divider, RoundedCornerShape(corner))
             .padding(top = 10.dp, bottom = 8.dp)
@@ -1296,22 +1298,24 @@ fun FuzzySearchSheet(ui: Ui) {
 
     // 界面问题 7：统一提升模糊搜索全部输入框状态，支持多输入栏焦点与内置软键盘无缝切换
     var deltaTf by remember(fz.deltaText) {
-        mutableStateOf(TextFieldValue(fz.deltaText, TextRange(0, fz.deltaText.length)))
+        val sel = if (hasResults) TextRange(0, fz.deltaText.length) else TextRange(fz.deltaText.length)
+        mutableStateOf(TextFieldValue(fz.deltaText, sel))
     }
     var fromTf by remember {
-        mutableStateOf(TextFieldValue(fz.rangeFrom, TextRange(0, fz.rangeFrom.length)))
+        val sel = if (!hasResults) TextRange(0, fz.rangeFrom.length) else TextRange(fz.rangeFrom.length)
+        mutableStateOf(TextFieldValue(fz.rangeFrom, sel))
     }
     var toTf by remember {
-        mutableStateOf(TextFieldValue(fz.rangeTo, TextRange(0, fz.rangeTo.length)))
+        mutableStateOf(TextFieldValue(fz.rangeTo, TextRange(fz.rangeTo.length)))
     }
     var addrTf by remember {
         val cur = fz.nearbyAddress.ifEmpty {
             java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
         }
-        mutableStateOf(TextFieldValue(cur, TextRange(0, cur.length)))
+        mutableStateOf(TextFieldValue(cur, TextRange(cur.length)))
     }
     var distTf by remember {
-        mutableStateOf(TextFieldValue(fz.nearbyDistance, TextRange(0, fz.nearbyDistance.length)))
+        mutableStateOf(TextFieldValue(fz.nearbyDistance, TextRange(fz.nearbyDistance.length)))
     }
     // 0: deltaTf, 1: fromTf, 2: toTf, 3: addrTf, 4: distTf
     var activeField by remember { mutableIntStateOf(if (hasResults) 0 else 1) }
@@ -1362,6 +1366,7 @@ fun FuzzySearchSheet(ui: Ui) {
         Modifier
             .padding(horizontal = 10.dp)
             .fillMaxWidth()
+            .clickableNoRipple(remember { MutableInteractionSource() }) {}
             .background(Rose.Card.copy(alpha = cardAlpha), RoundedCornerShape(corner))
             .border(1.dp, Rose.Divider, RoundedCornerShape(corner))
             .padding(horizontal = 14.dp, vertical = 12.dp)
@@ -1975,7 +1980,7 @@ fun MaskSearchSheet(ui: Ui) {
         mutableStateOf(TextFieldValue(init, TextRange(0, init.length)))
     }
     var maskTf by remember {
-        mutableStateOf(TextFieldValue(ui.search.mask, TextRange(0, ui.search.mask.length)))
+        mutableStateOf(TextFieldValue(ui.search.mask, TextRange(ui.search.mask.length)))
     }
     var focusMask by remember { mutableStateOf(false) }
     var showKeyboard by remember { mutableStateOf(true) }
@@ -2113,7 +2118,7 @@ fun PointerSearchSheet(ui: Ui) {
     }
     var offsetTf by remember {
         val offInit = ui.search.offset.ifEmpty { "200" }
-        mutableStateOf(TextFieldValue(offInit, TextRange(0, offInit.length)))
+        mutableStateOf(TextFieldValue(offInit, TextRange(offInit.length)))
     }
     var focusOffset by remember { mutableStateOf(false) }
     var showKeyboard by remember { mutableStateOf(true) }

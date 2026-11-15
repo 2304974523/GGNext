@@ -155,7 +155,7 @@ object I18n {
         "使用帮助与语法指南" to "Help & Syntax Guide",
         "了解精确搜索、模糊搜索、联合搜索与批量修改用法" to "Learn exact, fuzzy, group search & batch editing",
         "关于软件" to "About App",
-        "GGNext v0.4 · 查看软件信息与更新日志" to "GGNext v0.4 · App info & changelog",
+        "GGNext v0.5 · 查看软件信息与更新日志" to "GGNext v0.5 · App info & changelog",
         "管理软件语言、主题配色、背景透明度、页面屏幕占比与关于信息" to "Manage language, theme, opacity, screen ratio & about info",
         "语言与区域" to "Language & Region",
         "切换" to "Switch",
@@ -186,9 +186,9 @@ object I18n {
         "列表入场与骨架屏动画" to "List Enter & Skeleton Animation",
         "关于与支持" to "About & Support",
         "关于 GGNext" to "About GGNext",
-        "版本 v0.4 · 架构与环境信息" to "Version v0.4 · Architecture & environment",
+        "版本 v0.5 · 架构与环境信息" to "Version v0.5 · Architecture & environment",
         "更新日志" to "Changelog",
-        "查看 v0.4 版本优化与修复详情" to "View v0.4 optimizations & bug fixes",
+        "查看 v0.5 版本优化与修复详情" to "View v0.5 optimizations & bug fixes",
         "使用帮助" to "User Guide",
         "搜索语法与功能说明" to "Search syntax & feature reference",
         "软件运行日志" to "Runtime Log",
@@ -627,15 +627,23 @@ fun GgTextField(
     textStyle: TextStyle = monoStyle(15, Rose.Text),
     cursorColor: Color = Rose.Primary,
     suppressSystemKeyboard: Boolean = true,
-    autoSelectOnFocus: Boolean = true,
+    autoSelectOnFocus: Boolean = false,
+    initialFocus: Boolean = false,
     onFocus: (() -> Unit)? = null
 ) {
     val focusRequester = remember { FocusRequester() }
     val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
     var wasFocused by remember { mutableStateOf(false) }
     var showContextMenu by remember { mutableStateOf(false) }
+    var textLayoutResult by remember { mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null) }
     val currentVal by androidx.compose.runtime.rememberUpdatedState(value)
     val currentOnValueChange by androidx.compose.runtime.rememberUpdatedState(onValueChange)
+
+    if (initialFocus) {
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            runCatching { focusRequester.requestFocus() }
+        }
+    }
 
     Box(
         modifier = modifier,
@@ -656,6 +664,7 @@ fun GgTextField(
                 singleLine = true,
                 textStyle = textStyle,
                 cursorBrush = SolidColor(cursorColor),
+                onTextLayout = { textLayoutResult = it },
                 keyboardOptions = KeyboardOptions(
                     capitalization = KeyboardCapitalization.None,
                     autoCorrectEnabled = false,
@@ -669,41 +678,13 @@ fun GgTextField(
                         if (focusState.isFocused && !wasFocused) {
                             wasFocused = true
                             onFocus?.invoke()
-                            if (autoSelectOnFocus && currentVal.text.isNotEmpty()) {
-                                currentOnValueChange(
-                                    currentVal.copy(selection = androidx.compose.ui.text.TextRange(0, currentVal.text.length))
-                                )
-                            }
                         } else if (!focusState.isFocused) {
                             wasFocused = false
                         }
                     },
                 decorationBox = { innerTextField ->
                     Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .then(
-                                Modifier.pointerInput(Unit) {
-                                    detectTapGestures(
-                                        onLongPress = {
-                                            focusRequester.requestFocus()
-                                            onFocus?.invoke()
-                                            showContextMenu = true
-                                        },
-                                        onTap = {
-                                            focusRequester.requestFocus()
-                                            onFocus?.invoke()
-                                            if (autoSelectOnFocus && currentVal.text.isNotEmpty() && currentVal.selection.collapsed) {
-                                                currentOnValueChange(
-                                                    currentVal.copy(
-                                                        selection = androidx.compose.ui.text.TextRange(0, currentVal.text.length)
-                                                    )
-                                                )
-                                            }
-                                        }
-                                    )
-                                }
-                            ),
+                        modifier = Modifier.fillMaxWidth(),
                         contentAlignment = Alignment.CenterStart
                     ) {
                         if (value.text.isEmpty() && placeholder.isNotEmpty()) {
@@ -714,9 +695,68 @@ fun GgTextField(
                                 overflow = TextOverflow.Ellipsis
                             )
                         }
-                        Box(contentAlignment = Alignment.CenterStart) {
+                        Box(
+                            modifier = Modifier.fillMaxWidth(),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
                             innerTextField()
                         }
+                        Box(
+                            modifier = Modifier
+                                .matchParentSize()
+                                .pointerInput(Unit) {
+                                    var lastTapTimeMs = 0L
+                                    var lastTapX = -1000f
+                                    detectTapGestures(
+                                        onLongPress = {
+                                            focusRequester.requestFocus()
+                                            onFocus?.invoke()
+                                            showContextMenu = true
+                                        },
+                                        onTap = { tapOffset ->
+                                            focusRequester.requestFocus()
+                                            onFocus?.invoke()
+                                            val text = currentVal.text
+                                            if (text.isEmpty()) {
+                                                currentOnValueChange(
+                                                    currentVal.copy(selection = androidx.compose.ui.text.TextRange.Zero)
+                                                )
+                                                return@detectTapGestures
+                                            }
+                                            val layout = textLayoutResult
+                                            val targetOffset = if (layout != null) {
+                                                val centerY = layout.size.height / 2f
+                                                layout.getOffsetForPosition(Offset(tapOffset.x, centerY))
+                                                    .coerceIn(0, text.length)
+                                            } else {
+                                                text.length
+                                            }
+                                            val now = android.os.SystemClock.uptimeMillis()
+                                            val hadSelection = !currentVal.selection.collapsed
+                                            val isRapidDoubleTap = !hadSelection &&
+                                                (now - lastTapTimeMs) in 40L..280L &&
+                                                kotlin.math.abs(tapOffset.x - lastTapX) < 28.dp.toPx()
+
+                                            if (isRapidDoubleTap) {
+                                                lastTapTimeMs = 0L
+                                                currentOnValueChange(
+                                                    currentVal.copy(
+                                                        selection = androidx.compose.ui.text.TextRange(0, text.length)
+                                                    )
+                                                )
+                                            } else {
+                                                lastTapTimeMs = now
+                                                lastTapX = tapOffset.x
+                                                currentOnValueChange(
+                                                    currentVal.copy(
+                                                        selection = androidx.compose.ui.text.TextRange(targetOffset)
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    )
+                                }
+                        )
                     }
                 }
             )

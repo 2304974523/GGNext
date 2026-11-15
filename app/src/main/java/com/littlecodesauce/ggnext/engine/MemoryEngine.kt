@@ -928,13 +928,13 @@ class MemoryEngine {
                         typesArr,
                         intArr,
                         fltArr,
+                        intMaxArr,
+                        fltMaxArr,
+                        opsArr,
                         c.area.coerceIn(2, 65536),
                         c.ordered,
                         true,
-                        onProgress,
-                        intMaxArr,
-                        fltMaxArr,
-                        opsArr
+                        onProgress
                     )
                 }
                 c.xorOffset != 0 -> {
@@ -970,7 +970,7 @@ class MemoryEngine {
                         onProgress
                     )
                 }
-                c.isRange -> {
+                c.isRange && !c.notRange -> {
                     RootMemDaemon.searchRange(
                         nativeDt,
                         minOf(c.from, c.to),
@@ -1139,12 +1139,12 @@ class MemoryEngine {
                         typesArr,
                         intArr,
                         fltArr,
-                        c.area.coerceIn(2, 65536),
-                        c.ordered,
-                        true,
                         intMaxArr,
                         fltMaxArr,
-                        opsArr
+                        opsArr,
+                        c.area.coerceIn(2, 65536),
+                        c.ordered,
+                        true
                     )
                 }
                 c.xorOffset != 0 -> {

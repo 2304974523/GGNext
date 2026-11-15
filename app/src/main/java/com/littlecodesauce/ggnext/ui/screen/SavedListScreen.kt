@@ -89,7 +89,7 @@ fun SavedListScreen(ui: Ui) {
         ) {
             itemsIndexed(
                 items = ui.saved,
-                key = { _, i -> i.address },
+                key = { idx, i -> "${i.address}_${i.flags}_$idx" },
                 contentType = { _, _ -> "saved_row" }
             ) { idx, item ->
                 SavedRow(item, ui.valueMaskSaved, idx)

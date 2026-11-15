@@ -198,16 +198,12 @@ fun GgNextTheme(
         )
     )
 
-    // Bug 1 修复：使用 key(...) 包裹主题子树，确保切换浅色/深色模式、预设主题或语言时，
-    // 所有子组件在同一帧内 100% 重新组合并立即应用新文字与背景颜色，绝不残留旧帧白色文字。
-    key(activePreset, activeDarkMode, activeDynamic, systemDark, lang) {
-        CompositionLocalProvider(
-            LocalUiMetrics provides m,
-            LocalContentColor provides computedPalette.text
-        ) {
-            MaterialTheme(colorScheme = scheme, typography = typography) {
-                content()
-            }
+    CompositionLocalProvider(
+        LocalUiMetrics provides m,
+        LocalContentColor provides computedPalette.text
+    ) {
+        MaterialTheme(colorScheme = scheme, typography = typography) {
+            content()
         }
     }
 }

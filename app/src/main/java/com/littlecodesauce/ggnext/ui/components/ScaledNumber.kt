@@ -17,7 +17,7 @@ import com.littlecodesauce.ggnext.ui.theme.typeColor
  */
 @Composable
 fun ScaledNumber(item: MemoryItem, mask: Int) {
-    val text = remember(item.value, item.previousValue, item.flags, mask) {
+    val text = remember(item.value, item.previousValue, item.manuallyEdited, item.flags, mask) {
         valueTextWithMask(item, mask)
     }
     val color = remember(item.flags) { typeColor(item.flags) }
@@ -49,8 +49,8 @@ fun previousValueText(item: MemoryItem): String = when (item.flags and 0x7F) {
 
 fun valueTextWithMask(item: MemoryItem, mask: Int): String {
     val curVal = valueText(item)
-    // Bug 2 修复：当数值发生变动时，像原版 GG 一样在当前值后附加 (原先数值)
-    val base = if (item.value != item.previousValue) {
+    // 仅当用户手动修改过该地址数值时，才在后方展示修改前的数值
+    val base = if (item.manuallyEdited && item.value != item.previousValue) {
         "$curVal (${previousValueText(item)})"
     } else {
         curVal

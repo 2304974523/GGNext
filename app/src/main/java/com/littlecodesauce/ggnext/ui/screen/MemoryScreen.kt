@@ -107,7 +107,7 @@ fun MemoryScreen(ui: Ui) {
                 ) {
                     itemsIndexed(
                         items = ui.memoryRows,
-                        key = { _, i -> i.address },
+                        key = { idx, i -> "${i.address}_$idx" },
                         contentType = { _, _ -> "mem_row" }
                     ) { _, item ->
                         MemoryRow(
@@ -233,9 +233,10 @@ private fun MemoryRow(
         Spacer(Modifier.width(10.dp))
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.clickableWithTooltip {
-                Session.openSheet(Sheet.EDITOR, currentItem, singleEdit = true)
-            }
+            modifier = Modifier.clickableLongPress(
+                onClick = { Session.openSheet(Sheet.EDITOR, currentItem, singleEdit = true) },
+                onLongPress = { Session.openSheet(Sheet.CONTEXT, currentItem) }
+            )
         ) {
             Text(text = formattedVal, style = monoStyle(13, accent, weight = FontWeight.Medium))
             Spacer(Modifier.width(2.dp))

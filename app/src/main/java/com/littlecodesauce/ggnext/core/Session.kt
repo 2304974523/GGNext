@@ -271,7 +271,8 @@ data class Ui(
     val floatingBallVisible: Boolean = false,
     val panelVisible: Boolean = false,
     val speedBarExpanded: Boolean = false,
-    val speedMultiplier: Float = 1.0f
+    val speedMultiplier: Float = 1.0f,
+    val homeSettingsOpen: Boolean = false
 ) {
     val currentMask: Int get() = if (tab == NextTab.SAVED_LIST) valueMaskSaved else valueMask
     val currentPinnedTools: List<ToolId> get() = pinnedTools[tab] ?: DEFAULT_PINNED_TOOLS
@@ -420,8 +421,8 @@ object Session {
             attach(target, silent = true, forceReattach = true)
         }
         toast(when (mode) {
-            WorkMode.ROOT -> if (hasRoot) "已切换至 Root 模式 (UID 0)" else "已切换至 Root 模式（未检测到 Root 授权）"
-            WorkMode.NO_ROOT -> "已切换至免 Root 模式（共享 UID / 虚拟空间）"
+            WorkMode.ROOT -> if (hasRoot) "已切换至 Root 模式" else "已切换至 Root 模式，未检测到 Root 授权"
+            WorkMode.NO_ROOT -> "已切换至免 Root 模式"
         })
     }
 
@@ -435,9 +436,9 @@ object Session {
             attach(target, silent = true, forceReattach = true)
         }
         if (hasRoot) {
-            toast("Root 权限已获取 (UID 0)")
+            toast("Root 权限已获取")
         } else if (promptIfMissing) {
-            toast("未检测到 Root 权限，请在 Magisk/KernelSU/APatch 中授权或切换到免 Root 模式")
+            toast("未检测到 Root 权限，请在管理器中授权或切换到免 Root 模式")
         }
     }
 
@@ -627,6 +628,10 @@ object Session {
         setSetting("disclaimer_v1_accepted", "1")
     }
 
+    fun setHomeSettingsOpen(open: Boolean) {
+        _ui.update { it.copy(homeSettingsOpen = open) }
+    }
+
     fun setFloatingBallVisible(visible: Boolean) = _ui.update {
         it.copy(
             floatingBallVisible = visible,
@@ -697,7 +702,7 @@ object Session {
         val next = !st.speedBarExpanded
         st.copy(
             speedBarExpanded = next,
-            toast = if (next) "变速控制已展开 (当前 ${st.speedText})" else null
+            toast = if (next) "变速控制已展开：${st.speedText}" else null
         )
     }
 
@@ -723,7 +728,7 @@ object Session {
     }
 
     fun resetSpeed() = _ui.update { st ->
-        st.copy(speedMultiplier = 1.0f, toast = "已恢复正常速度 (1.0x)")
+        st.copy(speedMultiplier = 1.0f, toast = "已恢复正常速度 1.0x")
     }
 
     // ============ 进程 ============
@@ -809,7 +814,7 @@ object Session {
             AppLog.add("attach", "${proc.label} pid=${proc.pid} ok=$ok regions=${rawRegions.size}")
             if (!silent) {
                 if (ok) {
-                    toast("已附加到 ${proc.label} (PID ${proc.pid})")
+                    toast("已附加到 ${proc.label}")
                 } else {
                     toast("附加 ${proc.label} 失败：无跨进程内存读写权限，请检查 Root 授权")
                 }
@@ -1083,10 +1088,11 @@ object Session {
                 textBytes = parsed.textBytes,
                 textUtf16 = parsed.textUtf16
             )
-            val isRefine = !newSearch && (st.rawResults.isNotEmpty() || st.totalCount > 0L)
+            val isRefine = !newSearch && (hasFuzzySession || st.rawResults.isNotEmpty() || st.totalCount > 0L)
             val previous = if (isRefine) st.rawResults else null
             val progressCb = makeProgressCallback(startTime)
             val result = withContext(Dispatchers.IO) { engine.search(criteria, previous, progressCb) }
+            hasFuzzySession = false
             val filtered = filterList(result.items, _ui.value.filter)
             _ui.update {
                 it.copy(
@@ -1104,7 +1110,7 @@ object Session {
             }
             historyStore.add(input)
             _ui.update { it.copy(history = historyStore.list()) }
-            toast("找到 ${result.totalFound} 条结果（显示 ${filtered.size} 条）")
+            toast("找到 ${result.totalFound} 条结果")
         }
     }
 
@@ -1188,8 +1194,8 @@ object Session {
                 )
             }
             toast(
-                if (isInit) "已完成初始模糊采样：共 ${result.totalFound} 项（显示 ${filtered.size} 项）"
-                else "模糊筛选（$actionName）：剩余 ${result.totalFound} 项（显示 ${filtered.size} 项）"
+                if (isInit) "已完成初始模糊采样，共 ${result.totalFound} 项"
+                else "模糊筛选 $actionName：剩余 ${result.totalFound} 项"
             )
         }
     }
@@ -1248,7 +1254,7 @@ object Session {
                 historyStore.add(st.search.text.trim())
                 _ui.update { it.copy(history = historyStore.list()) }
             }
-            toast("蒙版搜索找到 ${result.totalFound} 项（显示 ${filtered.size} 项）")
+            toast("蒙版搜索找到 ${result.totalFound} 项")
         }
     }
 
@@ -1307,7 +1313,7 @@ object Session {
                     selectedCount = 0
                 )
             }
-            toast("指针搜索找到 ${result.totalFound} 条指针链（显示 ${filtered.size} 条）")
+            toast("指针搜索找到 ${result.totalFound} 条结果")
         }
     }
 
@@ -1341,8 +1347,7 @@ object Session {
             )
         }
         recount()
-        val total = maxOf(st.totalCount, st.rawResults.size.toLong())
-        toast("已应用筛选（显示 ${filtered.size}/$total）")
+        toast("已应用筛选")
     }
 
     fun resetFilter() {
@@ -1367,8 +1372,10 @@ object Session {
         val valMax = if (f.valLessEnabled) f.valLess.trim().toLongOrNull() else null
         val fracTarget = if (f.fractionalEnabled) f.fractional.trim().removePrefix(".") else null
 
+        val seenKeys = HashSet<String>(minOf(source.size, f.maxShow) * 2)
         val out = ArrayList<MemoryItem>(minOf(source.size, f.maxShow))
         for (item in source) {
+            if (!seenKeys.add("${item.address}_${item.flags and 0x7F}")) continue
             if (addrMin != null && java.lang.Long.compareUnsigned(item.address, addrMin) < 0) continue
             if (addrMax != null && java.lang.Long.compareUnsigned(item.address, addrMax) > 0) continue
             val signedVal = Formatter.signed(item.value, item.size)
@@ -1412,12 +1419,16 @@ object Session {
 
     // ============ 选择（Bug 4 优化：单次原子更新 + 精确索引替换，0 延迟响应） ============
 
+    private fun sameItemKey(a: MemoryItem, b: MemoryItem): Boolean =
+        a.address == b.address && (a.flags and 0x7F) == (b.flags and 0x7F)
+
     fun toggle(item: MemoryItem) {
         val targetAddr = item.address
         _ui.update { s ->
             when (s.tab) {
                 NextTab.SAVED_LIST -> {
-                    val idx = s.saved.indexOfFirst { it.address == targetAddr }
+                    val idx = s.saved.indexOfFirst { sameItemKey(it, item) }
+                        .let { if (it >= 0) it else s.saved.indexOfFirst { r -> r.address == targetAddr } }
                     if (idx < 0) s else {
                         val cur = s.saved[idx]
                         val nextChecked = !cur.checked
@@ -1437,13 +1448,15 @@ object Session {
                     }
                 }
                 else -> {
-                    val idx = s.results.indexOfFirst { it.address == targetAddr }
+                    val idx = s.results.indexOfFirst { sameItemKey(it, item) }
+                        .let { if (it >= 0) it else s.results.indexOfFirst { r -> r.address == targetAddr } }
                     if (idx < 0) s else {
                         val cur = s.results[idx]
                         val nextChecked = !cur.checked
                         val updatedItem = cur.copy(checked = nextChecked)
                         val nextRes = ArrayList<MemoryItem>(s.results).also { it[idx] = updatedItem }
-                        val rawIdx = s.rawResults.indexOfFirst { it.address == targetAddr }
+                        val rawIdx = s.rawResults.indexOfFirst { sameItemKey(it, item) }
+                            .let { if (it >= 0) it else s.rawResults.indexOfFirst { r -> r.address == targetAddr } }
                         val nextRaw = if (rawIdx >= 0) {
                             ArrayList<MemoryItem>(s.rawResults).also { it[rawIdx] = updatedItem }
                         } else s.rawResults
@@ -1461,8 +1474,8 @@ object Session {
             NextTab.MEMORY -> _ui.update { s -> s.copy(memoryRows = s.memoryRows.map(f)) }
             else -> _ui.update { s ->
                 val updatedResults = s.results.map(f)
-                val byAddr = updatedResults.associateBy { it.address }
-                val updatedRaw = s.rawResults.map { byAddr[it.address] ?: it }
+                val byKey = updatedResults.associateBy { "${it.address}_${it.flags and 0x7F}" }
+                val updatedRaw = s.rawResults.map { byKey["${it.address}_${it.flags and 0x7F}"] ?: it }
                 s.copy(results = updatedResults, rawResults = updatedRaw)
             }
         }
@@ -1526,7 +1539,7 @@ object Session {
         _ui.update { st ->
             val merged = st.saved.toMutableList()
             items.forEach { item ->
-                val existingIdx = merged.indexOfFirst { it.address == item.address }
+                val existingIdx = merged.indexOfFirst { sameItemKey(it, item) }
                 if (existingIdx >= 0) {
                     merged[existingIdx] = item.copy(checked = false)
                 } else {
@@ -1541,15 +1554,15 @@ object Session {
     fun deleteSaved(item: MemoryItem) {
         engine.setFreeze(item.address, item.flags, item.value, false)
         _ui.update { st ->
-            st.copy(saved = st.saved.filterNot { it.address == item.address })
+            st.copy(saved = st.saved.filterNot { sameItemKey(it, item) })
         }
         recount()
     }
 
     fun deleteResultItem(item: MemoryItem) {
         _ui.update { st ->
-            val nextRaw = st.rawResults.filterNot { it.address == item.address }
-            val nextRes = st.results.filterNot { it.address == item.address }
+            val nextRaw = st.rawResults.filterNot { sameItemKey(it, item) }
+            val nextRes = st.results.filterNot { sameItemKey(it, item) }
             st.copy(
                 rawResults = nextRaw,
                 results = nextRes,
@@ -1564,7 +1577,7 @@ object Session {
         val nextFreeze = !item.freeze
         engine.setFreeze(item.address, item.flags, item.value, nextFreeze)
         _ui.update { st ->
-            st.copy(saved = st.saved.map { if (it.address == item.address) it.copy(freeze = nextFreeze) else it })
+            st.copy(saved = st.saved.map { if (sameItemKey(it, item)) it.copy(freeze = nextFreeze) else it })
         }
     }
 
@@ -1578,10 +1591,10 @@ object Session {
         targets.forEach { engine.write(it.address, it.size, it.previousValue) }
         _ui.update { st ->
             st.copy(
-                rawResults = st.rawResults.map { if (it.address in addrSet) it.copy(value = it.previousValue) else it },
-                results = st.results.map { if (it.address in addrSet) it.copy(value = it.previousValue) else it },
-                saved = st.saved.map { if (it.address in addrSet) it.copy(value = it.previousValue) else it },
-                memoryRows = st.memoryRows.map { if (it.address in addrSet) it.copy(value = it.previousValue) else it }
+                rawResults = st.rawResults.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it },
+                results = st.results.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it },
+                saved = st.saved.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it },
+                memoryRows = st.memoryRows.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it }
             )
         }
         toast("已恢复 ${targets.size} 项为先前数值")
@@ -1710,6 +1723,7 @@ object Session {
                         freeze = if (freeze) true else item.freeze,
                         freezeType = if (freeze) freezeType else item.freezeType,
                         previousValue = item.value,
+                        manuallyEdited = true,
                         note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
                     )
                 }
@@ -1726,6 +1740,7 @@ object Session {
                         freeze = if (freeze) true else item.freeze,
                         freezeType = if (freeze) freezeType else item.freezeType,
                         previousValue = item.value,
+                        manuallyEdited = true,
                         note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
                     )
                 }
@@ -1766,6 +1781,7 @@ object Session {
                         freeze = if (freeze) true else item.freeze,
                         freezeType = if (freeze) freezeType else item.freezeType,
                         previousValue = item.value,
+                        manuallyEdited = true,
                         note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
                     )
                 }
@@ -1834,10 +1850,10 @@ object Session {
         )
         _ui.update { s ->
             s.copy(
-                rawResults = s.rawResults.map { if (it.address == item.address) updated else it },
-                results = s.results.map { if (it.address == item.address) updated else it },
-                saved = s.saved.map { if (it.address == item.address) updated else it },
-                memoryRows = s.memoryRows.map { if (it.address == item.address) updated else it },
+                rawResults = s.rawResults.map { if (it.address == item.address) updated else it }.distinctBy { it.address },
+                results = s.results.map { if (it.address == item.address) updated else it }.distinctBy { it.address },
+                saved = s.saved.map { if (it.address == item.address) updated else it }.distinctBy { it.address },
+                memoryRows = s.memoryRows.map { if (it.address == item.address) updated else it }.distinctBy { it.address },
                 sheet = Sheet.NONE
             )
         }
@@ -1886,7 +1902,7 @@ object Session {
                         name = name,
                         note = note
                     )
-                }
+                }.distinctBy { it.address }
                 _ui.update { it.copy(saved = loaded, fileManagerPath = clean, sheet = Sheet.NONE, tab = NextTab.SAVED_LIST) }
                 toast("已从 ${file.name} 载入 ${loaded.size} 项")
                 true
