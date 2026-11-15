@@ -1,6 +1,0 @@
-{
-  "name": "MemEngine NDK Diagnostics & Benchmark Suite",
-  "description": "Industrial-grade cross-process memory analysis and search engine library (C++17/20 + ARM NEON SIMD + CMake + JNI/Kotlin) with static code audit and 500MB/1GB/3GB empirical benchmarks.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
