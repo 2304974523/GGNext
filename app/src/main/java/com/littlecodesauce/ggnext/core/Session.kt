@@ -1020,6 +1020,7 @@ object Session {
         }
         if (newSearch) {
             hasFuzzySession = false
+            engine.clearRemoved()
         }
         scope.launch {
             val parsed = try {
@@ -1077,7 +1078,7 @@ object Session {
                 groupOps = parsed.groupOps,
                 ordered = parsed.ordered,
                 groupTypes = parsed.types,
-                area = parsed.area.coerceAtLeast(2),
+                area = parsed.area.coerceIn(2, 65536),
                 memoryFrom = memFrom,
                 memoryTo = memTo,
                 limit = maxOf(st.filter.maxShow, MemoryEngine.MAX_CACHED_CANDIDATES),
@@ -1267,13 +1268,26 @@ object Session {
         }
         if (newSearch) {
             hasFuzzySession = false
+            engine.clearRemoved()
         }
-        val rawAddr = st.search.text.trim().removePrefix("0x").removeSuffix("h")
-        val targetAddr = rawAddr.toLongOrNull(16) ?: st.contextItem?.address ?: 0x79F165BD8CL
-        val maxOffset = if (st.search.offsetHex) {
-            st.search.offset.trim().removePrefix("0x").toLongOrNull(16) ?: 0x200L
+        val rawAddr = st.search.text.trim().removePrefix("0x").removePrefix("0X").removeSuffix("h").removeSuffix("H")
+        val targetAddr = rawAddr.toULongOrNull(16)?.toLong()
+            ?: rawAddr.toLongOrNull(16)
+            ?: st.contextItem?.address
+            ?: st.editing?.address
+            ?: 0x79F165BD8CL
+        val rawOff = st.search.offset.trim()
+        val isExplicitHex = st.search.offsetHex || rawOff.startsWith("0x", true) || rawOff.endsWith("h", true)
+        val cleanOff = rawOff.removePrefix("-").removePrefix("+").removePrefix("0x").removePrefix("0X").removeSuffix("h").removeSuffix("H")
+        val maxOffset = (if (isExplicitHex) {
+            cleanOff.toULongOrNull(16)?.toLong() ?: 0x200L
         } else {
-            st.search.offset.trim().toLongOrNull() ?: 512L
+            cleanOff.toLongOrNull() ?: cleanOff.toULongOrNull(16)?.toLong() ?: 512L
+        }).coerceAtLeast(0L)
+        val ptrType = if (st.search.pointerType == ValueType.DWORD || st.search.pointerType == ValueType.QWORD) {
+            st.search.pointerType
+        } else {
+            if (st.target.x64) ValueType.QWORD else ValueType.DWORD
         }
         scope.launch {
             val startTime = System.currentTimeMillis()
@@ -1294,7 +1308,7 @@ object Session {
                 engine.pointerSearch(
                     targetAddress = targetAddr,
                     maxOffset = maxOffset,
-                    type = st.search.type,
+                    type = ptrType,
                     previous = prev,
                     selectedRegions = st.selectedRegions,
                     limit = maxOf(st.filter.maxShow, MemoryEngine.MAX_CACHED_CANDIDATES),
@@ -1310,7 +1324,8 @@ object Session {
                     busy = false,
                     searchProgress = 1f,
                     hintVisible = filtered.isEmpty(),
-                    selectedCount = 0
+                    selectedCount = 0,
+                    searchType = ptrType
                 )
             }
             toast("指针搜索找到 ${result.totalFound} 条结果")
@@ -1405,6 +1420,7 @@ object Session {
 
     fun clearResults() {
         hasFuzzySession = false
+        engine.clearRemoved()
         _ui.update {
             it.copy(
                 rawResults = emptyList(),
@@ -1560,13 +1576,15 @@ object Session {
     }
 
     fun deleteResultItem(item: MemoryItem) {
+        engine.markRemoved(listOf(item.address))
         _ui.update { st ->
             val nextRaw = st.rawResults.filterNot { sameItemKey(it, item) }
-            val nextRes = st.results.filterNot { sameItemKey(it, item) }
+            val nextRes = filterList(nextRaw, st.filter)
+            val nextTotal = (st.totalCount - 1L).coerceAtLeast(nextRaw.size.toLong())
             st.copy(
                 rawResults = nextRaw,
                 results = nextRes,
-                totalCount = nextRaw.size.toLong(),
+                totalCount = nextTotal,
                 hintVisible = nextRes.isEmpty()
             )
         }
@@ -1654,16 +1672,22 @@ object Session {
         when (_ui.value.tab) {
             NextTab.SAVED_LIST -> _ui.update { s -> s.copy(saved = s.saved.filterNot { it.checked }) }
             NextTab.MEMORY -> _ui.update { s -> s.copy(memoryRows = s.memoryRows.filterNot { it.checked }) }
-            else -> _ui.update { s ->
-                val nextRes = s.results.filterNot { it.checked }
-                val removedAddrs = s.results.filter { it.checked }.map { it.address }.toHashSet()
-                val nextRaw = s.rawResults.filterNot { it.address in removedAddrs }
-                s.copy(
-                    rawResults = nextRaw,
-                    results = nextRes,
-                    totalCount = nextRaw.size.toLong(),
-                    hintVisible = nextRes.isEmpty()
-                )
+            else -> {
+                val removedAddrs = _ui.value.results.filter { it.checked }.map { it.address }.toHashSet()
+                if (removedAddrs.isNotEmpty()) {
+                    engine.markRemoved(removedAddrs)
+                }
+                _ui.update { s ->
+                    val nextRaw = s.rawResults.filterNot { it.checked || it.address in removedAddrs }
+                    val nextRes = filterList(nextRaw, s.filter)
+                    val nextTotal = (s.totalCount - removedAddrs.size).coerceAtLeast(nextRaw.size.toLong())
+                    s.copy(
+                        rawResults = nextRaw,
+                        results = nextRes,
+                        totalCount = nextTotal,
+                        hintVisible = nextRes.isEmpty()
+                    )
+                }
             }
         }
         _ui.update { it.copy(sheet = Sheet.NONE) }
@@ -2006,6 +2030,89 @@ object Session {
         val st = _ui.value
         val target = st.memoryHighlightAddress ?: st.memoryBase
         goto(target, recordHistory = false, highlightTarget = true)
+    }
+
+    /**
+     * 问题 3 修复：内存列表上下边界处的「转到此地址：xxxx」翻页跳转
+     * - 当向上翻页 (isUpward = true) 时，加载以 targetAligned 为末尾地址的 4KB 页，使 xxxx 位于新页底部并连续衔接；
+     * - 当向下翻页 (isUpward = false) 时，加载以 targetAligned 为起始地址的 4KB 页，使 xxxx 位于新页顶部并连续衔接。
+     */
+    fun gotoBoundary(address: Long, isUpward: Boolean) {
+        scope.launch {
+            val prevBase = _ui.value.memoryBase
+            _ui.update { it.copy(busy = true, busyText = "读取内存页") }
+            val targetAligned = address and -4L
+            val pageBase = if (isUpward) {
+                val span = (MEMORY_PAGE_BYTES - 4).toLong()
+                if (java.lang.Long.compareUnsigned(targetAligned, span) >= 0) {
+                    (targetAligned - span) and -4L
+                } else {
+                    0L
+                }
+            } else {
+                targetAligned
+            }
+            val rows = withContext(Dispatchers.IO) {
+                val count = MEMORY_PAGE_ROWS
+                val block = engine.readBlock(pageBase, MEMORY_PAGE_BYTES)
+                val candidatePtrs = LongArray(count) { r ->
+                    val off = (r and -2) * 4
+                    if (engine.x64 && off + 8 <= block.size) {
+                        (block[off].toLong() and 0xFF) or
+                            ((block[off + 1].toLong() and 0xFF) shl 8) or
+                            ((block[off + 2].toLong() and 0xFF) shl 16) or
+                            ((block[off + 3].toLong() and 0xFF) shl 24) or
+                            ((block[off + 4].toLong() and 0xFF) shl 32) or
+                            ((block[off + 5].toLong() and 0xFF) shl 40) or
+                            ((block[off + 6].toLong() and 0xFF) shl 48) or
+                            ((block[off + 7].toLong() and 0xFF) shl 56)
+                    } else if (off + 4 <= block.size) {
+                        (block[off].toLong() and 0xFF) or
+                            ((block[off + 1].toLong() and 0xFF) shl 8) or
+                            ((block[off + 2].toLong() and 0xFF) shl 16) or
+                            ((block[off + 3].toLong() and 0xFF) shl 24)
+                    } else 0L
+                }
+                val classifiedPtrs = engine.classifyPointers(candidatePtrs)
+                val out = ArrayList<MemoryItem>(count)
+                for (r in 0 until count) {
+                    val off = r * 4
+                    val rowAddr = pageBase + r * 4L
+                    val v = if (off + 4 <= block.size) {
+                        (block[off].toLong() and 0xFF) or
+                            ((block[off + 1].toLong() and 0xFF) shl 8) or
+                            ((block[off + 2].toLong() and 0xFF) shl 16) or
+                            ((block[off + 3].toLong() and 0xFF) shl 24)
+                    } else 0L
+                    out.add(
+                        MemoryItem(
+                            address = rowAddr,
+                            value = v,
+                            flags = ValueType.DWORD,
+                            region = engine.regionCodeAt(rowAddr),
+                            pointer = classifiedPtrs[r]
+                        )
+                    )
+                }
+                out
+            }
+            _ui.update {
+                val nextBack = if (prevBase != pageBase && prevBase != 0L) {
+                    (it.memoryHistoryBack + prevBase).takeLast(32)
+                } else it.memoryHistoryBack
+                it.copy(
+                    memoryRows = rows,
+                    memoryBase = pageBase,
+                    memoryHighlightAddress = targetAligned,
+                    memoryScrollTrigger = it.memoryScrollTrigger + 1,
+                    memoryHistoryBack = nextBack,
+                    memoryHistoryForward = emptyList(),
+                    selectedCount = 0,
+                    busy = false,
+                    tab = NextTab.MEMORY
+                )
+            }
+        }
     }
 
     fun memoryScrollBy(rows: Int) {

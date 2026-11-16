@@ -156,6 +156,7 @@ object I18n {
         "了解精确搜索、模糊搜索、联合搜索与批量修改用法" to "Learn exact, fuzzy, group search & batch editing",
         "关于软件" to "About App",
         "GGNext v0.5 · 查看软件信息与更新日志" to "GGNext v0.5 · App info & changelog",
+        "GGNext v0.6 · 查看软件信息与更新日志" to "GGNext v0.6 · App info & changelog",
         "管理软件语言、主题配色、背景透明度、页面屏幕占比与关于信息" to "Manage language, theme, opacity, screen ratio & about info",
         "语言与区域" to "Language & Region",
         "切换" to "Switch",
@@ -187,8 +188,10 @@ object I18n {
         "关于与支持" to "About & Support",
         "关于 GGNext" to "About GGNext",
         "版本 v0.5 · 架构与环境信息" to "Version v0.5 · Architecture & environment",
+        "版本 v0.6 · 架构与环境信息" to "Version v0.6 · Architecture & environment",
         "更新日志" to "Changelog",
         "查看 v0.5 版本优化与修复详情" to "View v0.5 optimizations & bug fixes",
+        "查看 v0.6 版本优化与修复详情" to "View v0.6 optimizations & bug fixes",
         "使用帮助" to "User Guide",
         "搜索语法与功能说明" to "Search syntax & feature reference",
         "软件运行日志" to "Runtime Log",
@@ -868,9 +871,12 @@ private fun ContextToolbarDivider() {
 }
 
 /**
- * 其他改进 1：列表右侧快速滑动条 (VerticalFastScrollbar)
+ * 其他改进 1 & 问题 6 修复：列表右侧快速滑动条 (VerticalFastScrollbar)
  * - 颜色跟随当前主题色 (Rose.Primary)
- * - 视觉滑块纤细精致 (常态 3.5.dp，按住拖拽时平滑加宽至 5.5.dp)，右侧触控响应宽度 18.dp（兼顾易按住与不遮挡列表按钮）
+ * - 防误触设计：
+ *   1. 仅当手指按下位置命中当前滑块 (thumb) 区域时才进入候选拖拽状态，点击空白轨道绝不拦截或跳页；
+ *   2. 加入按住驻留阈值 (80ms) 与快速划动识别：若用户在列表右侧边缘快速上下划动屏幕（<80ms 内快速划出），判定为普通列表滑动并自动放行；
+ *   3. 激活拖拽后采用相对于按下点的增量位移 (relative delta)，避免按下瞬间列表突跳。
  */
 @Composable
 fun VerticalFastScrollbar(
@@ -886,13 +892,13 @@ fun VerticalFastScrollbar(
     var isDragging by remember { mutableStateOf(false) }
     var dragFraction by remember { androidx.compose.runtime.mutableFloatStateOf(0f) }
 
-    val scrollFraction = if (isDragging) {
-        dragFraction
-    } else {
+    val liveFraction = run {
         val firstIndex = listState.firstVisibleItemIndex.toFloat()
         val maxIndex = (totalItems - visibleItems).coerceAtLeast(1).toFloat()
         (firstIndex / maxIndex).coerceIn(0f, 1f)
     }
+    val scrollFraction = if (isDragging) dragFraction else liveFraction
+    val currentLiveFraction by androidx.compose.runtime.rememberUpdatedState(liveFraction)
 
     val thumbAlpha by animateFloatAsState(
         targetValue = when {
@@ -914,36 +920,83 @@ fun VerticalFastScrollbar(
     BoxWithConstraints(
         modifier = modifier
             .fillMaxHeight()
-            .width(18.dp)
+            .width(14.dp)
             .pointerInput(totalItems, visibleItems) {
+                val minThumbPx = 28.dp.toPx()
+                val hitPadPx = 8.dp.toPx()
+                val holdThresholdMs = 80L
+                val touchSlopPx = viewConfiguration.touchSlop
+
                 awaitPointerEventScope {
                     while (true) {
-                        val down = awaitPointerEvent()
-                        val change = down.changes.firstOrNull() ?: continue
-                        if (change.pressed) {
-                            isDragging = true
-                            val h = size.height.toFloat().coerceAtLeast(1f)
-                            val frac = (change.position.y / h).coerceIn(0f, 1f)
-                            dragFraction = frac
-                            val targetIdx = (frac * (totalItems - visibleItems).coerceAtLeast(1)).toInt().coerceIn(0, totalItems - 1)
-                            scope.launch { listState.scrollToItem(targetIdx) }
-                            change.consume()
+                        val downEvent = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                        val downChange = downEvent.changes.firstOrNull() ?: continue
+                        if (!downChange.pressed || downChange.isConsumed) continue
 
+                        val trackH = size.height.toFloat().coerceAtLeast(1f)
+                        val thumbRatio = (visibleItems.toFloat() / totalItems.toFloat()).coerceIn(0.08f, 0.55f)
+                        val thumbH = (trackH * thumbRatio).coerceAtLeast(minThumbPx)
+                        val availRange = (trackH - thumbH).coerceAtLeast(1f)
+                        val startFrac = currentLiveFraction
+                        val curThumbTop = availRange * startFrac
+
+                        val downX = downChange.position.x
+                        val downY = downChange.position.y
+                        // 1. 仅当触点落在滑块 (thumb) 上下容差范围内时才候选触发，空白轨道区域直接放行给列表滚动
+                        val hitThumb = downY >= (curThumbTop - hitPadPx) && downY <= (curThumbTop + thumbH + hitPadPx)
+                        if (!hitThumb) {
                             while (true) {
-                                val event = awaitPointerEvent()
-                                val dragChange = event.changes.firstOrNull() ?: break
-                                if (!dragChange.pressed) {
-                                    isDragging = false
-                                    break
-                                }
-                                val nextFrac = (dragChange.position.y / h).coerceIn(0f, 1f)
-                                dragFraction = nextFrac
-                                val nextIdx = (nextFrac * (totalItems - visibleItems).coerceAtLeast(1)).toInt().coerceIn(0, totalItems - 1)
-                                scope.launch { listState.scrollToItem(nextIdx) }
-                                dragChange.consume()
+                                val ev = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                                if (ev.changes.none { it.pressed }) break
                             }
-                            isDragging = false
+                            continue
                         }
+
+                        val downTime = android.os.SystemClock.uptimeMillis()
+                        var activated = false
+                        var abortedAsNormalScroll = false
+                        var grabAnchorY = downY
+                        var anchorFrac = startFrac
+
+                        while (true) {
+                            val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                            val ch = event.changes.firstOrNull() ?: break
+                            if (!ch.pressed) break
+
+                            val dx = kotlin.math.abs(ch.position.x - downX)
+                            val dy = kotlin.math.abs(ch.position.y - downY)
+                            val elapsed = android.os.SystemClock.uptimeMillis() - downTime
+
+                            if (!activated && !abortedAsNormalScroll) {
+                                // 2. 如果未满驻留时间就发生大幅度快速划动，或水平位移大于垂直位移，判定为普通页面滑动并放弃接管
+                                if (dx > touchSlopPx && dx > dy) {
+                                    abortedAsNormalScroll = true
+                                } else if (elapsed < holdThresholdMs && dy > touchSlopPx * 1.4f) {
+                                    abortedAsNormalScroll = true
+                                } else if (elapsed >= holdThresholdMs && dy >= touchSlopPx * 0.5f) {
+                                    activated = true
+                                    isDragging = true
+                                    grabAnchorY = ch.position.y
+                                    anchorFrac = currentLiveFraction
+                                    dragFraction = anchorFrac
+                                }
+                            }
+
+                            if (abortedAsNormalScroll) {
+                                continue
+                            }
+
+                            if (activated) {
+                                val deltaY = ch.position.y - grabAnchorY
+                                val nextFrac = (anchorFrac + deltaY / availRange).coerceIn(0f, 1f)
+                                dragFraction = nextFrac
+                                val maxIdx = (totalItems - visibleItems).coerceAtLeast(1)
+                                val nextIdx = (nextFrac * maxIdx).toInt().coerceIn(0, totalItems - 1)
+                                scope.launch { listState.scrollToItem(nextIdx) }
+                                ch.consume()
+                            }
+                        }
+                        isDragging = false
                     }
                 }
             }

@@ -68,12 +68,22 @@ fun MemoryScreen(ui: Ui) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
+    val firstAddr = ui.memoryRows.firstOrNull()?.address ?: 0L
+    val lastAddr = ui.memoryRows.lastOrNull()?.address ?: 0L
+    val hasTopBoundary = ui.memoryRows.isNotEmpty() && java.lang.Long.compareUnsigned(firstAddr, 4L) >= 0
+    val topJumpOffset = if (hasTopBoundary) 1 else 0
+
     LaunchedEffect(ui.memoryScrollTrigger, ui.memoryHighlightAddress, ui.memoryRows.size) {
         val targetAddr = ui.memoryHighlightAddress
         if (targetAddr != null && ui.memoryRows.isNotEmpty()) {
             val idx = ui.memoryRows.indexOfFirst { it.address == targetAddr }
             if (idx >= 0) {
-                val scrollIdx = (idx - 2).coerceAtLeast(0)
+                val listIdx = idx + topJumpOffset
+                val scrollIdx = when {
+                    idx == 0 -> listIdx
+                    idx >= ui.memoryRows.lastIndex - 1 -> (listIdx - 4).coerceAtLeast(0)
+                    else -> (listIdx - 2).coerceAtLeast(0)
+                }
                 listState.scrollToItem(scrollIdx)
             }
         }
@@ -86,8 +96,9 @@ fun MemoryScreen(ui: Ui) {
                 val targetAddr = ui.memoryHighlightAddress ?: ui.memoryBase
                 val idx = ui.memoryRows.indexOfFirst { it.address == targetAddr }
                 if (idx >= 0) {
+                    val listIdx = idx + topJumpOffset
                     scope.launch {
-                        listState.animateScrollToItem((idx - 2).coerceAtLeast(0))
+                        listState.animateScrollToItem((listIdx - 2).coerceAtLeast(0))
                     }
                     Session.toast("已定位到地址 0x${java.lang.Long.toHexString(targetAddr).uppercase()}")
                 } else {
@@ -105,6 +116,15 @@ fun MemoryScreen(ui: Ui) {
                     contentPadding = PaddingValues(vertical = 2.dp, horizontal = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
+                    if (hasTopBoundary) {
+                        val prevAddr = (firstAddr - 4L) and -4L
+                        item(key = "mem_boundary_top", contentType = "mem_boundary") {
+                            MemoryBoundaryJumpButton(
+                                targetAddress = prevAddr,
+                                isUpward = true
+                            )
+                        }
+                    }
                     itemsIndexed(
                         items = ui.memoryRows,
                         key = { idx, i -> "${i.address}_$idx" },
@@ -116,6 +136,13 @@ fun MemoryScreen(ui: Ui) {
                             isJumpTarget = (item.address == ui.memoryHighlightAddress)
                         )
                     }
+                    val nextAddr = (lastAddr + 4L) and -4L
+                    item(key = "mem_boundary_bottom", contentType = "mem_boundary") {
+                        MemoryBoundaryJumpButton(
+                            targetAddress = nextAddr,
+                            isUpward = false
+                        )
+                    }
                 }
                 VerticalFastScrollbar(
                     listState = listState,
@@ -123,6 +150,40 @@ fun MemoryScreen(ui: Ui) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun MemoryBoundaryJumpButton(
+    targetAddress: Long,
+    isUpward: Boolean
+) {
+    val bgOpacity = com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics.current.bgOpacity.coerceIn(0.25f, 1.0f)
+    val addrHex = remember(targetAddress) { Formatter.addr(targetAddress) }
+    var pressed by remember { mutableStateOf(false) }
+    val scale by animateFloatAsState(if (pressed) 0.98f else 1f, Motion.Fast, label = "memBoundaryScale")
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .scale(scale)
+            .background(
+                Rose.CardHigh.copy(alpha = (bgOpacity * 0.95f).coerceIn(0.25f, 1.0f)),
+                RoundedCornerShape(8.dp)
+            )
+            .border(1.dp, Rose.Primary.copy(alpha = 0.40f), RoundedCornerShape(8.dp))
+            .clickableWithTooltip(
+                onPressChange = { pressed = it },
+                onClick = { Session.gotoBoundary(targetAddress, isUpward = isUpward) }
+            )
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "${tr("转到此地址：")}$addrHex",
+            style = monoStyle(13, Rose.Primary, weight = FontWeight.SemiBold)
+        )
     }
 }
 

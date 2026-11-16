@@ -146,8 +146,10 @@ ProcessEntry ProcessEnumerator::classifyProcessMetadata(
 
     // 3. Standard User Apps across any Multi-User profile (appId in 10000..19999)
     if (entry.appId >= AID_APP_START && entry.appId <= AID_APP_END) {
-        // Native helper binaries executed without package name vs real Android App / Service
-        if (parentIsZygote || looksLikeAndroidPackage(cmdline) || !cmdline.empty()) {
+        // Exclude pure shell/su helper invocations while keeping all Zygote/app processes (including sharedUserId)
+        bool isShellHelper = (cmdline.find("/system/bin/") == 0 || cmdline.find("/vendor/bin/") == 0 ||
+                              comm == "sh" || comm == "su" || comm == "daemonsu" || comm == "magisk");
+        if (!isShellHelper && (parentIsZygote || looksLikeAndroidPackage(entry.processName) || !entry.processName.empty())) {
             entry.category = ProcessCategory::USER_APP;
             return entry;
         }
@@ -155,7 +157,7 @@ ProcessEntry ProcessEnumerator::classifyProcessMetadata(
 
     // 4. System Apps (e.g. system_server, com.android.systemui, com.android.phone, vendor apps)
     // Either spawned by Zygote/Zygote64 OR running under system/radio/bluetooth/nfc UIDs with Android package syntax
-    if (parentIsZygote || looksLikeAndroidPackage(cmdline)) {
+    if (parentIsZygote || looksLikeAndroidPackage(entry.processName)) {
         entry.category = ProcessCategory::SYSTEM_APP;
         return entry;
     }
@@ -176,8 +178,6 @@ ProcessEntry ProcessEnumerator::classifyProcessMetadata(
 
 std::vector<ProcessEntry> ProcessEnumerator::enumerateProcesses(bool androidAppsOnly) {
     std::vector<ProcessEntry> results;
-    DIR* dir = ::opendir("/proc");
-    if (!dir) return results;
 
     struct RawProc {
         int pid;
@@ -191,20 +191,16 @@ std::vector<ProcessEntry> ProcessEnumerator::enumerateProcesses(bool androidApps
     std::vector<RawProc> rawList;
     rawList.reserve(256);
     std::unordered_set<int> zygotePids;
+    std::unordered_set<int> visitedPids;
 
-    struct dirent* ent = nullptr;
-    while ((ent = ::readdir(dir)) != nullptr) {
-        // Do not rely solely on d_type == DT_DIR because some procfs mounts return DT_UNKNOWN
-        if (!isAllDigits(ent->d_name)) continue;
-
-        int pid = std::atoi(ent->d_name);
-        if (pid <= 0) continue;
-
+    auto inspectPid = [&](int pid) {
+        if (pid <= 0 || visitedPids.count(pid) > 0) return;
         int ppid = 0;
         uint32_t uid = 0;
         size_t vmRssKB = 0;
         std::string comm;
-        if (!readStatusMetadata(pid, ppid, uid, vmRssKB, comm)) continue;
+        if (!readStatusMetadata(pid, ppid, uid, vmRssKB, comm)) return;
+        visitedPids.insert(pid);
 
         std::string cmdline = readFirstArgCmdline(pid);
 
@@ -216,8 +212,36 @@ std::vector<ProcessEntry> ProcessEnumerator::enumerateProcesses(bool androidApps
         }
 
         rawList.push_back(RawProc{pid, ppid, uid, vmRssKB, std::move(cmdline), std::move(comm)});
+    };
+
+    DIR* dir = ::opendir("/proc");
+    if (dir) {
+        struct dirent* ent = nullptr;
+        while ((ent = ::readdir(dir)) != nullptr) {
+            // Do not rely solely on d_type == DT_DIR because some procfs mounts return DT_UNKNOWN
+            if (!isAllDigits(ent->d_name)) continue;
+            int pid = std::atoi(ent->d_name);
+            inspectPid(pid);
+        }
+        ::closedir(dir);
     }
-    ::closedir(dir);
+
+    // Fallback / supplement: On Android 7.0+ without root, SELinux blocks opendir("/proc") (proc:dir read),
+    // or hidepid hides entries, but allows direct path lookup (/proc/<pid>/status via proc:dir search)
+    // for all processes sharing the same UID / android:sharedUserId & SELinux domain.
+    if (rawList.size() <= 2) {
+        int maxPid = 65536;
+        if (FILE* fp = std::fopen("/proc/sys/kernel/pid_max", "r")) {
+            int val = 0;
+            if (std::fscanf(fp, "%d", &val) == 1 && val > 0) {
+                maxPid = std::min(val, 131072);
+            }
+            std::fclose(fp);
+        }
+        for (int pid = 1; pid <= maxPid; ++pid) {
+            inspectPid(pid);
+        }
+    }
 
     results.reserve(rawList.size());
     for (const auto& rp : rawList) {

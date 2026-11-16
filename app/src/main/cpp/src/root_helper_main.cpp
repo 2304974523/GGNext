@@ -359,7 +359,7 @@ int main(int argc, char** argv) {
             scanner.refineRange(static_cast<mem_engine::DataType>(dt), iMin, iMax, fMin, fMax, inclusive != 0, &cancelToken, makeProgressReporter());
             std::printf("OK %zu\n", scanner.totalMatchedCount());
             std::fflush(stdout);
-        } else if (cmd == "SEARCH_GROUP") {
+        } else if (cmd == "SEARCH_GROUP" || cmd == "REFINE_GROUP") {
             int windowSize = 512, ordered = 0, aligned = 1, count = 0;
             iss >> windowSize >> ordered >> aligned >> count;
             mem_engine::GroupSearchQuery query;
@@ -383,7 +383,11 @@ int main(int argc, char** argv) {
                 query.fields.push_back(f);
             }
             cancelToken.reset();
-            scanner.searchGroup(query, &cancelToken, makeProgressReporter());
+            if (cmd == "REFINE_GROUP") {
+                scanner.refineGroup(query, &cancelToken, makeProgressReporter());
+            } else {
+                scanner.searchGroup(query, &cancelToken, makeProgressReporter());
+            }
             std::printf("OK %zu\n", scanner.totalMatchedCount());
             std::fflush(stdout);
         } else if (cmd == "SEARCH_PATTERN") {

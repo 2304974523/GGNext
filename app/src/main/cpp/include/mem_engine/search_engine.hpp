@@ -208,6 +208,12 @@ public:
         ProgressCallback progress = nullptr
     );
 
+    EngineErrc refineGroup(
+        const GroupSearchQuery& query,
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
+    );
+
 private:
     struct ChunkTask {
         uintptr_t startAddr   = 0;

@@ -79,6 +79,12 @@ object NumberParser {
             )
         }
 
+        // 统一将中文全角分号/冒号/波浪号归一化为半角符号，兼容中文输入法（如 100：200：100、100：200：：100）
+        input = input
+            .replace('；', ';')
+            .replace('：', ':')
+            .replace('～', '~')
+
         var effSign = sign
         when {
             input.startsWith("!=") || input.startsWith("≠") -> {
@@ -107,7 +113,7 @@ object NumberParser {
             }
         }
 
-        if (input.contains(';')) return parseGroup(input, defaultType, effSign)
+        if (input.contains(';') || input.contains(':')) return parseGroup(input, defaultType, effSign)
 
         // 先提取外层 X 异或表达式（支持 25X4, 25X-4, 1000X5A5Ah, 以及 40~50X4）
         var body = input
@@ -275,22 +281,59 @@ object NumberParser {
         )
     }
 
+    private fun parseAreaSpan(areaStr: String): Int {
+        val clean = areaStr.trim().replace("_", "").replace(",", "")
+        if (clean.isEmpty()) return 512
+        val parsed = when {
+            clean.startsWith("0x", true) -> clean.substring(2).toIntOrNull(16)
+            clean.endsWith("h", true) -> clean.dropLast(1).toIntOrNull(16)
+            clean.startsWith("h", true) && clean.length > 1 -> clean.substring(1).toIntOrNull(16)
+            else -> clean.toIntOrNull()
+        } ?: throw ParseException("区域大小无效: $areaStr")
+        if (parsed < 2 || parsed > 65536) throw ParseException("区域大小必须在 2 - 65,536 之间")
+        return parsed
+    }
+
     private fun parseGroup(input: String, defaultType: Int, sign: Int): Query {
         val ordered = input.contains("::")
-        val hasArea = ordered || input.contains(":")
         var area = 512
-        var listPart = input
-        if (hasArea) {
-            val splitter = if (ordered) "::" else ":"
-            val idx = input.lastIndexOf(splitter)
-            listPart = input.substring(0, idx)
-            val areaStr = input.substring(idx + splitter.length).trim()
+        val items: List<String>
+
+        if (ordered) {
+            // 有序联合搜索：例如 "100;200::100"、"100:200::100"、"100:200:300::100"、"100;200::"
+            val idx = input.lastIndexOf("::")
+            val listPart = input.substring(0, idx)
+            val areaStr = input.substring(idx + 2).trim()
             if (areaStr.isNotEmpty()) {
-                area = areaStr.toIntOrNull() ?: throw ParseException("区域大小无效: $areaStr")
-                if (area < 2 || area > 65536) throw ParseException("区域必须在 2 - 65,536 之间")
+                area = parseAreaSpan(areaStr)
+            }
+            items = listPart.split(';', ':').map { it.trim() }.filter { it.isNotEmpty() }
+        } else if (input.contains(';')) {
+            // 分号分隔无序联合搜索：例如 "100;200"、"100;200:100"
+            var listPart = input
+            if (input.contains(':')) {
+                val idx = input.lastIndexOf(':')
+                listPart = input.substring(0, idx)
+                val areaStr = input.substring(idx + 1).trim()
+                if (areaStr.isNotEmpty()) {
+                    area = parseAreaSpan(areaStr)
+                }
+            }
+            items = listPart.split(';', ':').map { it.trim() }.filter { it.isNotEmpty() }
+        } else {
+            // 纯冒号分隔无序联合搜索：例如 "100:200:100"（数据为 100 和 200，偏移距离 100）或 "100:200:300:100"
+            val rawParts = input.split(':').map { it.trim() }
+            if (rawParts.size >= 3) {
+                val lastPart = rawParts.last()
+                if (lastPart.isNotEmpty()) {
+                    area = parseAreaSpan(lastPart)
+                }
+                items = rawParts.dropLast(1).filter { it.isNotEmpty() }
+            } else {
+                items = rawParts.filter { it.isNotEmpty() }
             }
         }
-        val items = listPart.split(';').map { it.trim() }.filter { it.isNotEmpty() }
+
         if (items.size < 2) throw ParseException("联合搜索至少需要两个数值")
         if (items.size > 64) throw ParseException("联合搜索最多 64 个数值")
 

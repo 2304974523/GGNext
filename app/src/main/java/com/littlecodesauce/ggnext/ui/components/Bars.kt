@@ -41,7 +41,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -72,7 +71,6 @@ import com.littlecodesauce.ggnext.ui.model.toolIcon
 import com.littlecodesauce.ggnext.ui.theme.Motion
 import com.littlecodesauce.ggnext.ui.theme.Rose
 import com.littlecodesauce.ggnext.ui.theme.regionColor
-import kotlin.math.abs
 
 /**
  * 顶部导航栏：
@@ -295,9 +293,12 @@ fun ToolBar(
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
+    val pinnedScrollState = rememberScrollState()
     val coroutineScope = rememberCoroutineScope()
     val density = LocalDensity.current
-    val itemSpanPx = with(density) { 42.dp.toPx() }
+    val itemWidthPx = with(density) { 40.dp.toPx() }
+    val itemSpacingPx = with(density) { 2.dp.toPx() }
+    val itemSpanPx = itemWidthPx + itemSpacingPx
 
     val currentFlowing by rememberUpdatedState(flowingTools)
     val currentPinned by rememberUpdatedState(pinnedTools)
@@ -305,10 +306,40 @@ fun ToolBar(
     val currentOnMovePinned by rememberUpdatedState(onMovePinnedTool)
 
     var draggingFlowingTool by remember { mutableStateOf<ToolId?>(null) }
-    var fingerXInFlowing by remember { mutableFloatStateOf(0f) }
+    var viewportFingerXFlowing by remember { mutableFloatStateOf(0f) }
+    var grabOffsetFlowingPx by remember { mutableFloatStateOf(0f) }
 
     var draggingPinnedTool by remember { mutableStateOf<ToolId?>(null) }
-    var fingerXInPinned by remember { mutableFloatStateOf(0f) }
+    var viewportFingerXPinned by remember { mutableFloatStateOf(0f) }
+    var grabOffsetPinnedPx by remember { mutableFloatStateOf(0f) }
+
+    // 精确计算含滞回区间 (Hysteresis) 的目标槽位，彻底消除槽位边界来回抖动抽搐
+    fun resolveTargetSlot(
+        draggedCenterX: Float,
+        curIndex: Int,
+        lastIndex: Int
+    ): Int {
+        if (lastIndex <= 0) return 0
+        val hysteresisPx = itemSpanPx * 0.14f
+        var target = curIndex
+        while (target < lastIndex) {
+            val nextSlotThreshold = (target + 1) * itemSpanPx + hysteresisPx
+            if (draggedCenterX >= nextSlotThreshold) {
+                target++
+            } else {
+                break
+            }
+        }
+        while (target > 0) {
+            val prevSlotThreshold = target * itemSpanPx - hysteresisPx
+            if (draggedCenterX <= prevSlotThreshold) {
+                target--
+            } else {
+                break
+            }
+        }
+        return target.coerceIn(0, lastIndex)
+    }
 
     Row(
         modifier
@@ -316,160 +347,199 @@ fun ToolBar(
             .padding(horizontal = 6.dp, vertical = 1.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // 左侧流动工具栏（水平平滑滚动，支持无限跨位置连续拖动重排）
-        Row(
+        // 左侧流动工具栏：外层 Box 捕获视口坐标系手势（位于 horizontalScroll 之外，避免滚动偏移被重复叠加导致错位）
+        Box(
             Modifier
                 .weight(1f)
-                .horizontalScroll(scrollState, enabled = draggingFlowingTool == null)
                 .pointerInput(ui.tab) {
                     detectDragGesturesAfterLongPress(
                         onDragStart = { startOffset ->
                             val curList = currentFlowing
                             if (curList.isEmpty()) return@detectDragGesturesAfterLongPress
-                            val idx = ((startOffset.x + scrollState.value) / itemSpanPx).toInt().coerceIn(0, curList.lastIndex)
+                            val contentX = startOffset.x + scrollState.value
+                            val idx = (contentX / itemSpanPx).toInt().coerceIn(0, curList.lastIndex)
+                            val slotCenterX = idx * itemSpanPx + itemWidthPx * 0.5f
+                            viewportFingerXFlowing = startOffset.x
+                            grabOffsetFlowingPx = (contentX - slotCenterX).coerceIn(-itemWidthPx * 0.5f, itemWidthPx * 0.5f)
                             draggingFlowingTool = curList[idx]
-                            fingerXInFlowing = startOffset.x + scrollState.value
                         },
                         onDragEnd = {
                             draggingFlowingTool = null
-                            fingerXInFlowing = 0f
+                            viewportFingerXFlowing = 0f
+                            grabOffsetFlowingPx = 0f
                         },
                         onDragCancel = {
                             draggingFlowingTool = null
-                            fingerXInFlowing = 0f
+                            viewportFingerXFlowing = 0f
+                            grabOffsetFlowingPx = 0f
                         },
                         onDrag = { change, dragAmount ->
                             change.consume()
                             val activeTool = draggingFlowingTool ?: return@detectDragGesturesAfterLongPress
                             val curList = currentFlowing
                             if (curList.isEmpty()) return@detectDragGesturesAfterLongPress
-                            fingerXInFlowing = (fingerXInFlowing + dragAmount.x).coerceIn(
-                                itemSpanPx * 0.5f,
-                                (curList.size * itemSpanPx - itemSpanPx * 0.5f).coerceAtLeast(itemSpanPx * 0.5f)
-                            )
-                            val targetIndex = (fingerXInFlowing / itemSpanPx).toInt().coerceIn(0, curList.lastIndex)
+
+                            viewportFingerXFlowing = (viewportFingerXFlowing + dragAmount.x)
+                                .coerceIn(0f, size.width.toFloat().coerceAtLeast(1f))
+
+                            // 边缘平滑自动滚动
+                            val edgeThreshold = 44f
+                            if (viewportFingerXFlowing < edgeThreshold && scrollState.value > 0) {
+                                coroutineScope.launch { scrollState.scrollBy(-10f) }
+                            } else if (viewportFingerXFlowing > (size.width - edgeThreshold) && scrollState.value < scrollState.maxValue) {
+                                coroutineScope.launch { scrollState.scrollBy(10f) }
+                            }
+
+                            val maxContentX = (curList.size * itemSpanPx - itemSpacingPx - itemWidthPx * 0.5f)
+                                .coerceAtLeast(itemWidthPx * 0.5f)
+                            val contentX = viewportFingerXFlowing + scrollState.value
+                            val draggedCenterX = (contentX - grabOffsetFlowingPx)
+                                .coerceIn(itemWidthPx * 0.5f, maxContentX)
+
                             val curIndex = curList.indexOf(activeTool)
-                            if (curIndex != -1 && targetIndex != curIndex) {
-                                currentOnMoveFlowing(curIndex, targetIndex)
-                            }
-                            // 边缘平滑自动跟随滚动
-                            val viewportX = fingerXInFlowing - scrollState.value
-                            val edgeThreshold = 48f
-                            if (viewportX < edgeThreshold && scrollState.value > 0) {
-                                coroutineScope.launch { scrollState.scrollBy(-12f) }
-                            } else if (viewportX > (scrollState.viewportSize - edgeThreshold) && scrollState.value < scrollState.maxValue) {
-                                coroutineScope.launch { scrollState.scrollBy(12f) }
+                            if (curIndex != -1) {
+                                val targetIndex = resolveTargetSlot(draggedCenterX, curIndex, curList.lastIndex)
+                                if (targetIndex != curIndex) {
+                                    currentOnMoveFlowing(curIndex, targetIndex)
+                                }
                             }
                         }
                     )
-                },
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-            verticalAlignment = Alignment.CenterVertically
+                }
         ) {
-            flowingTools.forEachIndexed { idx, id ->
-                androidx.compose.runtime.key("flow_${id.name}") {
-                    val isDragging = draggingFlowingTool == id
-                    val enabled = com.littlecodesauce.ggnext.ui.model.isToolEnabled(id, ui.tab, ui)
-                    val targetTx = if (isDragging) (fingerXInFlowing - (idx * itemSpanPx + itemSpanPx * 0.5f)) else 0f
-                    val smoothTx by animateFloatAsState(
-                        targetValue = targetTx,
-                        animationSpec = if (isDragging) spring(stiffness = Spring.StiffnessHigh) else Motion.Fast,
-                        label = "flowTx"
-                    )
-                    ToolIconItem(
-                        id = id,
-                        enabled = enabled,
-                        isDragging = isDragging,
-                        translationX = smoothTx,
-                        onClick = {
-                            if (enabled) onTool(id) else Session.toast("当前无可选项目")
-                        }
-                    )
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(scrollState, enabled = draggingFlowingTool == null),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                flowingTools.forEachIndexed { idx, id ->
+                    androidx.compose.runtime.key("flow_${id.name}") {
+                        val isDragging = draggingFlowingTool == id
+                        val enabled = com.littlecodesauce.ggnext.ui.model.isToolEnabled(id, ui.tab, ui)
+                        val maxContentX = (flowingTools.size * itemSpanPx - itemSpacingPx - itemWidthPx * 0.5f)
+                            .coerceAtLeast(itemWidthPx * 0.5f)
+                        val draggedCenterX = ((viewportFingerXFlowing + scrollState.value) - grabOffsetFlowingPx)
+                            .coerceIn(itemWidthPx * 0.5f, maxContentX)
+                        val slotCenterX = idx * itemSpanPx + itemWidthPx * 0.5f
+                        // 拖拽中采用 1:1 零延迟跟手位移，彻底消除槽位交换瞬间弹簧滞后引起的跳变抽搐
+                        val directTx = if (isDragging) (draggedCenterX - slotCenterX) else 0f
+
+                        ToolIconItem(
+                            id = id,
+                            enabled = enabled,
+                            isDragging = isDragging,
+                            translationX = directTx,
+                            interactionEnabled = draggingFlowingTool == null && draggingPinnedTool == null,
+                            onClick = {
+                                if (enabled) onTool(id) else Session.toast("当前无可选项目")
+                            }
+                        )
+                    }
                 }
             }
         }
 
         Spacer(Modifier.width(2.dp))
 
-        // 右侧固定工具栏（最大 3 个工具长度，超过 3 个支持独立滑动查看，按钮跟随主题色）
-        val pinnedScrollState = rememberScrollState()
+        // 右侧固定工具栏：同样由外层 Box 捕获视口坐标，消除滚动坐标二次叠加
         val maxPinnedWidth = (42.dp * 3) + 4.dp
-        Row(
+        Box(
             Modifier
                 .widthIn(max = maxPinnedWidth)
-                .horizontalScroll(pinnedScrollState, enabled = draggingPinnedTool == null)
                 .pointerInput(ui.tab) {
                     detectDragGesturesAfterLongPress(
                         onDragStart = { startOffset ->
                             val curList = currentPinned
                             if (curList.isEmpty()) return@detectDragGesturesAfterLongPress
-                            val idx = ((startOffset.x + pinnedScrollState.value) / itemSpanPx).toInt().coerceIn(0, curList.lastIndex)
+                            val contentX = startOffset.x + pinnedScrollState.value
+                            val idx = (contentX / itemSpanPx).toInt().coerceIn(0, curList.lastIndex)
+                            val slotCenterX = idx * itemSpanPx + itemWidthPx * 0.5f
+                            viewportFingerXPinned = startOffset.x
+                            grabOffsetPinnedPx = (contentX - slotCenterX).coerceIn(-itemWidthPx * 0.5f, itemWidthPx * 0.5f)
                             draggingPinnedTool = curList[idx]
-                            fingerXInPinned = startOffset.x + pinnedScrollState.value
                         },
                         onDragEnd = {
                             draggingPinnedTool = null
-                            fingerXInPinned = 0f
+                            viewportFingerXPinned = 0f
+                            grabOffsetPinnedPx = 0f
                         },
                         onDragCancel = {
                             draggingPinnedTool = null
-                            fingerXInPinned = 0f
+                            viewportFingerXPinned = 0f
+                            grabOffsetPinnedPx = 0f
                         },
                         onDrag = { change, dragAmount ->
                             change.consume()
                             val activeTool = draggingPinnedTool ?: return@detectDragGesturesAfterLongPress
                             val curList = currentPinned
                             if (curList.isEmpty()) return@detectDragGesturesAfterLongPress
-                            fingerXInPinned = (fingerXInPinned + dragAmount.x).coerceIn(
-                                itemSpanPx * 0.5f,
-                                (curList.size * itemSpanPx - itemSpanPx * 0.5f).coerceAtLeast(itemSpanPx * 0.5f)
-                            )
-                            val targetIndex = (fingerXInPinned / itemSpanPx).toInt().coerceIn(0, curList.lastIndex)
+
+                            viewportFingerXPinned = (viewportFingerXPinned + dragAmount.x)
+                                .coerceIn(0f, size.width.toFloat().coerceAtLeast(1f))
+
+                            val edgeThreshold = 32f
+                            if (viewportFingerXPinned < edgeThreshold && pinnedScrollState.value > 0) {
+                                coroutineScope.launch { pinnedScrollState.scrollBy(-10f) }
+                            } else if (viewportFingerXPinned > (size.width - edgeThreshold) && pinnedScrollState.value < pinnedScrollState.maxValue) {
+                                coroutineScope.launch { pinnedScrollState.scrollBy(10f) }
+                            }
+
+                            val maxContentX = (curList.size * itemSpanPx - itemSpacingPx - itemWidthPx * 0.5f)
+                                .coerceAtLeast(itemWidthPx * 0.5f)
+                            val contentX = viewportFingerXPinned + pinnedScrollState.value
+                            val draggedCenterX = (contentX - grabOffsetPinnedPx)
+                                .coerceIn(itemWidthPx * 0.5f, maxContentX)
+
                             val curIndex = curList.indexOf(activeTool)
-                            if (curIndex != -1 && targetIndex != curIndex) {
-                                currentOnMovePinned(curIndex, targetIndex)
-                            }
-                            val viewportX = fingerXInPinned - pinnedScrollState.value
-                            val edgeThreshold = 36f
-                            if (viewportX < edgeThreshold && pinnedScrollState.value > 0) {
-                                coroutineScope.launch { pinnedScrollState.scrollBy(-12f) }
-                            } else if (viewportX > (pinnedScrollState.viewportSize - edgeThreshold) && pinnedScrollState.value < pinnedScrollState.maxValue) {
-                                coroutineScope.launch { pinnedScrollState.scrollBy(12f) }
+                            if (curIndex != -1) {
+                                val targetIndex = resolveTargetSlot(draggedCenterX, curIndex, curList.lastIndex)
+                                if (targetIndex != curIndex) {
+                                    currentOnMovePinned(curIndex, targetIndex)
+                                }
                             }
                         }
                     )
-                },
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-            verticalAlignment = Alignment.CenterVertically
+                }
         ) {
-            pinnedTools.forEachIndexed { idx, id ->
-                androidx.compose.runtime.key("pin_${id.name}") {
-                    val isDragging = draggingPinnedTool == id
-                    val enabled = com.littlecodesauce.ggnext.ui.model.isToolEnabled(id, ui.tab, ui)
-                    val targetTx = if (isDragging) (fingerXInPinned - (idx * itemSpanPx + itemSpanPx * 0.5f)) else 0f
-                    val smoothTx by animateFloatAsState(
-                        targetValue = targetTx,
-                        animationSpec = if (isDragging) spring(stiffness = Spring.StiffnessHigh) else Motion.Fast,
-                        label = "pinTx"
-                    )
-                    ToolIconItem(
-                        id = id,
-                        enabled = enabled,
-                        isDragging = isDragging,
-                        translationX = smoothTx,
-                        isPinned = true,
-                        onClick = {
-                            if (!enabled) {
-                                Session.toast("当前无可选项目")
-                                return@ToolIconItem
+            Row(
+                Modifier
+                    .horizontalScroll(pinnedScrollState, enabled = draggingPinnedTool == null),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                pinnedTools.forEachIndexed { idx, id ->
+                    androidx.compose.runtime.key("pin_${id.name}") {
+                        val isDragging = draggingPinnedTool == id
+                        val enabled = com.littlecodesauce.ggnext.ui.model.isToolEnabled(id, ui.tab, ui)
+                        val maxContentX = (pinnedTools.size * itemSpanPx - itemSpacingPx - itemWidthPx * 0.5f)
+                            .coerceAtLeast(itemWidthPx * 0.5f)
+                        val draggedCenterX = ((viewportFingerXPinned + pinnedScrollState.value) - grabOffsetPinnedPx)
+                            .coerceIn(itemWidthPx * 0.5f, maxContentX)
+                        val slotCenterX = idx * itemSpanPx + itemWidthPx * 0.5f
+                        val directTx = if (isDragging) (draggedCenterX - slotCenterX) else 0f
+
+                        ToolIconItem(
+                            id = id,
+                            enabled = enabled,
+                            isDragging = isDragging,
+                            translationX = directTx,
+                            isPinned = true,
+                            interactionEnabled = draggingFlowingTool == null && draggingPinnedTool == null,
+                            onClick = {
+                                if (!enabled) {
+                                    Session.toast("当前无可选项目")
+                                    return@ToolIconItem
+                                }
+                                when (id) {
+                                    ToolId.EXEC_SCRIPT -> onScript()
+                                    ToolId.MENU -> onMoreMenu()
+                                    else -> onTool(id)
+                                }
                             }
-                            when (id) {
-                                ToolId.EXEC_SCRIPT -> onScript()
-                                ToolId.MENU -> onMoreMenu()
-                                else -> onTool(id)
-                            }
-                        }
-                    )
+                        )
+                    }
                 }
             }
         }
@@ -477,7 +547,7 @@ fun ToolBar(
 }
 
 /**
- * 工具栏图标渲染组件（支持主题色高亮，支持平滑无回弹拖拽位移渲染）
+ * 工具栏图标渲染组件（支持主题色高亮，支持 1:1 零延迟拖拽跟手渲染）
  */
 @Composable
 private fun ToolIconItem(
@@ -486,13 +556,14 @@ private fun ToolIconItem(
     isDragging: Boolean,
     translationX: Float,
     isPinned: Boolean = false,
+    interactionEnabled: Boolean = true,
     onClick: () -> Unit
 ) {
     var pressed by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(
         targetValue = when {
             isDragging -> 1.12f
-            pressed -> 0.88f
+            pressed && interactionEnabled -> 0.88f
             else -> 1f
         },
         animationSpec = Motion.Fast,
@@ -517,8 +588,10 @@ private fun ToolIconItem(
             )
             .clickableWithTooltip(
                 tooltip = id.label,
-                onPressChange = { pressed = it },
-                onClick = onClick
+                onPressChange = { pressed = it && interactionEnabled },
+                onClick = {
+                    if (interactionEnabled) onClick()
+                }
             ),
         contentAlignment = Alignment.Center
     ) {

@@ -83,6 +83,17 @@ class MemoryEngine {
     private var nativeHandle: Long = 0L
     @Volatile
     private var cachedRegions: List<MemoryRegion> = emptyList()
+    private val removedAddresses: MutableSet<Long> = java.util.Collections.synchronizedSet(HashSet<Long>())
+
+    fun markRemoved(addresses: Collection<Long>) {
+        if (addresses.isNotEmpty()) {
+            removedAddresses.addAll(addresses)
+        }
+    }
+
+    fun clearRemoved() {
+        removedAddresses.clear()
+    }
 
     /**
      * 附加到目标进程：
@@ -97,6 +108,7 @@ class MemoryEngine {
         context: Context? = null
     ): Boolean {
         clearNativeFreezes()
+        removedAddresses.clear()
         pid = targetPid
         x64 = targetX64
         isRootModeActive = isRootMode
@@ -170,6 +182,7 @@ class MemoryEngine {
 
     fun detach() {
         clearNativeFreezes()
+        removedAddresses.clear()
         pid = 0
         attachedOk = false
         rootDaemonActive = false
@@ -522,13 +535,16 @@ class MemoryEngine {
     ): SearchResult {
         if (!attachedOk || pid <= 0) return SearchResult(emptyList(), 0L)
         val newSearch = previous == null
+        if (newSearch) {
+            removedAddresses.clear()
+        }
         val current = previous.orEmpty()
         val fetchCap = criteria.limit.coerceIn(2000, MAX_CACHED_CANDIDATES)
         return when {
             rootDaemonActive -> searchViaRootDaemon(criteria, criteria.selectedRegions, current, newSearch, fetchCap, onProgress)
-            nativeBackendActive && nativeHandle != 0L -> searchViaNativeBridge(criteria, criteria.selectedRegions, current, newSearch, fetchCap)
+            nativeBackendActive && nativeHandle != 0L -> searchViaNativeBridge(criteria, criteria.selectedRegions, current, newSearch, fetchCap, onProgress)
             else -> {
-                val items = searchRealJvmFallback(criteria, criteria.selectedRegions, current, newSearch, fetchCap)
+                val items = searchRealJvmFallback(criteria, criteria.selectedRegions, current, newSearch, fetchCap, onProgress)
                 SearchResult(items, items.size.toLong())
             }
         }
@@ -773,20 +789,27 @@ class MemoryEngine {
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): SearchResult {
         if (!attachedOk || pid <= 0) return SearchResult(emptyList(), 0L)
-        val ptrType = if (type == ValueType.AUTO || type == ValueType.DWORD) {
+        val ptrType = if (type == ValueType.AUTO) {
             if (x64) ValueType.QWORD else ValueType.DWORD
-        } else type
-        val cleanTarget = targetAddress and 0x00FFFFFFFFFFFFFFL
-        val lo = (cleanTarget - maxOffset.coerceAtLeast(0L)).coerceAtLeast(0L)
-        val hi = cleanTarget + maxOffset.coerceAtLeast(0L)
+        } else (type and 0x7F)
+        val cleanTarget = if (ptrType == ValueType.DWORD) {
+            targetAddress and 0xFFFFFFFFL
+        } else {
+            targetAddress and 0x00FFFFFFFFFFFFFFL
+        }
+        val absOffset = abs(maxOffset).coerceAtLeast(0L)
+        val lo = (cleanTarget - absOffset).coerceAtLeast(0L)
+        val hi = cleanTarget + absOffset
         val fetchCap = limit.coerceIn(2000, MAX_CACHED_CANDIDATES)
+        val nativeDt = NativeMemBridge.toNativeDataType(ptrType)
 
         if (previous == null) {
+            removedAddresses.clear()
             if (rootDaemonActive) {
                 val mask = NativeMemBridge.buildRegionMask(selectedRegions)
                 RootMemDaemon.setRegionMask(mask)
                 val totalFound = RootMemDaemon.searchRange(
-                    NativeMemBridge.toNativeDataType(ptrType),
+                    nativeDt,
                     lo,
                     hi,
                     lo.toDouble(),
@@ -818,7 +841,7 @@ class MemoryEngine {
                 NativeMemBridge.nativeSetRegionMask(nativeHandle, mask)
                 NativeMemBridge.nativeSearchRange(
                     nativeHandle,
-                    NativeMemBridge.toNativeDataType(ptrType),
+                    nativeDt,
                     lo,
                     hi,
                     lo.toDouble(),
@@ -827,38 +850,133 @@ class MemoryEngine {
                     true
                 )
                 val totalFound = NativeMemBridge.nativeGetCandidateCount(nativeHandle)
-                val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap)
-                if (packed != null && packed.isNotEmpty()) {
-                    val out = ArrayList<MemoryItem>(packed.size / 3)
-                    var i = 0
-                    while (i + 2 < packed.size) {
-                        val addr = packed[i]
-                        val rawVal = packed[i + 1]
-                        val meta = packed[i + 2].toInt()
-                        val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((meta ushr 8) and 0xFFFF))
-                        out.add(
-                            MemoryItem(
-                                address = addr,
-                                value = rawVal,
-                                previousValue = rawVal,
-                                flags = ptrType,
-                                region = regCode,
-                                pointer = classifyPointer(rawVal)
-                            )
+                onProgress?.invoke(1L, 1L, totalFound)
+                val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap) ?: LongArray(0)
+                val out = ArrayList<MemoryItem>(packed.size / 3)
+                var i = 0
+                while (i + 2 < packed.size) {
+                    val addr = packed[i]
+                    val rawVal = packed[i + 1]
+                    val meta = packed[i + 2].toInt()
+                    val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((meta ushr 8) and 0xFFFF))
+                    out.add(
+                        MemoryItem(
+                            address = addr,
+                            value = rawVal,
+                            previousValue = rawVal,
+                            flags = ptrType,
+                            region = regCode,
+                            pointer = classifyPointer(rawVal)
                         )
-                        i += 3
-                    }
-                    return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
+                    )
+                    i += 3
                 }
+                return SearchResult(out, totalFound.coerceAtLeast(out.size.toLong()))
             }
+
+            val c = Criteria(
+                type = ptrType,
+                value = lo,
+                from = lo,
+                to = hi,
+                isRange = true,
+                notRange = false,
+                sign = ValueType.SIGN_EQUAL,
+                selectedRegions = selectedRegions,
+                limit = fetchCap
+            )
+            val fallback = searchRealJvmFallback(c, selectedRegions, emptyList(), newSearch = true, maxResults = fetchCap, onProgress = onProgress)
+            return SearchResult(fallback, fallback.size.toLong())
         }
 
-        val matched = previous.orEmpty().mapNotNull { item ->
-            val v = read(item.address, ValueType.sizeOf(ptrType))
-            val cleanVal = v and 0x00FFFFFFFFFFFFFFL
-            if (item.region in selectedRegions && cleanVal in lo..hi) {
-                item.copy(value = v, previousValue = item.value, pointer = classifyPointer(v))
-            } else null
+        // previous != null: 在已有候选集上改善指针搜索
+        if (rootDaemonActive) {
+            val totalFound = RootMemDaemon.refineRange(
+                nativeDt,
+                lo,
+                hi,
+                lo.toDouble(),
+                hi.toDouble(),
+                true,
+                onProgress
+            )
+            val extra = removedAddresses.size.coerceAtMost(10000)
+            val cands = RootMemDaemon.getCandidates(0, fetchCap + extra)
+            val out = ArrayList<MemoryItem>(min(cands.size, fetchCap))
+            for (c in cands) {
+                if (c.address in removedAddresses) continue
+                val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((c.meta ushr 8) and 0xFFFF))
+                if (regCode in selectedRegions) {
+                    out.add(
+                        MemoryItem(
+                            address = c.address,
+                            value = c.rawValue,
+                            previousValue = c.rawValue,
+                            flags = ptrType,
+                            region = regCode,
+                            pointer = classifyPointer(c.rawValue)
+                        )
+                    )
+                    if (out.size >= fetchCap) break
+                }
+            }
+            val adjTotal = (totalFound - removedAddresses.size).coerceAtLeast(out.size.toLong())
+            return SearchResult(out, adjTotal)
+        }
+
+        if (nativeBackendActive && nativeHandle != 0L) {
+            NativeMemBridge.nativeRefineRange(
+                nativeHandle,
+                nativeDt,
+                lo,
+                hi,
+                lo.toDouble(),
+                hi.toDouble(),
+                true
+            )
+            val totalFound = NativeMemBridge.nativeGetCandidateCount(nativeHandle)
+            onProgress?.invoke(1L, 1L, totalFound)
+            val extra = removedAddresses.size.coerceAtMost(10000)
+            val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, fetchCap + extra) ?: LongArray(0)
+            val out = ArrayList<MemoryItem>(min(packed.size / 3, fetchCap))
+            var i = 0
+            while (i + 2 < packed.size && out.size < fetchCap) {
+                val addr = packed[i]
+                val rawVal = packed[i + 1]
+                val meta = packed[i + 2].toInt()
+                i += 3
+                if (addr in removedAddresses) continue
+                val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl ((meta ushr 8) and 0xFFFF))
+                if (regCode in selectedRegions) {
+                    out.add(
+                        MemoryItem(
+                            address = addr,
+                            value = rawVal,
+                            previousValue = rawVal,
+                            flags = ptrType,
+                            region = regCode,
+                            pointer = classifyPointer(rawVal)
+                        )
+                    )
+                }
+            }
+            val adjTotal = (totalFound - removedAddresses.size).coerceAtLeast(out.size.toLong())
+            return SearchResult(out, adjTotal)
+        }
+
+        val itemSz = ValueType.sizeOf(ptrType)
+        val filteredPrev = previous.filter { it.region in selectedRegions && it.address !in removedAddresses }
+        val rawMap = batchReadRawValues(filteredPrev.map { it.address to itemSz })
+        val matched = ArrayList<MemoryItem>()
+        for ((idx, item) in filteredPrev.withIndex()) {
+            val v = rawMap[item.address] ?: read(item.address, itemSz)
+            val cleanVal = if (ptrType == ValueType.DWORD) (v and 0xFFFFFFFFL) else (v and 0x00FFFFFFFFFFFFFFL)
+            if (cleanVal in lo..hi) {
+                matched.add(item.copy(value = v, previousValue = item.value, flags = ptrType, pointer = classifyPointer(v)))
+            }
+            if ((idx and 0xFF) == 0 || idx + 1 == filteredPrev.size) {
+                onProgress?.invoke((idx + 1).toLong(), filteredPrev.size.coerceAtLeast(1).toLong(), matched.size.toLong())
+            }
         }
         return SearchResult(matched.take(fetchCap), matched.size.toLong())
     }
@@ -993,12 +1111,51 @@ class MemoryEngine {
                     )
                 }
                 else -> {
-                    val fallback = searchRealJvmFallback(c, regions, current, true, maxResults)
+                    val fallback = searchRealJvmFallback(c, regions, current, true, maxResults, onProgress)
                     return SearchResult(fallback, fallback.size.toLong())
                 }
             }
         } else {
             when {
+                c.orderedGroup.size > 1 -> {
+                    val count = c.orderedGroup.size
+                    val typesArr = IntArray(count) { i ->
+                        NativeMemBridge.toNativeDataType(c.groupTypes.getOrElse(i) { c.type })
+                    }
+                    val intArr = LongArray(count) { i -> c.orderedGroup[i] }
+                    val fltArr = DoubleArray(count) { i ->
+                        val gt = c.groupTypes.getOrElse(i) { c.type } and 0x7F
+                        val raw = c.orderedGroup[i]
+                        when (gt) {
+                            ValueType.FLOAT -> Float.fromBits(raw.toInt()).toDouble()
+                            ValueType.DOUBLE -> Double.fromBits(raw)
+                            else -> raw.toDouble()
+                        }
+                    }
+                    val intMaxArr = LongArray(count) { i -> c.groupTo.getOrElse(i) { c.orderedGroup[i] } }
+                    val fltMaxArr = DoubleArray(count) { i ->
+                        val gt = c.groupTypes.getOrElse(i) { c.type } and 0x7F
+                        val raw = c.groupTo.getOrElse(i) { c.orderedGroup[i] }
+                        when (gt) {
+                            ValueType.FLOAT -> Float.fromBits(raw.toInt()).toDouble()
+                            ValueType.DOUBLE -> Double.fromBits(raw)
+                            else -> raw.toDouble()
+                        }
+                    }
+                    val opsArr = IntArray(count) { i -> c.groupOps.getOrElse(i) { 0 } }
+                    RootMemDaemon.refineGroup(
+                        typesArr,
+                        intArr,
+                        fltArr,
+                        intMaxArr,
+                        fltMaxArr,
+                        opsArr,
+                        c.area.coerceIn(2, 65536),
+                        c.ordered,
+                        true,
+                        onProgress
+                    )
+                }
                 c.xorOffset != 0 -> {
                     RootMemDaemon.refineEncoded(
                         nativeDt,
@@ -1045,16 +1202,22 @@ class MemoryEngine {
                     RootMemDaemon.refineExact(nativeDt, c.value, fVal1, 1e-4, onProgress)
                 }
                 else -> {
-                    val refined = refineLoadedCandidates(c, current, maxResults)
+                    val refined = refineLoadedCandidates(c, current, maxResults, onProgress)
                     return SearchResult(refined, refined.size.toLong())
                 }
             }
         }
 
-        val cands = RootMemDaemon.getCandidates(0, maxResults)
-        val out = ArrayList<MemoryItem>(cands.size)
+        val extraFetch = if (newSearch) 0 else removedAddresses.size.coerceAtMost(10000)
+        val cands = RootMemDaemon.getCandidates(0, maxResults + extraFetch)
+        val out = ArrayList<MemoryItem>(min(cands.size, maxResults))
         val hasAddrFilter = (c.memoryFrom != 0L || c.memoryTo != Long.MAX_VALUE)
+        var skippedRemoved = 0L
         for (cand in cands) {
+            if (!newSearch && cand.address in removedAddresses) {
+                skippedRemoved++
+                continue
+            }
             val dt = NativeMemBridge.fromNativeDataType(cand.meta and 0xFF)
             val regFlag = (cand.meta ushr 8) and 0xFFFF
             val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl regFlag)
@@ -1064,14 +1227,16 @@ class MemoryEngine {
                         address = cand.address,
                         value = cand.rawValue,
                         previousValue = cand.rawValue,
-                        flags = if (c.type == ValueType.AUTO) dt else c.type,
+                        flags = if (c.type == ValueType.AUTO || c.orderedGroup.size > 1) dt else c.type,
                         region = regCode,
                         pointer = classifyPointer(cand.rawValue)
                     )
                 )
+                if (out.size >= maxResults) break
             }
         }
-        val reportedTotal = if (hasAddrFilter) out.size.toLong() else totalFound.coerceAtLeast(out.size.toLong())
+        val effectiveTotal = (totalFound - skippedRemoved).coerceAtLeast(out.size.toLong())
+        val reportedTotal = if (hasAddrFilter) out.size.toLong() else effectiveTotal
         return SearchResult(out, reportedTotal)
     }
 
@@ -1083,7 +1248,8 @@ class MemoryEngine {
         regions: Set<String>,
         current: List<MemoryItem>,
         newSearch: Boolean,
-        maxResults: Int
+        maxResults: Int,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
     ): SearchResult {
         val regMask = NativeMemBridge.buildRegionMask(regions)
         NativeMemBridge.nativeSetRegionMask(nativeHandle, regMask)
@@ -1203,12 +1369,51 @@ class MemoryEngine {
                     )
                 }
                 else -> {
-                    val fallback = searchRealJvmFallback(c, regions, current, true, maxResults)
+                    val fallback = searchRealJvmFallback(c, regions, current, true, maxResults, onProgress)
                     return SearchResult(fallback, fallback.size.toLong())
                 }
             }
         } else {
             when {
+                c.orderedGroup.size > 1 -> {
+                    val count = c.orderedGroup.size
+                    val typesArr = IntArray(count) { i ->
+                        NativeMemBridge.toNativeDataType(c.groupTypes.getOrElse(i) { c.type })
+                    }
+                    val intArr = LongArray(count) { i -> c.orderedGroup[i] }
+                    val fltArr = DoubleArray(count) { i ->
+                        val gt = c.groupTypes.getOrElse(i) { c.type } and 0x7F
+                        val raw = c.orderedGroup[i]
+                        when (gt) {
+                            ValueType.FLOAT -> Float.fromBits(raw.toInt()).toDouble()
+                            ValueType.DOUBLE -> Double.fromBits(raw)
+                            else -> raw.toDouble()
+                        }
+                    }
+                    val intMaxArr = LongArray(count) { i -> c.groupTo.getOrElse(i) { c.orderedGroup[i] } }
+                    val fltMaxArr = DoubleArray(count) { i ->
+                        val gt = c.groupTypes.getOrElse(i) { c.type } and 0x7F
+                        val raw = c.groupTo.getOrElse(i) { c.orderedGroup[i] }
+                        when (gt) {
+                            ValueType.FLOAT -> Float.fromBits(raw.toInt()).toDouble()
+                            ValueType.DOUBLE -> Double.fromBits(raw)
+                            else -> raw.toDouble()
+                        }
+                    }
+                    val opsArr = IntArray(count) { i -> c.groupOps.getOrElse(i) { 0 } }
+                    NativeMemBridge.nativeRefineGroup(
+                        nativeHandle,
+                        typesArr,
+                        intArr,
+                        fltArr,
+                        intMaxArr,
+                        fltMaxArr,
+                        opsArr,
+                        c.area.coerceIn(2, 65536),
+                        c.ordered,
+                        true
+                    )
+                }
                 c.xorOffset != 0 -> {
                     NativeMemBridge.nativeRefineEncoded(
                         nativeHandle,
@@ -1255,21 +1460,29 @@ class MemoryEngine {
                     NativeMemBridge.nativeRefineExact(nativeHandle, nativeDt, c.value, fVal1, 1e-4)
                 }
                 else -> {
-                    val refined = refineLoadedCandidates(c, current, maxResults)
+                    val refined = refineLoadedCandidates(c, current, maxResults, onProgress)
                     return SearchResult(refined, refined.size.toLong())
                 }
             }
         }
 
         val totalFound = NativeMemBridge.nativeGetCandidateCount(nativeHandle)
-        val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, maxResults) ?: LongArray(0)
-        val out = ArrayList<MemoryItem>(packed.size / 3)
+        onProgress?.invoke(1L, 1L, totalFound)
+        val extraFetch = if (newSearch) 0 else removedAddresses.size.coerceAtMost(10000)
+        val packed = NativeMemBridge.nativeGetCandidatesPacked(nativeHandle, 0, maxResults + extraFetch) ?: LongArray(0)
+        val out = ArrayList<MemoryItem>(min(packed.size / 3, maxResults))
         val hasAddrFilter = (c.memoryFrom != 0L || c.memoryTo != Long.MAX_VALUE)
+        var skippedRemoved = 0L
         var idx = 0
         while (idx + 2 < packed.size) {
             val addr = packed[idx]
             val rawVal = packed[idx + 1]
             val meta = packed[idx + 2].toInt()
+            idx += 3
+            if (!newSearch && addr in removedAddresses) {
+                skippedRemoved++
+                continue
+            }
             val dt = NativeMemBridge.fromNativeDataType(meta and 0xFF)
             val regFlag = (meta ushr 8) and 0xFFFF
             val regCode = NativeMemBridge.fromNativeRegionFlag(1 shl regFlag)
@@ -1280,39 +1493,58 @@ class MemoryEngine {
                         address = addr,
                         value = rawVal,
                         previousValue = rawVal,
-                        flags = if (c.type == ValueType.AUTO) dt else c.type,
+                        flags = if (c.type == ValueType.AUTO || c.orderedGroup.size > 1) dt else c.type,
                         region = regCode,
                         pointer = classifyPointer(rawVal)
                     )
                 )
+                if (out.size >= maxResults) break
             }
-            idx += 3
         }
-        val reportedTotal = if (hasAddrFilter) out.size.toLong() else totalFound.coerceAtLeast(out.size.toLong())
+        val effectiveTotal = (totalFound - skippedRemoved).coerceAtLeast(out.size.toLong())
+        val reportedTotal = if (hasAddrFilter) out.size.toLong() else effectiveTotal
         return SearchResult(out, reportedTotal)
     }
 
     private fun refineLoadedCandidates(
         criteria: Criteria,
         current: List<MemoryItem>,
-        maxResults: Int
+        maxResults: Int,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
     ): List<MemoryItem> {
-        val out = ArrayList<MemoryItem>(min(maxResults, current.size))
+        val eligible = current.filter { it.address !in removedAddresses && addressMatchesRangeAndMask(it.address, criteria) }
+        if (eligible.isEmpty()) {
+            onProgress?.invoke(1L, 1L, 0L)
+            return emptyList()
+        }
+        val out = ArrayList<MemoryItem>(min(maxResults, eligible.size))
         val prevMap = current.associate { it.address to it.value }
-        for (item in current) {
-            if (!addressMatchesRangeAndMask(item.address, criteria)) continue
-            val itemSize = ValueType.sizeOf(item.flags and 0x7F)
-            val v = read(item.address, itemSize)
-            if (matches(v, criteria.copy(type = item.flags and 0x7F), prevMap, item.address)) {
-                out.add(
-                    item.copy(
-                        value = v,
-                        previousValue = item.value,
-                        pointer = classifyPointer(v)
-                    )
-                )
-                if (out.size >= maxResults) break
+        val total = eligible.size.toLong()
+        var processed = 0L
+
+        for (chunk in eligible.chunked(512)) {
+            val batchReq = chunk.map { item ->
+                item.address to ValueType.sizeOf(item.flags and 0x7F).coerceIn(1, 8)
             }
+            val batchVals = batchReadRawValues(batchReq)
+            for (item in chunk) {
+                val itemType = item.flags and 0x7F
+                val itemSize = ValueType.sizeOf(itemType).coerceIn(1, 8)
+                val v = batchVals[item.address] ?: read(item.address, itemSize)
+                if (matches(v, criteria.copy(type = itemType), prevMap, item.address)) {
+                    out.add(
+                        item.copy(
+                            value = v,
+                            previousValue = item.value,
+                            pointer = classifyPointer(v)
+                        )
+                    )
+                    if (out.size >= maxResults) break
+                }
+            }
+            processed += chunk.size
+            onProgress?.invoke(processed, total, out.size.toLong())
+            if (out.size >= maxResults) break
         }
         return out
     }
@@ -1510,10 +1742,11 @@ class MemoryEngine {
         regions: Set<String>,
         current: List<MemoryItem>,
         newSearch: Boolean,
-        maxResults: Int
+        maxResults: Int,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
     ): List<MemoryItem> {
         if (!newSearch && current.isNotEmpty()) {
-            return refineLoadedCandidates(criteria, current, maxResults)
+            return refineLoadedCandidates(criteria, current, maxResults, onProgress)
         }
 
         val targetType = if (criteria.type == ValueType.AUTO) ValueType.DWORD else criteria.type

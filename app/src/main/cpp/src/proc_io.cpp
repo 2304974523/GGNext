@@ -105,13 +105,31 @@ EngineErrc ProcIO::attach(int pid) {
         m_memFd = ::open(memPath, O_RDONLY | O_CLOEXEC);
     }
     if (m_memFd < 0 && (errno == EPERM || errno == EACCES)) {
-        // Check if process_vm_readv is also blocked by EPERM
+        // Check if /proc/[pid]/maps is accessible (e.g., same-UID / android:sharedUserId process)
+        char mapsPath[64];
+        std::snprintf(mapsPath, sizeof(mapsPath), "/proc/%d/maps", pid);
+        uintptr_t probeAddr = 0;
+        if (FILE* mfp = std::fopen(mapsPath, "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof(line), mfp)) {
+                unsigned long long start = 0, end = 0;
+                char perms[8] = {0};
+                if (std::sscanf(line, "%llx-%llx %7s", &start, &end, perms) == 3 &&
+                    perms[0] == 'r' && end > start && start > 0) {
+                    probeAddr = static_cast<uintptr_t>(start);
+                    break;
+                }
+            }
+            std::fclose(mfp);
+        }
         uint8_t dummy = 0;
-        struct iovec l_iov{&dummy, 0};
-        struct iovec r_iov{nullptr, 0};
+        struct iovec l_iov{&dummy, probeAddr != 0 ? 1u : 0u};
+        struct iovec r_iov{reinterpret_cast<void*>(probeAddr), probeAddr != 0 ? 1u : 0u};
         if (::process_vm_readv(m_pid, &l_iov, 1, &r_iov, 1, 0) < 0 && (errno == EPERM || errno == EACCES)) {
-            m_pid = -1;
-            return EngineErrc::ERR_PERM;
+            if (probeAddr == 0) {
+                m_pid = -1;
+                return EngineErrc::ERR_PERM;
+            }
         }
     }
 

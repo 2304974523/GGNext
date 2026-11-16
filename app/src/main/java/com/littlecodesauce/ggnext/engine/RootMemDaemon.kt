@@ -466,11 +466,39 @@ object RootMemDaemon {
         ordered: Boolean,
         aligned: Boolean,
         onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): Long = sendGroupCmd("SEARCH_GROUP", types, intVals, floatVals, intMaxVals, floatMaxVals, fieldOps, windowSize, ordered, aligned, onProgress)
+
+    @Synchronized
+    fun refineGroup(
+        types: IntArray,
+        intVals: LongArray,
+        floatVals: DoubleArray,
+        intMaxVals: LongArray,
+        floatMaxVals: DoubleArray,
+        fieldOps: IntArray,
+        windowSize: Int,
+        ordered: Boolean,
+        aligned: Boolean,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): Long = sendGroupCmd("REFINE_GROUP", types, intVals, floatVals, intMaxVals, floatMaxVals, fieldOps, windowSize, ordered, aligned, onProgress)
+
+    private fun sendGroupCmd(
+        cmdName: String,
+        types: IntArray,
+        intVals: LongArray,
+        floatVals: DoubleArray,
+        intMaxVals: LongArray,
+        floatMaxVals: DoubleArray,
+        fieldOps: IntArray,
+        windowSize: Int,
+        ordered: Boolean,
+        aligned: Boolean,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
         val ord = if (ordered) 1 else 0
         val aln = if (aligned) 1 else 0
         val sb = StringBuilder()
-        sb.append("SEARCH_GROUP ").append(windowSize).append(' ')
+        sb.append(cmdName).append(' ').append(windowSize).append(' ')
             .append(ord).append(' ').append(aln).append(' ').append(types.size)
         for (i in types.indices) {
             val iMax = intMaxVals.getOrElse(i) { intVals[i] }

@@ -308,6 +308,11 @@ void SimdKernel::scanRange(const uint8_t* buf, size_t len, T minVal, T maxVal, b
     }
 #endif
 
+    const bool checkArm64TbiPointer = std::is_same_v<T, int64_t> &&
+        minVal >= static_cast<T>(0x10000LL) &&
+        maxVal <= static_cast<T>(0x00FFFFFFFFFFFFFFLL) &&
+        minVal <= maxVal;
+
     for (; i + tSize <= len; i += step) {
         T val;
         std::memcpy(&val, buf + i, tSize);
@@ -315,6 +320,17 @@ void SimdKernel::scanRange(const uint8_t* buf, size_t len, T minVal, T maxVal, b
             if (std::isnan(val)) continue;
         }
         bool ok = inclusive ? (val >= minVal && val <= maxVal) : (val > minVal && val < maxVal);
+        if (!ok && checkArm64TbiPointer) {
+            if constexpr (std::is_same_v<T, int64_t>) {
+                uint64_t uval = static_cast<uint64_t>(val);
+                uint8_t topByte = static_cast<uint8_t>(uval >> 56);
+                if (topByte != 0 && topByte != 0xFF) {
+                    int64_t untagged = static_cast<int64_t>(uval & 0x00FFFFFFFFFFFFFFULL);
+                    ok = inclusive ? (untagged >= minVal && untagged <= maxVal)
+                                   : (untagged >  minVal && untagged <  maxVal);
+                }
+            }
+        }
         if (ok) outOffsets.push_back(i);
     }
 }

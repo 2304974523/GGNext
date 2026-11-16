@@ -174,7 +174,7 @@ private fun SingleHomePage(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("GGNext", color = Rose.Text, fontSize = fsp(21f), fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.width(8.dp))
-                    Text("v0.5", color = Rose.TextDim, fontSize = fsp(12f), fontWeight = FontWeight.Medium)
+                    Text("v0.6", color = Rose.TextDim, fontSize = fsp(12f), fontWeight = FontWeight.Medium)
                 }
                 Text(
                     text = tr("Android 内存调试工具"),

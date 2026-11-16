@@ -241,8 +241,18 @@ bool evalSingleRange(const uint8_t* ptr, DataType dt, int64_t iMin, int64_t iMax
         case DataType::INT64: {
             int64_t v = 0;
             std::memcpy(&v, ptr, 8);
-            return inclusive ? (v >= iMin && v <= iMax)
-                             : (v >  iMin && v <  iMax);
+            bool ok = inclusive ? (v >= iMin && v <= iMax)
+                                : (v >  iMin && v <  iMax);
+            if (!ok && iMin >= 0x10000LL && iMax <= 0x00FFFFFFFFFFFFFFLL && iMin <= iMax) {
+                uint64_t uv = static_cast<uint64_t>(v);
+                uint8_t topByte = static_cast<uint8_t>(uv >> 56);
+                if (topByte != 0 && topByte != 0xFF) {
+                    int64_t untagged = static_cast<int64_t>(uv & 0x00FFFFFFFFFFFFFFULL);
+                    ok = inclusive ? (untagged >= iMin && untagged <= iMax)
+                                   : (untagged >  iMin && untagged <  iMax);
+                }
+            }
+            return ok;
         }
         case DataType::FLOAT: {
             float v = 0.0f;
@@ -2346,6 +2356,8 @@ EngineErrc SearchEngine::searchGroup(
                 uint8_t rTag = regionFlagToIndex(task.regionFlag);
                 bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
                 size_t chunkMatches = 0;
+                const size_t numFields = query.fields.size();
+                std::vector<size_t> matchedOffsets(numFields, 0);
 
                 for (size_t aOff : anchorOffsets) {
                     if (!isRangeInValidPages(aOff, anchorSz, task.startAddr, pageSize, validMask)) continue;
@@ -2356,6 +2368,7 @@ EngineErrc SearchEngine::searchGroup(
                     bool allMatched = true;
                     size_t minMatchedOffset = aOff;
                     size_t maxMatchedEnd    = aOff + anchorSz;
+                    matchedOffsets[anchorIdx] = aOff;
 
                     if (query.ordered) {
                         size_t curUpperBound = aOff;
@@ -2364,8 +2377,8 @@ EngineErrc SearchEngine::searchGroup(
                         for (size_t rev = 0; rev < anchorIdx; ++rev) {
                             size_t fIdx = anchorIdx - 1 - rev;
                             const auto& fld = query.fields[fIdx];
-                            size_t fSz = dataTypeSize(fld.type);
-                            size_t fStep = query.aligned ? std::max<size_t>(fSz, 4) : 1;
+                            size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
+                            size_t fStep = query.aligned ? fSz : 1;
 
                             if (curUpperBound < winStart + fSz) {
                                 allMatched = false;
@@ -2380,6 +2393,7 @@ EngineErrc SearchEngine::searchGroup(
                             bool foundField = false;
                             for (size_t pos = maxPos; pos >= winStart; ) {
                                 if (evalGroupField(buf.data() + pos, fld)) {
+                                    matchedOffsets[fIdx] = pos;
                                     curUpperBound = pos;
                                     if (fIdx == 0) firstFieldOffset = pos;
                                     foundField = true;
@@ -2398,11 +2412,12 @@ EngineErrc SearchEngine::searchGroup(
                         minMatchedOffset = (anchorIdx == 0) ? aOff : firstFieldOffset;
 
                         size_t prevEnd = aOff + anchorSz;
-                        size_t allowedEnd = std::min(task.readLen, minMatchedOffset + query.maxSpanBytes);
+                        // In Original GG, "100;200::100" means the address distance (lastAddr - firstAddr) <= maxSpanBytes
+                        size_t maxAllowedStart = minMatchedOffset + query.maxSpanBytes;
 
-                        for (size_t fIdx = anchorIdx + 1; fIdx < query.fields.size(); ++fIdx) {
+                        for (size_t fIdx = anchorIdx + 1; fIdx < numFields; ++fIdx) {
                             const auto& fld = query.fields[fIdx];
-                            size_t fSz = dataTypeSize(fld.type);
+                            size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
                             size_t fStep = query.aligned ? fSz : 1;
                             size_t alignedStart = prevEnd;
                             if (fStep > 1 && (alignedStart % fStep) != 0) {
@@ -2410,8 +2425,9 @@ EngineErrc SearchEngine::searchGroup(
                             }
 
                             bool foundField = false;
-                            for (size_t pos = alignedStart; pos + fSz <= allowedEnd; pos += fStep) {
+                            for (size_t pos = alignedStart; pos <= maxAllowedStart && pos + fSz <= task.readLen; pos += fStep) {
                                 if (evalGroupField(buf.data() + pos, fld)) {
+                                    matchedOffsets[fIdx] = pos;
                                     prevEnd = pos + fSz;
                                     maxMatchedEnd = prevEnd;
                                     foundField = true;
@@ -2423,57 +2439,110 @@ EngineErrc SearchEngine::searchGroup(
                                 break;
                             }
                         }
+
+                        if (allMatched && (matchedOffsets[numFields - 1] - matchedOffsets[0]) > query.maxSpanBytes) {
+                            allMatched = false;
+                        }
                     } else {
-                        for (size_t fIdx = 0; fIdx < query.fields.size(); ++fIdx) {
+                        size_t minStartOff = aOff;
+                        size_t maxStartOff = aOff;
+                        size_t maxEndOff   = aOff + anchorSz;
+
+                        for (size_t fIdx = 0; fIdx < numFields; ++fIdx) {
                             if (fIdx == anchorIdx) continue;
                             const auto& fld = query.fields[fIdx];
-                            size_t fSz = dataTypeSize(fld.type);
+                            size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
                             size_t fStep = query.aligned ? fSz : 1;
-                            size_t alignedStart = winStart;
-                            if (fStep > 1 && (alignedStart % fStep) != 0) {
-                                alignedStart += fStep - (alignedStart % fStep);
+
+                            auto overlapsMatched = [&](size_t candPos, size_t candSz) noexcept -> bool {
+                                size_t candEnd = candPos + candSz;
+                                // Check anchor
+                                if (candPos < aOff + anchorSz && aOff < candEnd) return true;
+                                // Check all previously matched fields
+                                for (size_t prevIdx = 0; prevIdx < fIdx; ++prevIdx) {
+                                    if (prevIdx == anchorIdx) continue;
+                                    size_t pPos = matchedOffsets[prevIdx];
+                                    size_t pSz  = std::max<size_t>(1, dataTypeSize(query.fields[prevIdx].type));
+                                    if (candPos < pPos + pSz && pPos < candEnd) return true;
+                                }
+                                return false;
+                            };
+
+                            // Search outward from anchor aOff so we pick the closest valid match first
+                            size_t center = aOff;
+                            if (fStep > 1 && (center % fStep) != 0) {
+                                center -= (center % fStep);
                             }
 
                             bool foundField = false;
-                            for (size_t pos = alignedStart; pos + fSz <= winEnd; pos += fStep) {
-                                if (pos == aOff) continue;
-                                size_t candMin = std::min(minMatchedOffset, pos);
-                                size_t candMax = std::max(maxMatchedEnd, pos + fSz);
-                                if ((candMax - candMin) > query.maxSpanBytes) continue;
+                            size_t bestPos = 0;
+                            size_t maxRadius = query.maxSpanBytes;
 
-                                if (evalGroupField(buf.data() + pos, fld)) {
-                                    minMatchedOffset = candMin;
-                                    maxMatchedEnd    = candMax;
-                                    foundField       = true;
-                                    break;
+                            for (size_t dist = 0; dist <= maxRadius; dist += fStep) {
+                                // Try before anchor (center - dist) and after anchor (center + dist)
+                                for (int dir = 0; dir < 2; ++dir) {
+                                    if (dist == 0 && dir == 1) continue;
+                                    size_t pos = 0;
+                                    if (dir == 0) {
+                                        if (center < dist || center - dist < winStart) continue;
+                                        pos = center - dist;
+                                    } else {
+                                        pos = center + dist;
+                                    }
+                                    if (pos + fSz > winEnd || pos + fSz > task.readLen) continue;
+                                    if (overlapsMatched(pos, fSz)) continue;
+
+                                    size_t candMinStart = std::min(minStartOff, pos);
+                                    size_t candMaxStart = std::max(maxStartOff, pos);
+                                    if ((candMaxStart - candMinStart) > query.maxSpanBytes) continue;
+
+                                    if (evalGroupField(buf.data() + pos, fld)) {
+                                        bestPos = pos;
+                                        foundField = true;
+                                        break;
+                                    }
                                 }
+                                if (foundField) break;
                             }
+
                             if (!foundField) {
                                 allMatched = false;
                                 break;
                             }
+
+                            matchedOffsets[fIdx] = bestPos;
+                            minStartOff = std::min(minStartOff, bestPos);
+                            maxStartOff = std::max(maxStartOff, bestPos);
+                            maxEndOff   = std::max(maxEndOff, bestPos + fSz);
                         }
+
+                        minMatchedOffset = minStartOff;
+                        maxMatchedEnd    = maxEndOff;
                     }
 
                     if (allMatched && minMatchedOffset < task.logicalLen) {
                         size_t groupSpan = maxMatchedEnd - minMatchedOffset;
                         if (isRangeInValidPages(minMatchedOffset, groupSpan, task.startAddr, pageSize, validMask)) {
-                            chunkMatches++;
-                            if (!storeAlreadyFull) {
-                                CandidateEntry entry{};
-                                entry.address   = task.startAddr + minMatchedOffset;
-                                entry.rawValue  = extractRawValue(buf.data() + minMatchedOffset, query.fields[0].type);
-                                entry.type      = static_cast<uint8_t>(query.fields[0].type);
-                                entry.regionTag = rTag;
-                                localHits.push_back(entry);
-
-                                if (localHits.size() >= 16384) {
-                                    std::lock_guard<std::mutex> lk(storeMutex);
-                                    m_candidates.appendBatch(localHits.data(), localHits.size());
-                                    storedCount.store(m_candidates.size(), std::memory_order_relaxed);
-                                    localHits.clear();
-                                    if (m_candidates.isFull()) storeAlreadyFull = true;
+                            for (size_t k = 0; k < numFields; ++k) {
+                                size_t fOff = matchedOffsets[k];
+                                DataType fDt = query.fields[k].type;
+                                chunkMatches++;
+                                if (!storeAlreadyFull) {
+                                    CandidateEntry entry{};
+                                    entry.address   = task.startAddr + fOff;
+                                    entry.rawValue  = extractRawValue(buf.data() + fOff, fDt);
+                                    entry.type      = static_cast<uint8_t>(fDt);
+                                    entry.regionTag = rTag;
+                                    localHits.push_back(entry);
                                 }
+                            }
+
+                            if (!storeAlreadyFull && localHits.size() >= 16384) {
+                                std::lock_guard<std::mutex> lk(storeMutex);
+                                m_candidates.appendBatch(localHits.data(), localHits.size());
+                                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                localHits.clear();
+                                if (m_candidates.isFull()) storeAlreadyFull = true;
                             }
                         }
                     }
@@ -2499,7 +2568,9 @@ EngineErrc SearchEngine::searchGroup(
     if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
 
     m_candidates.sortByAddress();
-    m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
+    m_totalMatchedCount = m_candidates.isFull()
+        ? std::max(totalMatches.load(), m_candidates.size())
+        : m_candidates.size();
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
     m_lastTelemetry.totalVmasScanned  = m_regions.size();
@@ -2509,6 +2580,312 @@ EngineErrc SearchEngine::searchGroup(
     m_lastTelemetry.syscallsIssued    = syscalls.load();
     m_lastTelemetry.anchorFieldIndex  = anchorIdx;
     m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
+    return EngineErrc::OK;
+}
+
+EngineErrc SearchEngine::refineGroup(
+    const GroupSearchQuery& query,
+    CancellationToken* token,
+    ProgressCallback progress
+) {
+    if (query.fields.empty()) return EngineErrc::ERR_INVAL;
+    auto t0 = std::chrono::steady_clock::now();
+
+    m_snapshotStore.clear();
+    m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
+
+    if (m_candidates.empty()) {
+        m_totalMatchedCount = 0;
+        if (progress) progress(1, 1);
+        return EngineErrc::OK;
+    }
+
+    m_candidates.sortByAddress();
+    const size_t count = m_candidates.size();
+    const size_t numFields = query.fields.size();
+    const size_t maxSpan = std::max<size_t>(8, query.maxSpanBytes);
+
+    struct CoalescedGroup {
+        uintptr_t readStartAddr;
+        size_t    byteLen;
+        size_t    firstCandIdx;
+        size_t    lastCandIdx;
+    };
+
+    // Group candidates that are within maxSpan * 2 + 256 of each other
+    std::vector<CoalescedGroup> groups;
+    size_t idx = 0;
+    while (idx < count) {
+        uintptr_t firstAddr = m_candidates[idx].address;
+        DataType dt0 = static_cast<DataType>(m_candidates[idx].type);
+        size_t sz0 = std::max<size_t>(1, dataTypeSize(dt0));
+        uintptr_t clusterMin = firstAddr;
+        uintptr_t clusterMaxEnd = firstAddr + sz0;
+        size_t firstIdx = idx++;
+
+        while (idx < count) {
+            uintptr_t nextAddr = m_candidates[idx].address;
+            DataType nextDt = static_cast<DataType>(m_candidates[idx].type);
+            size_t nextSz = std::max<size_t>(1, dataTypeSize(nextDt));
+            uintptr_t nextEnd = nextAddr + nextSz;
+            if (nextAddr <= clusterMaxEnd + maxSpan + 256 && (nextEnd - clusterMin) <= 32768) {
+                if (nextEnd > clusterMaxEnd) clusterMaxEnd = nextEnd;
+                idx++;
+            } else {
+                break;
+            }
+        }
+
+        // If the cluster has fewer candidates than numFields (e.g. only anchor was stored previously),
+        // expand read window within the same 4KB page so neighboring fields can still be verified.
+        uintptr_t readStart = clusterMin;
+        uintptr_t readEnd   = clusterMaxEnd;
+        if ((idx - firstIdx) < numFields) {
+            uintptr_t pageFloor = clusterMin & ~static_cast<uintptr_t>(4095);
+            uintptr_t pageCeil  = (clusterMaxEnd + 4095) & ~static_cast<uintptr_t>(4095);
+            if (pageCeil == clusterMaxEnd) pageCeil += 4096;
+            readStart = (clusterMin > maxSpan) ? std::max(pageFloor, clusterMin - maxSpan) : pageFloor;
+            readEnd   = std::min(pageCeil, clusterMaxEnd + maxSpan + 16);
+        }
+
+        groups.push_back(CoalescedGroup{readStart, readEnd - readStart, firstIdx, idx});
+    }
+
+    MmapCandidateStore nextStore(MmapCandidateStore::DEFAULT_MEMORY_THRESHOLD, m_spillDir);
+    size_t syscallsIssued = 0;
+
+    if (progress) progress(0, std::max<size_t>(1, groups.size()));
+
+    constexpr size_t BATCH_GROUP_LIMIT = 1024;
+    std::vector<size_t> matchedCandIndices(numFields, 0);
+
+    for (size_t gBase = 0; gBase < groups.size(); gBase += BATCH_GROUP_LIMIT) {
+        if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
+        size_t gEnd = std::min(groups.size(), gBase + BATCH_GROUP_LIMIT);
+        size_t batchBytes = 0;
+        for (size_t i = gBase; i < gEnd; ++i) batchBytes += groups[i].byteLen;
+
+        std::vector<uint8_t> slab(batchBytes, 0);
+        std::vector<BatchReadRange> ranges(gEnd - gBase);
+        size_t offset = 0;
+        for (size_t i = gBase; i < gEnd; ++i) {
+            ranges[i - gBase].remoteAddr = groups[i].readStartAddr;
+            ranges[i - gBase].length     = groups[i].byteLen;
+            ranges[i - gBase].localBuf   = slab.data() + offset;
+            offset += groups[i].byteLen;
+        }
+
+        m_io.readBatchScattered(ranges);
+        syscallsIssued += (ranges.size() + m_io.iovMax() - 1) / m_io.iovMax();
+
+        for (size_t i = gBase; i < gEnd; ++i) {
+            const auto& br = ranges[i - gBase];
+            if (!br.success) continue;
+            const auto& grp = groups[i];
+            const size_t candCountInGrp = grp.lastCandIdx - grp.firstCandIdx;
+
+            if (candCountInGrp >= numFields) {
+                // Standard GG Group Refine: match query fields among existing candidates in this cluster
+                for (size_t startC = grp.firstCandIdx; startC < grp.lastCandIdx; ++startC) {
+                    const CandidateEntry& c0 = m_candidates[startC];
+                    const uint8_t* ptr0 = br.localBuf + (c0.address - grp.readStartAddr);
+
+                    if (query.ordered) {
+                        if (!evalGroupField(ptr0, query.fields[0])) continue;
+                        matchedCandIndices[0] = startC;
+                        uintptr_t prevEndAddr = c0.address + std::max<size_t>(1, dataTypeSize(query.fields[0].type));
+                        bool allOk = true;
+                        size_t searchFrom = startC + 1;
+
+                        for (size_t fIdx = 1; fIdx < numFields; ++fIdx) {
+                            const auto& fld = query.fields[fIdx];
+                            size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
+                            bool foundF = false;
+                            for (size_t candIdx = searchFrom; candIdx < grp.lastCandIdx; ++candIdx) {
+                                const CandidateEntry& cm = m_candidates[candIdx];
+                                if (cm.address < prevEndAddr) continue;
+                                if ((cm.address - c0.address) > query.maxSpanBytes) break;
+                                const uint8_t* ptrM = br.localBuf + (cm.address - grp.readStartAddr);
+                                if (evalGroupField(ptrM, fld)) {
+                                    matchedCandIndices[fIdx] = candIdx;
+                                    prevEndAddr = cm.address + fSz;
+                                    searchFrom = candIdx + 1;
+                                    foundF = true;
+                                    break;
+                                }
+                            }
+                            if (!foundF) {
+                                allOk = false;
+                                break;
+                            }
+                        }
+
+                        if (allOk) {
+                            for (size_t fIdx = 0; fIdx < numFields; ++fIdx) {
+                                CandidateEntry kept = m_candidates[matchedCandIndices[fIdx]];
+                                DataType fDt = query.fields[fIdx].type;
+                                const uint8_t* ptrK = br.localBuf + (kept.address - grp.readStartAddr);
+                                kept.rawValue = extractRawValue(ptrK, fDt);
+                                kept.type     = static_cast<uint8_t>(fDt);
+                                nextStore.append(kept);
+                            }
+                        }
+                    } else {
+                        // Unordered group refine across existing candidates in cluster
+                        if (!evalGroupField(ptr0, query.fields[0])) continue;
+                        matchedCandIndices[0] = startC;
+                        uintptr_t minAddr = c0.address;
+                        uintptr_t maxAddr = c0.address;
+                        bool allOk = true;
+
+                        for (size_t fIdx = 1; fIdx < numFields; ++fIdx) {
+                            const auto& fld = query.fields[fIdx];
+                            size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
+                            bool foundF = false;
+                            size_t bestCandIdx = 0;
+                            uint64_t bestDist = UINT64_MAX;
+
+                            for (size_t candIdx = grp.firstCandIdx; candIdx < grp.lastCandIdx; ++candIdx) {
+                                const CandidateEntry& cm = m_candidates[candIdx];
+                                uintptr_t candMin = std::min(minAddr, static_cast<uintptr_t>(cm.address));
+                                uintptr_t candMax = std::max(maxAddr, static_cast<uintptr_t>(cm.address));
+                                if ((candMax - candMin) > query.maxSpanBytes) {
+                                    if (cm.address > maxAddr + query.maxSpanBytes) break;
+                                    continue;
+                                }
+
+                                // Ensure distinct non-overlapping address from previously matched fields
+                                bool overlaps = false;
+                                for (size_t p = 0; p < fIdx; ++p) {
+                                    uintptr_t pAddr = m_candidates[matchedCandIndices[p]].address;
+                                    size_t pSz = std::max<size_t>(1, dataTypeSize(query.fields[p].type));
+                                    if (cm.address < pAddr + pSz && pAddr < cm.address + fSz) {
+                                        overlaps = true;
+                                        break;
+                                    }
+                                }
+                                if (overlaps) continue;
+
+                                const uint8_t* ptrM = br.localBuf + (cm.address - grp.readStartAddr);
+                                if (evalGroupField(ptrM, fld)) {
+                                    uint64_t dist = (cm.address >= c0.address)
+                                        ? (cm.address - c0.address)
+                                        : (c0.address - cm.address);
+                                    if (dist < bestDist) {
+                                        bestDist = dist;
+                                        bestCandIdx = candIdx;
+                                        foundF = true;
+                                        if (dist <= fSz) break;
+                                    }
+                                }
+                            }
+
+                            if (!foundF) {
+                                allOk = false;
+                                break;
+                            }
+                            matchedCandIndices[fIdx] = bestCandIdx;
+                            uintptr_t bAddr = m_candidates[bestCandIdx].address;
+                            minAddr = std::min(minAddr, bAddr);
+                            maxAddr = std::max(maxAddr, bAddr);
+                        }
+
+                        if (allOk) {
+                            for (size_t fIdx = 0; fIdx < numFields; ++fIdx) {
+                                CandidateEntry kept = m_candidates[matchedCandIndices[fIdx]];
+                                DataType fDt = query.fields[fIdx].type;
+                                const uint8_t* ptrK = br.localBuf + (kept.address - grp.readStartAddr);
+                                kept.rawValue = extractRawValue(ptrK, fDt);
+                                kept.type     = static_cast<uint8_t>(fDt);
+                                nextStore.append(kept);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fallback when cluster has fewer candidates than numFields (e.g., single-address candidate refined as group)
+                for (size_t startC = grp.firstCandIdx; startC < grp.lastCandIdx; ++startC) {
+                    const CandidateEntry& c0 = m_candidates[startC];
+                    size_t aOff = c0.address - grp.readStartAddr;
+                    if (!evalGroupField(br.localBuf + aOff, query.fields[0])) continue;
+
+                    std::vector<size_t> offMatches(numFields, 0);
+                    offMatches[0] = aOff;
+                    size_t minStartOff = aOff;
+                    size_t maxStartOff = aOff;
+                    size_t prevEnd = aOff + std::max<size_t>(1, dataTypeSize(query.fields[0].type));
+                    bool allOk = true;
+
+                    for (size_t fIdx = 1; fIdx < numFields; ++fIdx) {
+                        const auto& fld = query.fields[fIdx];
+                        size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
+                        size_t fStep = query.aligned ? fSz : 1;
+                        size_t searchStart = query.ordered ? prevEnd : 0;
+                        if (fStep > 1 && (searchStart % fStep) != 0) {
+                            searchStart += fStep - (searchStart % fStep);
+                        }
+
+                        bool foundF = false;
+                        for (size_t pos = searchStart; pos + fSz <= grp.byteLen; pos += fStep) {
+                            size_t candMin = std::min(minStartOff, pos);
+                            size_t candMax = std::max(maxStartOff, pos);
+                            if ((candMax - candMin) > query.maxSpanBytes) continue;
+
+                            bool overlaps = false;
+                            for (size_t p = 0; p < fIdx; ++p) {
+                                size_t pOff = offMatches[p];
+                                size_t pSz  = std::max<size_t>(1, dataTypeSize(query.fields[p].type));
+                                if (pos < pOff + pSz && pOff < pos + fSz) {
+                                    overlaps = true;
+                                    break;
+                                }
+                            }
+                            if (overlaps) continue;
+
+                            if (evalGroupField(br.localBuf + pos, fld)) {
+                                offMatches[fIdx] = pos;
+                                minStartOff = candMin;
+                                maxStartOff = candMax;
+                                prevEnd = pos + fSz;
+                                foundF = true;
+                                break;
+                            }
+                        }
+                        if (!foundF) {
+                            allOk = false;
+                            break;
+                        }
+                    }
+
+                    if (allOk) {
+                        for (size_t fIdx = 0; fIdx < numFields; ++fIdx) {
+                            CandidateEntry kept{};
+                            DataType fDt = query.fields[fIdx].type;
+                            kept.address   = grp.readStartAddr + offMatches[fIdx];
+                            kept.rawValue  = extractRawValue(br.localBuf + offMatches[fIdx], fDt);
+                            kept.type      = static_cast<uint8_t>(fDt);
+                            kept.regionTag = c0.regionTag;
+                            nextStore.append(kept);
+                        }
+                    }
+                }
+            }
+        }
+
+        m_totalMatchedCount = nextStore.size();
+        if (progress) progress(gEnd, groups.size());
+    }
+
+    nextStore.sortByAddress();
+    m_candidates = std::move(nextStore);
+    m_totalMatchedCount = m_candidates.size();
+
+    auto t1 = std::chrono::steady_clock::now();
+    m_lastTelemetry.elapsedMs       = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    m_lastTelemetry.candidatesFound = m_totalMatchedCount;
+    m_lastTelemetry.syscallsIssued  = syscallsIssued;
+    m_lastTelemetry.spilledToMmap   = m_candidates.isSpilledToDisk();
     return EngineErrc::OK;
 }
 

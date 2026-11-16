@@ -274,7 +274,7 @@ fun SettingsScreen(ui: Ui, embedded: Boolean = false) {
                     NavRow(
                         icon = Icons.Rounded.Info,
                         title = "关于",
-                        subtitle = "GGNext v0.5"
+                        subtitle = "GGNext v0.6"
                     ) {
                         Session.openSheet(Sheet.ABOUT)
                     }

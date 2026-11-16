@@ -860,6 +860,65 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchGroup(
 }
 
 JNIEXPORT jint JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineGroup(
+    JNIEnv* env,
+    jclass /*clazz*/,
+    jlong handle,
+    jintArray typesJarr,
+    jlongArray intValsJarr,
+    jdoubleArray floatValsJarr,
+    jlongArray intMaxValsJarr,
+    jdoubleArray floatMaxValsJarr,
+    jintArray fieldOpsJarr,
+    jint windowSize,
+    jboolean ordered,
+    jboolean aligned
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session || !typesJarr || !intValsJarr || !floatValsJarr) {
+        return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    }
+    std::lock_guard<std::mutex> lk(session->mtx);
+
+    jsize len = env->GetArrayLength(typesJarr);
+    if (len <= 0) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+
+    jint* typesPtr = env->GetIntArrayElements(typesJarr, nullptr);
+    jlong* intPtr = env->GetLongArrayElements(intValsJarr, nullptr);
+    jdouble* fltPtr = env->GetDoubleArrayElements(floatValsJarr, nullptr);
+    jlong* intMaxPtr = intMaxValsJarr ? env->GetLongArrayElements(intMaxValsJarr, nullptr) : nullptr;
+    jdouble* fltMaxPtr = floatMaxValsJarr ? env->GetDoubleArrayElements(floatMaxValsJarr, nullptr) : nullptr;
+    jint* opsPtr = fieldOpsJarr ? env->GetIntArrayElements(fieldOpsJarr, nullptr) : nullptr;
+
+    mem_engine::GroupSearchQuery query;
+    query.fields.resize(static_cast<size_t>(len));
+    for (jsize i = 0; i < len; ++i) {
+        query.fields[static_cast<size_t>(i)].type = static_cast<mem_engine::DataType>(typesPtr[i]);
+        query.fields[static_cast<size_t>(i)].iVal = static_cast<int64_t>(intPtr[i]);
+        query.fields[static_cast<size_t>(i)].fVal = static_cast<double>(fltPtr[i]);
+        query.fields[static_cast<size_t>(i)].iMax = intMaxPtr ? static_cast<int64_t>(intMaxPtr[i]) : static_cast<int64_t>(intPtr[i]);
+        query.fields[static_cast<size_t>(i)].fMax = fltMaxPtr ? static_cast<double>(fltMaxPtr[i]) : static_cast<double>(fltPtr[i]);
+        query.fields[static_cast<size_t>(i)].op = opsPtr ? static_cast<uint8_t>(opsPtr[i]) : 0;
+        query.fields[static_cast<size_t>(i)].epsilon = 1e-4;
+        query.fields[static_cast<size_t>(i)].origIndex = static_cast<size_t>(i);
+    }
+    query.maxSpanBytes = static_cast<size_t>(windowSize > 0 ? windowSize : 512);
+    query.ordered = (ordered == JNI_TRUE);
+    query.aligned = (aligned == JNI_TRUE);
+
+    env->ReleaseIntArrayElements(typesJarr, typesPtr, 0);
+    env->ReleaseLongArrayElements(intValsJarr, intPtr, 0);
+    env->ReleaseDoubleArrayElements(floatValsJarr, fltPtr, 0);
+    if (intMaxPtr) env->ReleaseLongArrayElements(intMaxValsJarr, intMaxPtr, 0);
+    if (fltMaxPtr) env->ReleaseDoubleArrayElements(floatMaxValsJarr, fltMaxPtr, 0);
+    if (opsPtr) env->ReleaseIntArrayElements(fieldOpsJarr, opsPtr, 0);
+
+    session->cancelToken.reset();
+    auto rc = session->scanner->refineGroup(query, &session->cancelToken);
+    return static_cast<jint>(rc);
+}
+
+JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchPattern(
     JNIEnv* env,
     jclass /*clazz*/,

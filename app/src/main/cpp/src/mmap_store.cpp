@@ -166,10 +166,20 @@ void MmapCandidateStore::sortByAddress() {
         if (a.address != b.address) return a.address < b.address;
         return a.type < b.type;
     };
-    if (std::is_sorted(base, base + m_count, cmp)) {
-        return;
+    if (!std::is_sorted(base, base + m_count, cmp)) {
+        std::sort(base, base + m_count, cmp);
     }
-    std::sort(base, base + m_count, cmp);
+    auto eq = [](const CandidateEntry& a, const CandidateEntry& b) noexcept {
+        return a.address == b.address && a.type == b.type;
+    };
+    CandidateEntry* newEnd = std::unique(base, base + m_count, eq);
+    size_t uniqueCount = static_cast<size_t>(newEnd - base);
+    if (uniqueCount < m_count) {
+        m_count = uniqueCount;
+        if (!m_isMmap && m_ramVec.size() > uniqueCount) {
+            m_ramVec.resize(uniqueCount);
+        }
+    }
 }
 
 void MmapCandidateStore::clear() noexcept {

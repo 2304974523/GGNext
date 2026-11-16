@@ -146,9 +146,12 @@ object ProcessScanner {
         val appIdMap = HashMap<Int, MutableList<ApplicationInfo>>(installedApps.size)
         for (app in installedApps) {
             pkgMap[app.packageName] = app
-            uidMap.getOrPut(app.uid) { ArrayList(1) }.add(app)
-            val baseAppId = app.uid % 100000
-            appIdMap.getOrPut(baseAppId) { ArrayList(1) }.add(app)
+            // 排除 GGNext 自身包名进入 uidMap/appIdMap 首选槽位，防止与目标应用共享 android:sharedUserId 时把目标进程误匹配为 GGNext 自身
+            if (app.packageName != context.packageName) {
+                uidMap.getOrPut(app.uid) { ArrayList(2) }.add(app)
+                val baseAppId = app.uid % 100000
+                appIdMap.getOrPut(baseAppId) { ArrayList(2) }.add(app)
+            }
         }
 
         val out = LinkedHashMap<Int, TargetProcess>()
@@ -158,11 +161,9 @@ object ProcessScanner {
             scanViaRootProc(context, pm, pkgMap, uidMap, appIdMap, myPid, out)
         }
 
-        // 2. 免 Root 模式（或 Root 扫描补充）：扫描当前权限可读的 /proc 与 ActivityManager
-        if (out.isEmpty()) {
-            scanProcDirectly(context, pm, pkgMap, uidMap, appIdMap, myUid, myPid, mode, out)
-            scanFromActivityManager(context, pm, pkgMap, uidMap, appIdMap, myPid, out)
-        }
+        // 2. 无论是否为 Root 模式，始终扫描当前权限可读的 /proc（含 SELinux 直探同 UID / sharedUserId 进程）与 ActivityManager 作为补充
+        scanProcDirectly(context, pm, installedApps, pkgMap, uidMap, appIdMap, myUid, myPid, mode, out)
+        scanFromActivityManager(context, pm, pkgMap, uidMap, appIdMap, myPid, out)
 
         return out.values.sortedWith(
             compareBy<TargetProcess> { it.system }
@@ -231,11 +232,18 @@ object ProcessScanner {
     }.getOrDefault("")
 
     /**
-     * 直接扫描 `/proc` 目录（免 Root 模式下获取自身与相同共享 UID 沙箱内的应用进程）
+     * 直接扫描 `/proc` 目录（免 Root / 共享 UID 模式下获取相同 UID 或可读沙箱内的应用进程）：
+     * - 关键修复 1：Android 7.0+ 的 `untrusted_app` SELinux 域禁止对 `/proc` 执行 `opendir/readdir` (`proc:dir { read }` 被拒)，
+     *   导致 `File("/proc").listFiles()` 直接返回 `null`！但 SELinux 允许对 `/proc` 执行路径穿透 (`proc:dir { search }`)，
+     *   且对同 UID + 同 MCS 类别 (`android:sharedUserId`) 的进程拥有完整的 `/proc/<pid>` 访问权 (`self:dir/file`)。
+     *   因此当 `listFiles()` 为空或未枚举全时，通过 `Os.access("/proc/$pid/status", F_OK)` 直接遍历 PID 空间，毫秒级发现所有共享 UID 进程。
+     * - 关键修复 2：当 `/proc/<pid>/cmdline` 为空或进程名被截断为 15 字符 `Name:` (`TASK_COMM_LEN`) 时，
+     *   结合 `uidMap[uid]` 与已安装应用的 15 字符前缀反查完整包名。
      */
     private fun scanProcDirectly(
         context: Context,
         pm: PackageManager,
+        installedApps: List<ApplicationInfo>,
         pkgMap: Map<String, ApplicationInfo>,
         uidMap: Map<Int, List<ApplicationInfo>>,
         appIdMap: Map<Int, List<ApplicationInfo>>,
@@ -244,21 +252,50 @@ object ProcessScanner {
         mode: WorkMode,
         out: MutableMap<Int, TargetProcess>
     ) {
-        val procDir = File("/proc")
-        val entries = procDir.listFiles() ?: return
-        for (entry in entries) {
-            val pid = entry.name.toIntOrNull() ?: continue
-            if (pid <= 1 || pid == myPid || out.containsKey(pid)) continue
+        val candidatePids = LinkedHashSet<Int>()
+        val procEntries = runCatching { File("/proc").listFiles() }.getOrNull()
+        if (!procEntries.isNullOrEmpty()) {
+            for (entry in procEntries) {
+                val pid = entry.name.toIntOrNull() ?: continue
+                if (pid > 1 && pid != myPid && !out.containsKey(pid)) {
+                    candidatePids.add(pid)
+                }
+            }
+        }
 
-            val cmdline = readCmdlineDirect(pid)
-            if (cmdline.isEmpty()) continue
+        // 当 SELinux 拦截 opendir("/proc") 或 hidepid 隐藏目录项时，通过 proc:dir search 直接探测 PID 空间
+        if (candidatePids.isEmpty() || mode == WorkMode.NO_ROOT) {
+            val maxPid = runCatching {
+                File("/proc/sys/kernel/pid_max").readText().trim().toIntOrNull()
+            }.getOrNull()?.coerceIn(4096, 131072) ?: 65536
+
+            for (pid in 300..maxPid) {
+                if (pid == myPid || out.containsKey(pid) || candidatePids.contains(pid)) continue
+                val accessible = try {
+                    android.system.Os.access("/proc/$pid/status", android.system.OsConstants.R_OK)
+                } catch (_: Throwable) {
+                    false
+                }
+                if (accessible) {
+                    candidatePids.add(pid)
+                }
+            }
+        }
+
+        val myAppId = myUid % 100000
+        for (pid in candidatePids) {
+            if (pid <= 1 || pid == myPid || out.containsKey(pid)) continue
 
             var uid = -1
             var ppid = 0
             var rssKb = 0L
-            runCatching {
-                File(entry, "status").forEachLine { line ->
+            var commName = ""
+            val statusOk = runCatching {
+                File("/proc/$pid/status").forEachLine { line ->
                     when {
+                        line.startsWith("Name:") -> {
+                            commName = line.substringAfter("Name:").trim()
+                        }
                         line.startsWith("Uid:") -> {
                             uid = line.substringAfter("Uid:").trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull() ?: -1
                         }
@@ -270,10 +307,42 @@ object ProcessScanner {
                         }
                     }
                 }
+                true
+            }.getOrDefault(false)
+
+            if (!statusOk || ppid == 2 || rssKb <= 0L) continue
+            if (mode == WorkMode.NO_ROOT && uid != -1 && (uid % 100000) != myAppId) {
+                // 若非同 appId 且不可读其内存映射，则在免 Root 模式下跳过
+                val mapsReadable = runCatching { File("/proc/$pid/maps").canRead() }.getOrDefault(false)
+                if (!mapsReadable) continue
             }
 
-            if (ppid == 2 || rssKb <= 0L) continue
-            if (mode == WorkMode.NO_ROOT && uid != -1 && uid != myUid) continue
+            var procName = readCmdlineDirect(pid)
+            if (procName.isEmpty() || !procName.contains('.')) {
+                // 回退：通过同 UID 绑定的已安装应用或 15 字符 commName 还原完整包名
+                val sameUidApps = if (uid >= 0) (uidMap[uid] ?: appIdMap[uid % 100000]).orEmpty() else emptyList()
+                val matchedByUid = when {
+                    sameUidApps.size == 1 -> sameUidApps.first().packageName
+                    sameUidApps.size > 1 && commName.isNotEmpty() -> {
+                        sameUidApps.firstOrNull {
+                            it.packageName.startsWith(commName) || it.packageName.endsWith(commName) || commName.startsWith(it.packageName.take(15))
+                        }?.packageName ?: sameUidApps.first().packageName
+                    }
+                    commName.length >= 6 -> {
+                        installedApps.firstOrNull {
+                            it.packageName != context.packageName &&
+                                (it.packageName == commName || (commName.length >= 15 && it.packageName.startsWith(commName)))
+                        }?.packageName.orEmpty()
+                    }
+                    else -> ""
+                }
+                if (matchedByUid.isNotEmpty()) {
+                    procName = matchedByUid
+                } else if (procName.isEmpty()) {
+                    procName = commName
+                }
+            }
+            if (procName.isEmpty()) continue
 
             addCandidateIfAndroidApp(
                 context = context,
@@ -285,7 +354,7 @@ object ProcessScanner {
                 uid = uid,
                 ppid = ppid,
                 rssKb = rssKb,
-                rawProcessName = cmdline,
+                rawProcessName = procName,
                 allowRootInspect = false,
                 out = out
             )
@@ -305,7 +374,12 @@ object ProcessScanner {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
             am?.runningAppProcesses?.forEach { proc ->
                 if (proc.pid <= 1 || proc.pid == myPid || out.containsKey(proc.pid)) return@forEach
-                val rawName = proc.processName ?: return@forEach
+                val cmdFromProc = readCmdlineDirect(proc.pid)
+                val rawName = cmdFromProc.ifEmpty {
+                    proc.processName?.takeIf { it != context.packageName }
+                        ?: proc.pkgList?.firstOrNull { it != context.packageName }
+                        ?: return@forEach
+                }
                 val rss = readRssFromProc(proc.pid)
                 addCandidateIfAndroidApp(
                     context = context,
@@ -328,9 +402,9 @@ object ProcessScanner {
     /**
      * 核心过滤与分类逻辑：
      * - 严格拦截 Linux 原生进程、HAL 服务；
-     * - 精确区分「用户应用 (system = false)」与「系统应用 (system = true)」（包含已更新的系统应用 FLAG_UPDATED_SYSTEM_APP 及厂商系统组件）；
+     * - 精确区分「用户应用 (system = false)」与「系统应用 (system = true)」（包含系统应用的子进程、共享系统 UID 组件及已更新系统应用）；
      * - 完整保留长子进程名 / 自定义进程名，绝不截断；
-     * - 智能识别虚拟空间 / 双开分身进程 (`isVirtual = true`)，提取客体 APK 路径与图标。
+     * - 严格识别真正的虚拟空间 / 双开分身进程 (`isVirtual = true`)，避免将普通系统/用户应用子进程或共享 UID 应用误判为虚拟空间进程。
      */
     private fun addCandidateIfAndroidApp(
         context: Context,
@@ -372,17 +446,21 @@ object ProcessScanner {
         var directAppInfo: ApplicationInfo? = pkgMap[basePkg]
             ?: runCatching { pm.getApplicationInfo(basePkg, 0) }.getOrNull()
 
-        // 2. 通过 UID 或多用户 baseAppId 查找宿主 ApplicationInfo
-        val uidPackages: List<ApplicationInfo> = if (uid >= 10000) {
+        // 2. 通过 UID 或多用户 baseAppId 查找同 UID 下的宿主 ApplicationInfo 列表
+        val uidPackages: List<ApplicationInfo> = if (uid >= 1000) {
             uidMap[uid]
                 ?: appIdMap[appId]
                 ?: runCatching {
-                    pm.getPackagesForUid(uid)?.mapNotNull { p -> pkgMap[p] ?: runCatching { pm.getApplicationInfo(p, 0) }.getOrNull() }
+                    pm.getPackagesForUid(uid)
+                        ?.filter { it != context.packageName }
+                        ?.mapNotNull { p -> pkgMap[p] ?: runCatching { pm.getApplicationInfo(p, 0) }.getOrNull() }
                 }.getOrNull()
                 ?: emptyList()
         } else emptyList()
 
-        val hostAppInfo = uidPackages.firstOrNull { basePkg.startsWith(it.packageName) || it.packageName.startsWith(basePkg) }
+        val hostAppInfo = directAppInfo
+            ?: uidPackages.firstOrNull { it.packageName == basePkg }
+            ?: uidPackages.firstOrNull { basePkg.startsWith(it.packageName) || it.packageName.startsWith(basePkg) }
             ?: uidPackages.firstOrNull()
 
         var appInfo: ApplicationInfo? = directAppInfo ?: hostAppInfo
@@ -392,19 +470,39 @@ object ProcessScanner {
             return
         }
 
-        // 3. 虚拟空间与多开分身判定 (对标原版 GG 虚拟空间识别原理)：
-        //   (a) Android 多用户 / 系统应用双开 (userId > 0，如 u10_aXXX / u999_aXXX)
-        //   (b) 宿主 UID 对应的包名与当前进程实际运行的包名不一致（例如宿主是 Parallel Space / VirtualApp / GBox，而进程 cmdline 是客体游戏包名）
-        //   (c) 进程 cmdline 对应的 APK 未安装在宿主系统中 (directAppInfo == null)，而是从虚拟空间私有目录加载
-        //   (d) 宿主包名或数据目录包含典型虚拟空间特征词
+        // 判定某 ApplicationInfo 是否为系统内置/预装应用
+        fun isSystemApplicationInfo(ai: ApplicationInfo): Boolean {
+            val flagSystem = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+            val flagUpdated = (ai.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+            val src = ai.sourceDir.orEmpty()
+            val inSystemPartition = src.startsWith("/system/") ||
+                src.startsWith("/product/") ||
+                src.startsWith("/system_ext/") ||
+                src.startsWith("/vendor/") ||
+                src.startsWith("/apex/") ||
+                src.startsWith("/oem/") ||
+                src.startsWith("/odm/")
+            return flagSystem || flagUpdated || inSystemPartition
+        }
+
+        val anyUidPkgIsSystem = uidPackages.any { isSystemApplicationInfo(it) } ||
+            (appInfo != null && isSystemApplicationInfo(appInfo)) ||
+            (appId in 0 until 10000)
+
+        // 3. 虚拟空间与多开分身判定（修复误将应用子进程及系统共享 UID 子进程识别为虚拟空间应用的问题）：
+        //   - 若进程属于系统 UID 或其所属/同 UID 应用为系统应用 (`anyUidPkgIsSystem == true`)，或是已安装应用自身的子进程 (`directAppInfo != null`)，
+        //     只要 `userId == 0` 且宿主包名不含虚拟空间容器关键词，它就绝不是虚拟空间客体进程！
         val hostPkgName = hostAppInfo?.packageName.orEmpty().lowercase()
-        val hostIsVirtualContainer = VIRTUAL_HOST_KEYWORDS.any { kw -> hostPkgName.contains(kw) } ||
-            (hostAppInfo != null && directAppInfo != null && hostAppInfo.uid != directAppInfo.uid && (hostAppInfo.uid % 100000) != (directAppInfo.uid % 100000)) ||
-            (hostAppInfo != null && directAppInfo == null && !basePkg.startsWith(hostAppInfo.packageName))
+        val hostHasVirtualKeyword = VIRTUAL_HOST_KEYWORDS.any { kw -> hostPkgName.contains(kw) }
+        val hostIsVirtualContainer = !anyUidPkgIsSystem && (
+            hostHasVirtualKeyword ||
+                (hostAppInfo != null && directAppInfo != null &&
+                    (hostAppInfo.uid % 100000) != (directAppInfo.uid % 100000))
+            )
 
         var guestApkPath = ""
         var guestLabel: String? = null
-        if (directAppInfo == null && isAppUidRange) {
+        if (directAppInfo == null && !anyUidPkgIsSystem && isAppUidRange && (hostHasVirtualKeyword || uidPackages.isEmpty())) {
             val resolvedGuest = resolveVirtualGuestApk(pid, pm, basePkg, allowRootInspect)
             if (resolvedGuest != null) {
                 guestApkPath = resolvedGuest.first
@@ -416,12 +514,13 @@ object ProcessScanner {
             }
         }
 
-        val isVirtualProcess = (userId > 0) ||
-            hostIsVirtualContainer ||
-            guestApkPath.isNotEmpty() ||
-            (Session.ui.value.workMode == WorkMode.NO_ROOT && uid == Process.myUid())
+        val isVirtualProcess = !anyUidPkgIsSystem && (
+            (userId > 0) ||
+                hostIsVirtualContainer ||
+                guestApkPath.isNotEmpty()
+            )
 
-        val resolvedPkg = directAppInfo?.packageName ?: basePkg
+        val resolvedPkg = directAppInfo?.packageName ?: hostAppInfo?.packageName ?: basePkg
 
         // 再次检查解析后的包名是否属于 HAL/原生守护进程
         val lowerPkg = resolvedPkg.lowercase()
@@ -430,25 +529,11 @@ object ProcessScanner {
         }
 
         // 4. 精确判定「系统应用 (system = true)」与「用户应用 (system = false)」
-        // 修复：已更新的系统应用 (FLAG_UPDATED_SYSTEM_APP) 以及厂商/AOSP 系统包名前缀一律归为系统应用！
-        val isSystemPkgPrefix = SYSTEM_PKG_PREFIXES.any { resolvedPkg.startsWith(it, ignoreCase = true) }
-        val isSystemApp = if (appInfo != null && !isVirtualProcess) {
-            val flagSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-            val flagUpdated = (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-            val src = appInfo.sourceDir.orEmpty()
-            val inSystemPartition = src.startsWith("/system/") ||
-                src.startsWith("/product/") ||
-                src.startsWith("/system_ext/") ||
-                src.startsWith("/vendor/") ||
-                src.startsWith("/apex/") ||
-                src.startsWith("/oem/") ||
-                src.startsWith("/odm/")
-            flagSystem || flagUpdated || inSystemPartition || isSystemPkgPrefix || (appId in 0 until 10000)
-        } else if (isVirtualProcess) {
-            false
-        } else {
-            isSystemPkgPrefix || (appId in 0 until 10000)
+        // 修复：系统应用的子进程（即使具有自定义 process 名或与其它系统组件共享 UID）也严格保持为系统应用 (`system = true`)
+        val isSystemPkgPrefix = SYSTEM_PKG_PREFIXES.any {
+            resolvedPkg.startsWith(it, ignoreCase = true) || basePkg.startsWith(it, ignoreCase = true)
         }
+        val isSystemApp = anyUidPkgIsSystem || isSystemPkgPrefix
 
         // 5. 进程名与子进程完整显示（修复长进程名/子进程被截断为仅剩软件名的问题）
         val baseLabel = guestLabel

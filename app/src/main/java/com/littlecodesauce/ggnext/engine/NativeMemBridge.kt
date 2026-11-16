@@ -203,6 +203,18 @@ object NativeMemBridge {
         ordered: Boolean,
         aligned: Boolean
     ): Int
+    @JvmStatic external fun nativeRefineGroup(
+        handle: Long,
+        types: IntArray,
+        intVals: LongArray,
+        floatVals: DoubleArray,
+        intMaxVals: LongArray,
+        floatMaxVals: DoubleArray,
+        fieldOps: IntArray,
+        windowSize: Int,
+        ordered: Boolean,
+        aligned: Boolean
+    ): Int
     @JvmStatic external fun nativeSearchPattern(
         handle: Long,
         pattern: ByteArray,
