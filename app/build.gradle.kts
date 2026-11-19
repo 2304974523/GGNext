@@ -25,7 +25,7 @@ android {
                 arguments += listOf(
                     "-DMEMENGINE_BUILD_TESTS=OFF",
                     "-DMEMENGINE_BUILD_JNI=ON",
-                    "-DANDROID_STL=c++_shared"
+                    "-DANDROID_STL=c++_static"
                 )
             }
         }

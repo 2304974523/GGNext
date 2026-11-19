@@ -156,6 +156,7 @@ fun EditSheet(ui: Ui) {
     var freezeItems by remember(firstItem) { mutableStateOf(firstItem.freeze) }
 
     var keyboardTarget by remember { mutableIntStateOf(1) }
+    var showBuiltInKeyboard by remember { mutableStateOf(true) }
 
     val currentTypeColor = typeColor(selectedType)
     val typeRangeText = remember(selectedType) {
@@ -237,7 +238,7 @@ fun EditSheet(ui: Ui) {
                     modifier = Modifier.weight(1f).height(40.dp),
                     textStyle = monoStyle(16, Rose.Text),
                     cursorColor = Rose.Primary,
-                    suppressSystemKeyboard = keyboardTarget != 0,
+                    suppressSystemKeyboard = showBuiltInKeyboard,
                     placeholder = "输入修改值…"
                 )
                 Spacer(Modifier.width(8.dp))
@@ -245,16 +246,21 @@ fun EditSheet(ui: Ui) {
                     Modifier
                         .height(34.dp)
                         .background(
-                            if (keyboardTarget == 1) Rose.ChipSelected else Rose.Chip,
+                            if (showBuiltInKeyboard && keyboardTarget == 1) Rose.ChipSelected else Rose.Chip,
                             RoundedCornerShape(8.dp)
                         )
                         .clickableWithTooltip {
-                            keyboardTarget = if (keyboardTarget == 1) 0 else 1
+                            if (keyboardTarget == 1) {
+                                showBuiltInKeyboard = !showBuiltInKeyboard
+                            } else {
+                                keyboardTarget = 1
+                                showBuiltInKeyboard = true
+                            }
                         }
                         .padding(horizontal = 12.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(tr(if (keyboardTarget == 1) "收起" else "键盘"), color = Rose.Text, fontSize = fsp(13f))
+                    Text(tr(if (showBuiltInKeyboard && keyboardTarget == 1) "收起" else "键盘"), color = Rose.Text, fontSize = fsp(13f))
                 }
             }
 
@@ -380,7 +386,7 @@ fun EditSheet(ui: Ui) {
                                 modifier = Modifier.weight(1f).height(40.dp),
                                 textStyle = monoStyle(15, Rose.Text),
                                 cursorColor = Rose.Primary,
-                                suppressSystemKeyboard = keyboardTarget != 0,
+                                suppressSystemKeyboard = showBuiltInKeyboard,
                                 placeholder = "可选增量步进值"
                             )
                             Spacer(Modifier.width(8.dp))
@@ -388,16 +394,21 @@ fun EditSheet(ui: Ui) {
                                 Modifier
                                     .height(34.dp)
                                     .background(
-                                        if (keyboardTarget == 2) Rose.ChipSelected else Rose.Chip,
+                                        if (showBuiltInKeyboard && keyboardTarget == 2) Rose.ChipSelected else Rose.Chip,
                                         RoundedCornerShape(8.dp)
                                     )
                                     .clickableWithTooltip {
-                                        keyboardTarget = if (keyboardTarget == 2) 0 else 2
+                                        if (keyboardTarget == 2) {
+                                            showBuiltInKeyboard = !showBuiltInKeyboard
+                                        } else {
+                                            keyboardTarget = 2
+                                            showBuiltInKeyboard = true
+                                        }
                                     }
                                     .padding(horizontal = 12.dp),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text(tr("键盘"), color = Rose.Text, fontSize = fsp(13f))
+                                Text(tr(if (showBuiltInKeyboard && keyboardTarget == 2) "收起" else "键盘"), color = Rose.Text, fontSize = fsp(13f))
                             }
                         }
 
@@ -479,7 +490,7 @@ fun EditSheet(ui: Ui) {
                 }
             }
 
-            AnimatedVisibility(keyboardTarget != 0, enter = expandEnter(), exit = expandExit()) {
+            AnimatedVisibility(showBuiltInKeyboard && keyboardTarget != 0, enter = expandEnter(), exit = expandExit()) {
                 Column(Modifier.padding(top = 10.dp)) {
                     BuiltInKeyboard(
                         value = if (keyboardTarget == 2) stepTf else valueTf,
@@ -487,7 +498,7 @@ fun EditSheet(ui: Ui) {
                             if (keyboardTarget == 2) stepTf = next else valueTf = next
                         },
                         onHistory = { Session.openSheet(Sheet.HISTORY) },
-                        onDismiss = { keyboardTarget = 0 }
+                        onDismiss = { showBuiltInKeyboard = false }
                     )
                 }
             }
@@ -658,7 +669,10 @@ fun MenuAction(icon: ImageVector, label: String, onClick: () -> Unit) {
 fun TypePickSheet(ui: Ui) {
     val item = ui.editing ?: ui.contextItem
     NextSheetCard(title = "选择数据类型", onDismiss = Session::closeSheet) {
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Column(
+            Modifier.verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
             ValueType.order.forEach { t ->
                 val on = item != null && (item.flags and 0x7F) == t
                 Row(
@@ -692,13 +706,14 @@ fun TypePickSheet(ui: Ui) {
 @Composable
 fun AddressEditSheet(ui: Ui) {
     val item = ui.editing ?: ui.contextItem
-    val initAddr = item?.cachedAddressHex ?: "79F1497F24"
+    val initAddr = item?.cachedAddressHex
+        ?: java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
     var addr by remember {
         mutableStateOf(TextFieldValue(initAddr, TextRange(0, initAddr.length)))
     }
     var showKeyboard by remember { mutableStateOf(true) }
     NextSheetCard(title = "更改地址 / 类型", onDismiss = Session::closeSheet) {
-        Column {
+        Column(Modifier.verticalScroll(rememberScrollState())) {
             FieldRow("地址", addr, suppressSystemKeyboard = showKeyboard) { addr = it }
             Spacer(Modifier.height(10.dp))
             Text(tr("选择新类型"), color = Rose.TextSecond, fontSize = fsp(12f))
@@ -800,7 +815,12 @@ fun FormatSheet(ui: Ui) {
         onDismiss = Session::closeSheet
     ) {
         Column {
-            Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState())
+            ) {
                 Formatter.items.chunked(2).forEach { pair ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         pair.forEach { it2 ->
@@ -821,9 +841,9 @@ fun FormatSheet(ui: Ui) {
                     Spacer(Modifier.height(6.dp))
                 }
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             Text("${tr("当前：")}${Formatter.maskSummary(mask)}", style = monoStyle(11, Rose.TextDim))
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 RoseButton("默认", Modifier.weight(1f)) { mask = Formatter.DEFAULT_MASK }
                 RoseButton("确定", Modifier.weight(1f), filled = true) {
@@ -1154,7 +1174,7 @@ fun CalcOffsetXorSheet(ui: Ui) {
                 Column(
                     Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 420.dp)
+                        .weight(1f, fill = false)
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -1391,7 +1411,10 @@ private fun CalcModeTabPill(
 @Composable
 fun RemoveSheet(ui: Ui) {
     NextSheetCard(title = "移除", onDismiss = Session::closeSheet) {
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(
+            Modifier.verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
             MenuAction(Icons.Rounded.Restore, "恢复并移除所选 (${ui.selectedCount})") {
                 Session.removeChecked(all = false, revertFirst = true)
             }
@@ -1412,11 +1435,12 @@ fun RemoveSheet(ui: Ui) {
 // ============================================================
 @Composable
 fun GotoSheet() {
-    val initHex = java.lang.Long.toHexString(Session.ui.value.memoryHighlightAddress ?: Session.ui.value.memoryBase).uppercase()
+    val ui = Session.ui.collectAsState().value
+    val initHex = java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
     var tf by remember { mutableStateOf(TextFieldValue(initHex, TextRange(0, initHex.length))) }
     var showKeyboard by remember { mutableStateOf(true) }
     var showGotoHistory by remember { mutableStateOf(false) }
-    val gotoHistory = Session.ui.collectAsState().value.gotoHistory
+    val gotoHistory = ui.gotoHistory
 
     NextSheetCard(
         title = "转到地址",
@@ -1528,20 +1552,20 @@ fun GotoSheet() {
                 ) {
                     Text("历史", color = if (showGotoHistory) Rose.Primary else Rose.Text, fontSize = fsp(13f), fontWeight = if (showGotoHistory) FontWeight.Bold else FontWeight.Normal)
                 }
-                listOf(
-                    "Cd" to "717B199000",
-                    "Cb" to "718B000000",
-                    "Xs" to "7F80000000",
-                    "Xa" to "7180000000"
-                ).forEach { (label, mockHex) ->
+                listOf("Cd", "Cb", "Xs", "Xa").forEach { label ->
                     Box(
                         Modifier
                             .weight(1f)
                             .height(36.dp)
                             .background(Rose.CardHigh, RoundedCornerShape(8.dp))
                             .clickableWithTooltip {
-                                // 修复 Bug 1：点击仅填入地址，不直接退出弹窗
-                                tf = TextFieldValue(mockHex, TextRange(mockHex.length))
+                                val regionBase = Session.firstRegionBase(label)
+                                if (regionBase != null && regionBase != 0L) {
+                                    val hex = java.lang.Long.toHexString(regionBase).uppercase()
+                                    tf = TextFieldValue(hex, TextRange(hex.length))
+                                } else {
+                                    Session.toast("当前进程未找到 $label 内存段")
+                                }
                             },
                         contentAlignment = Alignment.Center
                     ) {
@@ -1687,7 +1711,7 @@ fun ModuleListSheet() {
             Column(
                 Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 480.dp)
+                    .weight(1f, fill = false)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
@@ -2159,7 +2183,8 @@ fun FileBrowserSheet(ui: Ui) {
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 240.dp, max = 360.dp),
+                    .weight(1f, fill = false)
+                    .heightIn(max = 360.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 itemsIndexed(
@@ -2393,100 +2418,18 @@ private fun loadBrowserEntries(
         }
     }
 
-    // 4. 虚拟内置树（内置示范文件，如果真实读取存在，真实文件优先）
-    val virtualTree: Map<String, List<BrowserEntry>> = mapOf(
-        "/" to listOf(
-            BrowserEntry("sdcard", "/sdcard", isDirectory = true, childCount = 5),
-            BrowserEntry("data", "/data", isDirectory = true, childCount = 3),
-            BrowserEntry("system", "/system", isDirectory = true, childCount = 4),
-            BrowserEntry("storage", "/storage", isDirectory = true, childCount = 2)
-        ),
-        "/sdcard" to listOf(
-            BrowserEntry("Download", "/sdcard/Download", isDirectory = true, childCount = 7),
-            BrowserEntry("GGNext", "/sdcard/GGNext", isDirectory = true, childCount = 6),
-            BrowserEntry("Documents", "/sdcard/Documents", isDirectory = true, childCount = 4),
-            BrowserEntry("Android", "/sdcard/Android", isDirectory = true, childCount = 3),
-            BrowserEntry("DCIM", "/sdcard/DCIM", isDirectory = true, childCount = 3),
-            BrowserEntry("Pictures", "/sdcard/Pictures", isDirectory = true, childCount = 2),
-            BrowserEntry("README.md", "/sdcard/README.md", isDirectory = false, sizeBytes = 4280L),
-            BrowserEntry("notes.txt", "/sdcard/notes.txt", isDirectory = false, sizeBytes = 1520L)
-        ),
-        "/sdcard/Download" to listOf(
-            BrowserEntry("scripts", "/sdcard/Download/scripts", isDirectory = true, childCount = 4),
-            BrowserEntry("libs", "/sdcard/Download/libs", isDirectory = true, childCount = 3),
-            BrowserEntry("script.lua", "/sdcard/Download/script.lua", isDirectory = false, sizeBytes = 18_432L),
-            BrowserEntry("auto_pointer_scan.lua", "/sdcard/Download/auto_pointer_scan.lua", isDirectory = false, sizeBytes = 32_768L),
-            BrowserEntry("libil2cpp.so", "/sdcard/Download/libil2cpp.so", isDirectory = false, sizeBytes = 48_234_496L),
-            BrowserEntry("libtersafe.so", "/sdcard/Download/libtersafe.so", isDirectory = false, sizeBytes = 6_815_744L),
-            BrowserEntry("offsets_guide.md", "/sdcard/Download/offsets_guide.md", isDirectory = false, sizeBytes = 8_960L),
-            BrowserEntry("search_results.txt", "/sdcard/Download/search_results.txt", isDirectory = false, sizeBytes = 12_400L)
-        ),
-        "/sdcard/Download/scripts" to listOf(
-            BrowserEntry("speed_hack_v2.lua", "/sdcard/Download/scripts/speed_hack_v2.lua", isDirectory = false, sizeBytes = 9_420L),
-            BrowserEntry("memory_patcher.lua", "/sdcard/Download/scripts/memory_patcher.lua", isDirectory = false, sizeBytes = 14_800L),
-            BrowserEntry("anti_detect.lua", "/sdcard/Download/scripts/anti_detect.lua", isDirectory = false, sizeBytes = 7_120L),
-            BrowserEntry("changelog.md", "/sdcard/Download/scripts/changelog.md", isDirectory = false, sizeBytes = 3_400L)
-        ),
-        "/sdcard/Download/libs" to listOf(
-            BrowserEntry("libunity.so", "/sdcard/Download/libs/libunity.so", isDirectory = false, sizeBytes = 24_117_248L),
-            BrowserEntry("libUE4.so", "/sdcard/Download/libs/libUE4.so", isDirectory = false, sizeBytes = 92_274_688L),
-            BrowserEntry("symbols.txt", "/sdcard/Download/libs/symbols.txt", isDirectory = false, sizeBytes = 542_000L)
-        ),
-        "/sdcard/GGNext" to listOf(
-            BrowserEntry("scripts", "/sdcard/GGNext/scripts", isDirectory = true, childCount = 3),
-            BrowserEntry("dump", "/sdcard/GGNext/dump", isDirectory = true, childCount = 2),
-            BrowserEntry("main.lua", "/sdcard/GGNext/main.lua", isDirectory = false, sizeBytes = 15_360L),
-            BrowserEntry("saved_list.txt", "/sdcard/GGNext/saved_list.txt", isDirectory = false, sizeBytes = 4_096L),
-            BrowserEntry("manual.md", "/sdcard/GGNext/manual.md", isDirectory = false, sizeBytes = 11_200L),
-            BrowserEntry("libggnext_core.so", "/sdcard/GGNext/libggnext_core.so", isDirectory = false, sizeBytes = 1_458_176L)
-        ),
-        "/sdcard/GGNext/scripts" to listOf(
-            BrowserEntry("main.lua", "/sdcard/GGNext/scripts/main.lua", isDirectory = false, sizeBytes = 15_360L),
-            BrowserEntry("init.lua", "/sdcard/GGNext/scripts/init.lua", isDirectory = false, sizeBytes = 3_840L),
-            BrowserEntry("ui_helper.lua", "/sdcard/GGNext/scripts/ui_helper.lua", isDirectory = false, sizeBytes = 6_200L)
-        ),
-        "/sdcard/GGNext/dump" to listOf(
-            BrowserEntry("dump_0x717B199000.bin", "/sdcard/GGNext/dump/dump_0x717B199000.bin", isDirectory = false, sizeBytes = 65_536L),
-            BrowserEntry("dump_libil2cpp.bin", "/sdcard/GGNext/dump/dump_libil2cpp.bin", isDirectory = false, sizeBytes = 1_048_576L)
-        ),
-        "/sdcard/Documents" to listOf(
-            BrowserEntry("gg_guide.txt", "/sdcard/Documents/gg_guide.txt", isDirectory = false, sizeBytes = 3_200L),
-            BrowserEntry("game_offsets.lua", "/sdcard/Documents/game_offsets.lua", isDirectory = false, sizeBytes = 7_800L),
-            BrowserEntry("config.json", "/sdcard/Documents/config.json", isDirectory = false, sizeBytes = 1_240L)
-        ),
-        "/sdcard/Android" to listOf(
-            BrowserEntry("data", "/sdcard/Android/data", isDirectory = true, childCount = 2),
-            BrowserEntry("obb", "/sdcard/Android/obb", isDirectory = true, childCount = 2)
-        )
-    )
-
-    virtualTree[cleanDir]?.forEach { vEntry ->
-        if (!out.containsKey(vEntry.name)) {
-            out[vEntry.name] = vEntry
+    // 4. 根目录在非 Root / SELinux 受限场景下提供标准挂载点入口，不生成任何虚拟假文件
+    if (out.isEmpty() && cleanDir == "/") {
+        listOf("/sdcard", "/storage", "/data", "/system").forEach { stdPath ->
+            val f = File(stdPath)
+            val name = stdPath.removePrefix("/")
+            out[name] = BrowserEntry(
+                name = name,
+                fullPath = stdPath,
+                isDirectory = true,
+                childCount = f.list()?.size ?: 0
+            )
         }
-    }
-
-    // 5. 关键修复：对于任何其他文件夹，如果为空，动态生成该目录下的标准展示文件，确保永远能正常查看与浏览
-    if (out.isEmpty() && cleanDir != "/") {
-        val lastSegment = cleanDir.substringAfterLast('/')
-        out["${lastSegment}_script.lua"] = BrowserEntry(
-            name = "${lastSegment}_script.lua",
-            fullPath = "$cleanDir/${lastSegment}_script.lua",
-            isDirectory = false,
-            sizeBytes = 12_288L
-        )
-        out["config.txt"] = BrowserEntry(
-            name = "config.txt",
-            fullPath = "$cleanDir/config.txt",
-            isDirectory = false,
-            sizeBytes = 2_048L
-        )
-        out["backup"] = BrowserEntry(
-            name = "backup",
-            fullPath = "$cleanDir/backup",
-            isDirectory = true,
-            childCount = 1
-        )
     }
 
     return out.values
@@ -2864,12 +2807,22 @@ fun AllocateSheet(ui: Ui) {
             }
 
             AnimatedVisibility(showRegionPicker, enter = expandEnter(), exit = expandExit()) {
-                val regionSamples = listOf(
-                    "0 (系统自动分配)" to "0",
-                    "Ca: C++ alloc (0x79F1497000)" to "79F1497000",
-                    "A: Anonymous (0x79F1800000)" to "79F1800000",
-                    "Xa: Code app (0x79F0100000)" to "79F0100000"
-                )
+                val regionSamples = remember(ui.target?.pid) {
+                    buildList {
+                        add("0 (系统自动分配)" to "0")
+                        listOf(
+                            "Ca" to "C++ alloc",
+                            "A" to "Anonymous",
+                            "Xa" to "Code app"
+                        ).forEach { (code, desc) ->
+                            val base = Session.firstRegionBase(code)
+                            if (base != null && base != 0L) {
+                                val hex = java.lang.Long.toHexString(base).uppercase()
+                                add("$code: $desc (0x$hex)" to hex)
+                            }
+                        }
+                    }
+                }
                 Column(
                     Modifier
                         .fillMaxWidth()
@@ -2970,7 +2923,7 @@ fun FileSheet(ui: Ui) {
         subtitle = "输入文件路径或点击右侧「浏览」从文件浏览器中选择",
         onDismiss = Session::closeSheet
     ) {
-        Column {
+        Column(Modifier.verticalScroll(rememberScrollState())) {
             Row(
                 Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -3012,7 +2965,7 @@ fun FileSheet(ui: Ui) {
 fun SpeedSheet(ui: Ui) {
     var speed by remember(ui.speedMultiplier) { mutableStateOf(ui.speedMultiplier) }
     NextSheetCard(title = "游戏变速", subtitle = "长按悬浮球也可随时呼出左右加减速控制栏", onDismiss = Session::closeSheet) {
-        Column {
+        Column(Modifier.verticalScroll(rememberScrollState())) {
             Text(
                 text = String.format(java.util.Locale.US, "%.2fx", speed).trimEnd('0').let {
                     if (it.endsWith(".")) "${it}0x" else if (!it.endsWith("x")) "${it}x" else it
@@ -3054,14 +3007,17 @@ fun SpeedSheet(ui: Ui) {
 // ============================================================
 @Composable
 fun LanguageSheet() {
-    val ui = Session.ui.value
+    val ui = Session.ui.collectAsState().value
     val cur = if (ui.settings["language"] == "1") "1" else "0"
     val langs = listOf(
         "0" to "简体中文",
         "1" to "English"
     )
     NextSheetCard(title = "选择语言", onDismiss = Session::closeSheet) {
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(
+            Modifier.verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
             langs.forEach { (code, name) ->
                 val selected = cur == code
                 Row(
@@ -3134,6 +3090,7 @@ fun LogSheet() {
             Box(
                 Modifier
                     .fillMaxWidth()
+                    .weight(1f, fill = false)
                     .heightIn(max = 380.dp)
                     .background(Rose.CardHigh, RoundedCornerShape(9.dp))
                     .verticalScroll(rememberScrollState())
@@ -3162,7 +3119,7 @@ fun LogSheet() {
 fun OverlaySheet(ui: Ui) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     NextSheetCard(title = "悬浮窗管理", subtitle = "短按悬浮球打开面板，长按悬浮球调节变速", onDismiss = Session::closeSheet) {
-        Column {
+        Column(Modifier.verticalScroll(rememberScrollState())) {
             Text(
                 tr(
                     if (com.littlecodesauce.ggnext.service.OverlayManager.canDraw(ctx)) "已授予系统悬浮窗权限"

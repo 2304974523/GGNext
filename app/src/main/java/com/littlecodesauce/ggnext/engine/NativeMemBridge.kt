@@ -9,10 +9,10 @@ import java.io.File
  *
  * 将 GGNext 的上层 UI 状态机与底层 C++20 跨进程内存检索引擎深度集成：
  * - process_vm_readv / process_vm_writev 零拷贝跨进程读写 + /proc/[pid]/mem 自动回退
- * - 16KB / 4KB 动态页对齐 (sysconf(_SC_PAGESIZE)) 与 EFAULT 单页隔离跳过
- * - 15 类细分内存区域 (Ch, Jh, Ca, Cd, Cb, Ps, A, J, S, As, V, O, B, Xa, Xs) 原生解析
- * - ARM64 NEON SIMD 向量化扫描与 MmapCandidateStore 零 OOM 磁盘溢出存储
- * - ValueLocker 独立高精度定时锁值线程
+ * - 16KB / 4KB 动态页对齐 (sysconf(_SC_PAGESIZE)) 与 Adaptive Normal<->Page 自适应容错读取
+ * - 15 类细分内存区域 (Ch, Jh, Ca, Cd, Cb, Ps, A, J, S, As, V, O, B, Xa, Xs) 原生解析与 VmaIndex 索引
+ * - ARM64 NEON SIMD 向量化扫描、原生指针链扫描与 MmapCandidateStore 零 OOM 磁盘溢出存储
+ * - ValueLocker 独立高精度定时锁值线程（原生支持普通冻结/递增/递减/范围钳制）
  */
 object NativeMemBridge {
 
@@ -52,6 +52,13 @@ object NativeMemBridge {
     const val ENC_XOR_ADDRESS = 4
     const val ENC_GG_AUTO = 5
     const val ENC_XOR_OFFSET = 6
+
+    // C++ PointerProtMask 位掩码
+    const val PTR_PROT_WX = 1
+    const val PTR_PROT_X = 2
+    const val PTR_PROT_RO = 8
+    const val PTR_PROT_W = 16
+    const val PTR_PROT_ALL = PTR_PROT_WX or PTR_PROT_X or PTR_PROT_RO or PTR_PROT_W
 
     // C++ RegionFlag 位掩码
     private val REGION_FLAG_MAP = mapOf(
@@ -191,6 +198,21 @@ object NativeMemBridge {
         floatMax: Double,
         inclusive: Boolean
     ): Int
+    @JvmStatic external fun nativeSearchPointers(
+        handle: Long,
+        dataType: Int,
+        targetAddress: Long,
+        maxOffset: Long,
+        protMask: Int,
+        aligned: Boolean
+    ): Int
+    @JvmStatic external fun nativeRefinePointers(
+        handle: Long,
+        dataType: Int,
+        targetAddress: Long,
+        maxOffset: Long,
+        protMask: Int
+    ): Int
     @JvmStatic external fun nativeSearchGroup(
         handle: Long,
         types: IntArray,
@@ -247,7 +269,20 @@ object NativeMemBridge {
     ): Int
     @JvmStatic external fun nativeGetCandidateCount(handle: Long): Long
     @JvmStatic external fun nativeGetCandidatesPacked(handle: Long, offset: Int, limit: Int): LongArray?
+    @JvmStatic external fun nativeRemoveCandidates(handle: Long, addresses: LongArray)
+    @JvmStatic external fun nativeClearSession(handle: Long)
     @JvmStatic external fun nativeLockAddress(handle: Long, address: Long, data: ByteArray)
+    @JvmStatic external fun nativeLockAddressConfigured(
+        handle: Long,
+        address: Long,
+        data: ByteArray,
+        dataType: Int,
+        freezeMode: Int,
+        minVal: Long,
+        maxVal: Long
+    )
+    @JvmStatic external fun nativeSetFreezePaused(handle: Long, paused: Boolean)
+    @JvmStatic external fun nativeSetFreezeIntervalMs(handle: Long, intervalMs: Int)
     @JvmStatic external fun nativeUnlockAddress(handle: Long, address: Long)
     @JvmStatic external fun nativeUnlockAll(handle: Long)
 }

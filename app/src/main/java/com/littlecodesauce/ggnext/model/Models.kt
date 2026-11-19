@@ -3,24 +3,24 @@ package com.littlecodesauce.ggnext.model
 /** 结果列表 / 内存编辑器 / 已保存列表 共用条目（预计算十六进制地址字符串以提升列表滚动帧率） */
 data class MemoryItem(
     val address: Long,
-    var value: Long,
-    var flags: Int = ValueType.DWORD,
-    var name: String = "",
-    var checked: Boolean = false,
-    var region: String = "Jh",
-    var freeze: Boolean = false,
-    var freezeType: Int = 0,
-    var freezeFrom: Long = 0L,
-    var freezeTo: Long = 0L,
-    var possible: Boolean = true,
+    val value: Long,
+    val flags: Int = ValueType.DWORD,
+    val name: String = "",
+    val checked: Boolean = false,
+    val region: String = "Jh",
+    val freeze: Boolean = false,
+    val freezeType: Int = 0,
+    val freezeFrom: Long = 0L,
+    val freezeTo: Long = 0L,
+    val possible: Boolean = true,
     /** 指针链长度 / 指针标记（0=无, 1=WX, 2=X, 4=未知, 8=RO, 16=W） */
-    var pointer: Int = 0,
+    val pointer: Int = 0,
     /** 上一次搜索/修改前的值，用于“恢复所选”与“模糊搜索/仅保留有变化的结果” */
-    var previousValue: Long = value,
+    val previousValue: Long = value,
     /** 是否由用户手动修改（仅在手动修改时在数值后显示修改前的值） */
-    var manuallyEdited: Boolean = false,
+    val manuallyEdited: Boolean = false,
     /** 自定义备注（批量修改时可写入） */
-    var note: String = ""
+    val note: String = ""
 ) {
     val size: Int get() = ValueType.sizeOf(flags)
     val typeShort: String get() = ValueType.shortName(flags)

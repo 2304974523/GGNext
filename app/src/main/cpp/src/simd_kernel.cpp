@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 #include <type_traits>
 
 #if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -16,7 +17,6 @@ namespace mem_engine {
 namespace {
 
 #if MEMENGINE_HAS_NEON && !defined(__aarch64__)
-// ARMv7 32-bit NEON helper for horizontal max reduction across uint8x16_t
 inline uint8_t neonMaxvU8(uint8x16_t v) noexcept {
     uint8x8_t m1 = vmax_u8(vget_low_u8(v), vget_high_u8(v));
     uint8x8_t m2 = vpmax_u8(m1, m1);
@@ -46,7 +46,6 @@ void SimdKernel::scanExactI8(const uint8_t* buf, size_t len, int8_t target, std:
 #if MEMENGINE_HAS_NEON
     uint8x16_t vTarget = vdupq_n_u8(uTarget);
     for (; i + 16 <= len; i += 16) {
-        // Strictly safe unaligned load via vld1q_u8
         uint8x16_t vChunk = vld1q_u8(buf + i);
         uint8x16_t vCmp   = vceqq_u8(vChunk, vTarget);
         if (neonMaxvU8(vCmp) != 0) {
@@ -59,7 +58,6 @@ void SimdKernel::scanExactI8(const uint8_t* buf, size_t len, int8_t target, std:
     }
 #endif
 
-    // Scalar path (and trailing bytes < 16)
     while (i < len) {
         const void* found = std::memchr(buf + i, uTarget, len - i);
         if (!found) break;
@@ -107,7 +105,6 @@ void SimdKernel::scanExactI32(const uint8_t* buf, size_t len, int32_t target, si
 #if MEMENGINE_HAS_NEON
     if (step == 4) {
         uint32x4_t vTarget = vdupq_n_u32(static_cast<uint32_t>(target));
-        // Unroll 2x (32 bytes per iteration) to hide horizontal reduction latency
         for (; i + 32 <= len; i += 32) {
             uint32x4_t c0 = vreinterpretq_u32_u8(vld1q_u8(buf + i));
             uint32x4_t c1 = vreinterpretq_u32_u8(vld1q_u8(buf + i + 16));
@@ -305,6 +302,24 @@ void SimdKernel::scanRange(const uint8_t* buf, size_t len, T minVal, T maxVal, b
                 }
             }
         }
+    } else if constexpr (std::is_same_v<T, uint32_t>) {
+        if (step == 4) {
+            uint32x4_t vMin = vdupq_n_u32(minVal);
+            uint32x4_t vMax = vdupq_n_u32(maxVal);
+            for (; i + 16 <= len; i += 16) {
+                uint32x4_t vChunk = vreinterpretq_u32_u8(vld1q_u8(buf + i));
+                uint32x4_t cMin = inclusive ? vcgeq_u32(vChunk, vMin) : vcgtq_u32(vChunk, vMin);
+                uint32x4_t cMax = inclusive ? vcleq_u32(vChunk, vMax) : vcltq_u32(vChunk, vMax);
+                uint32x4_t vMask = vandq_u32(cMin, cMax);
+                if (neonMaxvU32(vMask) != 0) {
+                    uint32_t lanes[4];
+                    vst1q_u32(lanes, vMask);
+                    for (size_t k = 0; k < 4; ++k) {
+                        if (lanes[k] != 0) outOffsets.push_back(i + k * 4);
+                    }
+                }
+            }
+        }
     }
 #endif
 
@@ -325,7 +340,7 @@ void SimdKernel::scanRange(const uint8_t* buf, size_t len, T minVal, T maxVal, b
                 uint64_t uval = static_cast<uint64_t>(val);
                 uint8_t topByte = static_cast<uint8_t>(uval >> 56);
                 if (topByte != 0 && topByte != 0xFF) {
-                    int64_t untagged = static_cast<int64_t>(uval & 0x00FFFFFFFFFFFFFFULL);
+                    int64_t untagged = static_cast<int64_t>(uval & ArchPtrPolicy::ARM64_TBI_MASK);
                     ok = inclusive ? (untagged >= minVal && untagged <= maxVal)
                                    : (untagged >  minVal && untagged <  maxVal);
                 }
@@ -335,15 +350,69 @@ void SimdKernel::scanRange(const uint8_t* buf, size_t len, T minVal, T maxVal, b
     }
 }
 
+void SimdKernel::scanRangeInteger(
+    const uint8_t* buf,
+    size_t len,
+    DataType dt,
+    int64_t iMin,
+    int64_t iMax,
+    bool inclusive,
+    size_t step,
+    std::vector<size_t>& outOffsets
+) {
+    if (iMin > iMax) std::swap(iMin, iMax);
+
+    switch (dt) {
+        case DataType::INT8: {
+            if (iMin >= 0 && iMax > 127 && iMax <= 255) {
+                scanRange<uint8_t>(buf, len, static_cast<uint8_t>(iMin), static_cast<uint8_t>(iMax), inclusive, 1, outOffsets);
+            } else {
+                int8_t lo = static_cast<int8_t>(std::clamp<int64_t>(iMin, -128, 127));
+                int8_t hi = static_cast<int8_t>(std::clamp<int64_t>(iMax, -128, 127));
+                scanRange<int8_t>(buf, len, lo, hi, inclusive, 1, outOffsets);
+            }
+            break;
+        }
+        case DataType::INT16: {
+            if (iMin >= 0 && iMax > 32767 && iMax <= 65535) {
+                scanRange<uint16_t>(buf, len, static_cast<uint16_t>(iMin), static_cast<uint16_t>(iMax), inclusive, step, outOffsets);
+            } else {
+                int16_t lo = static_cast<int16_t>(std::clamp<int64_t>(iMin, -32768, 32767));
+                int16_t hi = static_cast<int16_t>(std::clamp<int64_t>(iMax, -32768, 32767));
+                scanRange<int16_t>(buf, len, lo, hi, inclusive, step, outOffsets);
+            }
+            break;
+        }
+        case DataType::INT32: {
+            if (iMin >= 0 && iMax > 2147483647LL && iMax <= 4294967295LL) {
+                scanRange<uint32_t>(buf, len, static_cast<uint32_t>(iMin), static_cast<uint32_t>(iMax), inclusive, step, outOffsets);
+            } else {
+                int32_t lo = static_cast<int32_t>(std::clamp<int64_t>(iMin, -2147483648LL, 2147483647LL));
+                int32_t hi = static_cast<int32_t>(std::clamp<int64_t>(iMax, -2147483648LL, 2147483647LL));
+                scanRange<int32_t>(buf, len, lo, hi, inclusive, step, outOffsets);
+            }
+            break;
+        }
+        case DataType::INT64:
+        default: {
+            scanRange<int64_t>(buf, len, iMin, iMax, inclusive, step, outOffsets);
+            break;
+        }
+    }
+}
+
 template void SimdKernel::scanRange<int8_t>(const uint8_t*, size_t, int8_t, int8_t, bool, size_t, std::vector<size_t>&);
+template void SimdKernel::scanRange<uint8_t>(const uint8_t*, size_t, uint8_t, uint8_t, bool, size_t, std::vector<size_t>&);
 template void SimdKernel::scanRange<int16_t>(const uint8_t*, size_t, int16_t, int16_t, bool, size_t, std::vector<size_t>&);
+template void SimdKernel::scanRange<uint16_t>(const uint8_t*, size_t, uint16_t, uint16_t, bool, size_t, std::vector<size_t>&);
 template void SimdKernel::scanRange<int32_t>(const uint8_t*, size_t, int32_t, int32_t, bool, size_t, std::vector<size_t>&);
+template void SimdKernel::scanRange<uint32_t>(const uint8_t*, size_t, uint32_t, uint32_t, bool, size_t, std::vector<size_t>&);
 template void SimdKernel::scanRange<int64_t>(const uint8_t*, size_t, int64_t, int64_t, bool, size_t, std::vector<size_t>&);
 template void SimdKernel::scanRange<float>(const uint8_t*, size_t, float, float, bool, size_t, std::vector<size_t>&);
 template void SimdKernel::scanRange<double>(const uint8_t*, size_t, double, double, bool, size_t, std::vector<size_t>&);
 
 // ============================================================================
-// 3. Byte Array / Masked Pattern Search
+// 3. Byte Array / Masked Pattern Search (High-entropy anchor selection)
 // ============================================================================
 void SimdKernel::scanBytePattern(
     const uint8_t* buf,
@@ -355,14 +424,20 @@ void SimdKernel::scanBytePattern(
 ) {
     if (!buf || !pattern || patLen == 0 || len < patLen) return;
 
-    // Locate first non-wildcard anchor byte
+    // Select highest-entropy exact byte as anchor (preferring non-0x00 and non-0xFF bytes, inspired by frida-gum)
     size_t anchorIdx = 0;
     bool hasAnchor = false;
+    int bestScore = -1;
     for (size_t k = 0; k < patLen; ++k) {
         if (!mask || mask[k] == 0xFF) {
-            anchorIdx = k;
-            hasAnchor = true;
-            break;
+            uint8_t b = pattern[k];
+            int score = (b != 0x00 && b != 0xFF) ? 10 : (b != 0x00 ? 5 : 1);
+            if (score > bestScore) {
+                bestScore = score;
+                anchorIdx = k;
+                hasAnchor = true;
+                if (score == 10) break;
+            }
         }
     }
 
@@ -481,10 +556,12 @@ void SimdKernel::compareBuffersDelta(
     SearchOp op,
     T exactDelta,
     uint8_t regionTag,
-    std::vector<CandidateEntry>& outCandidates
+    std::vector<CandidateEntry>& outCandidates,
+    size_t step
 ) {
     const size_t tSize = sizeof(T);
     if (len < tSize) return;
+    const size_t actualStep = (step == 0) ? std::min<size_t>(tSize, 4) : step;
 
     DataType dt = DataType::INT32;
     if constexpr (std::is_same_v<T, int8_t>)   dt = DataType::INT8;
@@ -494,7 +571,7 @@ void SimdKernel::compareBuffersDelta(
     if constexpr (std::is_same_v<T, float>)    dt = DataType::FLOAT;
     if constexpr (std::is_same_v<T, double>)   dt = DataType::DOUBLE;
 
-    for (size_t off = 0; off + tSize <= len; off += tSize) {
+    for (size_t off = 0; off + tSize <= len; off += actualStep) {
         T curVal, oldVal;
         std::memcpy(&curVal, curBuf + off, tSize);
         std::memcpy(&oldVal, oldBuf + off, tSize);
@@ -533,11 +610,11 @@ void SimdKernel::compareBuffersDelta(
     }
 }
 
-template void SimdKernel::compareBuffersDelta<int8_t>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, int8_t, uint8_t, std::vector<CandidateEntry>&);
-template void SimdKernel::compareBuffersDelta<int16_t>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, int16_t, uint8_t, std::vector<CandidateEntry>&);
-template void SimdKernel::compareBuffersDelta<int32_t>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, int32_t, uint8_t, std::vector<CandidateEntry>&);
-template void SimdKernel::compareBuffersDelta<int64_t>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, int64_t, uint8_t, std::vector<CandidateEntry>&);
-template void SimdKernel::compareBuffersDelta<float>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, float, uint8_t, std::vector<CandidateEntry>&);
-template void SimdKernel::compareBuffersDelta<double>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, double, uint8_t, std::vector<CandidateEntry>&);
+template void SimdKernel::compareBuffersDelta<int8_t>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, int8_t, uint8_t, std::vector<CandidateEntry>&, size_t);
+template void SimdKernel::compareBuffersDelta<int16_t>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, int16_t, uint8_t, std::vector<CandidateEntry>&, size_t);
+template void SimdKernel::compareBuffersDelta<int32_t>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, int32_t, uint8_t, std::vector<CandidateEntry>&, size_t);
+template void SimdKernel::compareBuffersDelta<int64_t>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, int64_t, uint8_t, std::vector<CandidateEntry>&, size_t);
+template void SimdKernel::compareBuffersDelta<float>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, float, uint8_t, std::vector<CandidateEntry>&, size_t);
+template void SimdKernel::compareBuffersDelta<double>(uintptr_t, const uint8_t*, const uint8_t*, size_t, SearchOp, double, uint8_t, std::vector<CandidateEntry>&, size_t);
 
 } // namespace mem_engine

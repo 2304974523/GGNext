@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
     mem_engine::ValueLocker locker(io, 10);
     mem_engine::CancellationToken cancelToken;
     std::vector<mem_engine::VmaRegion> cachedAllRegions;
+    mem_engine::VmaIndex cachedVmaIndex;
     std::mutex progressMutex;
 
     auto makeProgressReporter = [&]() -> mem_engine::ProgressCallback {
@@ -126,9 +127,11 @@ int main(int argc, char** argv) {
             if (rc == mem_engine::EngineErrc::OK) {
                 scanner.refreshRegions();
                 cachedAllRegions = mem_engine::MapsParser::parseProcessMaps(pid, 0, false);
+                cachedVmaIndex.rebuild(cachedAllRegions);
                 std::printf("OK 0 %zu\n", cachedAllRegions.size());
             } else {
                 cachedAllRegions.clear();
+                cachedVmaIndex.rebuild(cachedAllRegions);
                 std::printf("ERR %d\n", static_cast<int>(rc));
             }
             std::fflush(stdout);
@@ -145,6 +148,7 @@ int main(int argc, char** argv) {
             int pid = io.pid();
             if (pid > 0) {
                 cachedAllRegions = mem_engine::MapsParser::parseProcessMaps(pid, 0, false);
+                cachedVmaIndex.rebuild(cachedAllRegions);
             }
             std::printf("OK %zu\n", cachedAllRegions.size());
             for (const auto& r : cachedAllRegions) {
@@ -312,6 +316,38 @@ int main(int argc, char** argv) {
             }
             std::printf("OK\n");
             std::fflush(stdout);
+        } else if (cmd == "LOCK_CONFIG") {
+            std::string addrHex, hexBytes;
+            int dt = 2, freezeMode = 0;
+            int64_t minVal = 0, maxVal = 0;
+            iss >> addrHex >> hexBytes >> dt >> freezeMode >> minVal >> maxVal;
+            uintptr_t addr = static_cast<uintptr_t>(std::strtoull(addrHex.c_str(), nullptr, 16));
+            auto bytes = hexToBytes(hexBytes);
+            if (!bytes.empty()) {
+                locker.lockAddressConfigured(
+                    addr,
+                    bytes.data(),
+                    bytes.size(),
+                    static_cast<mem_engine::DataType>(dt),
+                    static_cast<mem_engine::FreezeMode>(freezeMode),
+                    minVal,
+                    maxVal
+                );
+            }
+            std::printf("OK\n");
+            std::fflush(stdout);
+        } else if (cmd == "LOCK_PAUSE") {
+            int paused = 0;
+            iss >> paused;
+            locker.setPaused(paused != 0);
+            std::printf("OK\n");
+            std::fflush(stdout);
+        } else if (cmd == "LOCK_INTERVAL") {
+            uint32_t ms = 10;
+            iss >> ms;
+            locker.setIntervalMs(ms);
+            std::printf("OK\n");
+            std::fflush(stdout);
         } else if (cmd == "UNLOCK") {
             std::string addrHex;
             iss >> addrHex;
@@ -322,6 +358,25 @@ int main(int argc, char** argv) {
         } else if (cmd == "UNLOCK_ALL") {
             locker.unlockAll();
             std::printf("OK\n");
+            std::fflush(stdout);
+        } else if (cmd == "CLEAR_SESSION") {
+            scanner.clearSession();
+            std::printf("OK\n");
+            std::fflush(stdout);
+        } else if (cmd == "REMOVE_CANDIDATES") {
+            size_t count = 0;
+            iss >> count;
+            if (count > 0 && count <= 100000) {
+                std::vector<uint64_t> addrs;
+                addrs.reserve(count);
+                for (size_t i = 0; i < count; ++i) {
+                    std::string hex;
+                    if (!(iss >> hex)) break;
+                    addrs.push_back(std::strtoull(hex.c_str(), nullptr, 16));
+                }
+                scanner.removeCandidates(addrs.data(), addrs.size());
+            }
+            std::printf("OK %zu\n", scanner.totalMatchedCount());
             std::fflush(stdout);
         } else if (cmd == "SEARCH_EXACT") {
             int dt = 0, aligned = 1;
@@ -357,6 +412,43 @@ int main(int argc, char** argv) {
             iss >> dt >> iMin >> iMax >> fMin >> fMax >> inclusive;
             cancelToken.reset();
             scanner.refineRange(static_cast<mem_engine::DataType>(dt), iMin, iMax, fMin, fMax, inclusive != 0, &cancelToken, makeProgressReporter());
+            std::printf("OK %zu\n", scanner.totalMatchedCount());
+            std::fflush(stdout);
+        } else if (cmd == "SEARCH_POINTER") {
+            int dt = 0, aligned = 1;
+            std::string targetHex;
+            uint64_t maxOffset = 0;
+            uint32_t protMask = mem_engine::PointerProtMask::ALL;
+            iss >> dt >> targetHex >> maxOffset >> protMask >> aligned;
+            uintptr_t targetAddr = static_cast<uintptr_t>(std::strtoull(targetHex.c_str(), nullptr, 16));
+            cancelToken.reset();
+            scanner.searchPointers(
+                static_cast<mem_engine::DataType>(dt),
+                targetAddr,
+                maxOffset,
+                protMask,
+                aligned != 0,
+                &cancelToken,
+                makeProgressReporter()
+            );
+            std::printf("OK %zu\n", scanner.totalMatchedCount());
+            std::fflush(stdout);
+        } else if (cmd == "REFINE_POINTER") {
+            int dt = 0;
+            std::string targetHex;
+            uint64_t maxOffset = 0;
+            uint32_t protMask = mem_engine::PointerProtMask::ALL;
+            iss >> dt >> targetHex >> maxOffset >> protMask;
+            uintptr_t targetAddr = static_cast<uintptr_t>(std::strtoull(targetHex.c_str(), nullptr, 16));
+            cancelToken.reset();
+            scanner.refinePointers(
+                static_cast<mem_engine::DataType>(dt),
+                targetAddr,
+                maxOffset,
+                protMask,
+                &cancelToken,
+                makeProgressReporter()
+            );
             std::printf("OK %zu\n", scanner.totalMatchedCount());
             std::fflush(stdout);
         } else if (cmd == "SEARCH_GROUP" || cmd == "REFINE_GROUP") {
@@ -462,7 +554,9 @@ int main(int argc, char** argv) {
             scanner.fetchCandidates(offset, limit, slice);
             std::printf("OK %zu\n", slice.size());
             for (const auto& c : slice) {
-                uint64_t meta = static_cast<uint64_t>(c.type) | (static_cast<uint64_t>(c.regionTag) << 8);
+                uint64_t meta = static_cast<uint64_t>(c.type) |
+                                (static_cast<uint64_t>(c.regionTag) << 8) |
+                                (static_cast<uint64_t>(c.flags) << 16);
                 std::printf(
                     "%llx %lld %llu\n",
                     static_cast<unsigned long long>(c.address),

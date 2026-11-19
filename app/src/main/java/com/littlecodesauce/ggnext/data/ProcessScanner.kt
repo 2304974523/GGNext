@@ -155,21 +155,96 @@ object ProcessScanner {
         }
 
         val out = LinkedHashMap<Int, TargetProcess>()
+        val ppidByPid = HashMap<Int, Int>()
+        val procIdentityByPid = HashMap<Int, String>()
 
         // 1. Root 模式下通过 su 获取全系统真实运行中的 Android 应用进程
         if (mode == WorkMode.ROOT && Shell.hasRoot()) {
-            scanViaRootProc(context, pm, pkgMap, uidMap, appIdMap, myPid, out)
+            scanViaRootProc(context, pm, pkgMap, uidMap, appIdMap, myPid, out, ppidByPid, procIdentityByPid)
         }
 
         // 2. 无论是否为 Root 模式，始终扫描当前权限可读的 /proc（含 SELinux 直探同 UID / sharedUserId 进程）与 ActivityManager 作为补充
-        scanProcDirectly(context, pm, installedApps, pkgMap, uidMap, appIdMap, myUid, myPid, mode, out)
-        scanFromActivityManager(context, pm, pkgMap, uidMap, appIdMap, myPid, out)
+        scanProcDirectly(context, pm, installedApps, pkgMap, uidMap, appIdMap, myUid, myPid, mode, out, ppidByPid, procIdentityByPid)
+        scanFromActivityManager(context, pm, pkgMap, uidMap, appIdMap, myPid, out, ppidByPid, procIdentityByPid)
 
-        return out.values.sortedWith(
+        // 3. 基于 Android OS (uid, processName) 进程唯一性契约与父子进程树折叠 fork 辅助子进程 / 线程伪影
+        val deduplicated = deduplicateForkedAndSharedProcesses(out, ppidByPid, procIdentityByPid)
+
+        return deduplicated.sortedWith(
             compareBy<TargetProcess> { it.system }
                 .thenByDescending { it.isVirtual }
                 .thenBy { it.pid }
         )
+    }
+
+    /**
+     * 读取 `/proc/<pid>/status` 验证该 PID 是否为真实进程主线程 (`Tgid == pid`) 且非僵尸进程 (`State != Z/X`)。
+     * 若当前 SELinux 权限不可直接读 `/proc/<pid>/status`，则返回 `true` 交由上层 `ps` 数据处理。
+     */
+    private fun verifyThreadGroupLeaderIfReadable(pid: Int, myPid: Int): Boolean {
+        val statusFile = File("/proc/$pid/status")
+        if (!statusFile.canRead()) return true
+        var tgid = 0
+        var ppid = 0
+        var isZombieOrDead = false
+        val ok = runCatching {
+            statusFile.forEachLine { line ->
+                when {
+                    line.startsWith("Tgid:") -> {
+                        tgid = line.substringAfter("Tgid:").trim().toIntOrNull() ?: 0
+                    }
+                    line.startsWith("PPid:") -> {
+                        ppid = line.substringAfter("PPid:").trim().toIntOrNull() ?: 0
+                    }
+                    line.startsWith("State:") -> {
+                        val st = line.substringAfter("State:").trim()
+                        if (st.startsWith("Z") || st.startsWith("X") || st.startsWith("x")) {
+                            isZombieOrDead = true
+                        }
+                    }
+                }
+            }
+            true
+        }.getOrDefault(false)
+        if (!ok) return true
+        if (isZombieOrDead) return false
+        if (ppid == myPid) return false
+        if (tgid > 0 && tgid != pid) return false
+        return true
+    }
+
+    /**
+     * 基于 Android `ActivityManagerService` 的 `(uid, processName)` 唯一性不变量：
+     * - 同一用户 UID 下相同的 `processName` 在 Android 系统中仅对应唯一主应用进程；
+     * - 当目标游戏或虚拟沙箱使用 `fork()` 派生崩溃守护子进程 / Houdini 辅助进程 / 信号监听子进程时，
+     *   子进程会继承父进程相同的 `cmdline` 与 COW `VmRSS`。此处优先保留非子进程（`ppid` 不在同组中）且内存占用最高的主进程。
+     */
+    private fun deduplicateForkedAndSharedProcesses(
+        candidates: Map<Int, TargetProcess>,
+        ppidByPid: Map<Int, Int>,
+        procIdentityByPid: Map<Int, String>
+    ): List<TargetProcess> {
+        if (candidates.size <= 1) return candidates.values.toList()
+        val byIdentity = LinkedHashMap<String, MutableList<TargetProcess>>()
+        for ((pid, proc) in candidates) {
+            val identity = procIdentityByPid[pid] ?: "${proc.uid}|${proc.packageName}|${proc.label}"
+            byIdentity.getOrPut(identity) { ArrayList(2) }.add(proc)
+        }
+        val result = ArrayList<TargetProcess>(byIdentity.size)
+        for ((_, group) in byIdentity) {
+            if (group.size == 1) {
+                result.add(group[0])
+            } else {
+                val groupPids = group.mapTo(HashSet(group.size * 2)) { it.pid }
+                val primary = group.sortedWith(
+                    compareBy<TargetProcess> { (ppidByPid[it.pid] ?: 0) in groupPids }
+                        .thenByDescending { it.sizeBytes }
+                        .thenBy { it.pid }
+                ).first()
+                result.add(primary)
+            }
+        }
+        return result
     }
 
     /**
@@ -183,7 +258,9 @@ object ProcessScanner {
         uidMap: Map<Int, List<ApplicationInfo>>,
         appIdMap: Map<Int, List<ApplicationInfo>>,
         myPid: Int,
-        out: MutableMap<Int, TargetProcess>
+        out: MutableMap<Int, TargetProcess>,
+        ppidByPid: MutableMap<Int, Int>,
+        procIdentityByPid: MutableMap<Int, String>
     ) {
         val script = "ps -A -w -o UID,PID,PPID,RSS,ARGS 2>/dev/null || ps -A -o UID,PID,PPID,RSS,ARGS"
         val lines = Shell.suLines(script)
@@ -197,7 +274,9 @@ object ProcessScanner {
             val rss = parts[3].toLongOrNull() ?: 0L
             val cmdRaw = parts[4].trim()
 
-            if (pid <= 1 || pid == myPid || ppid == 2 || rss <= 0L) continue
+            if (pid <= 1 || pid == myPid || ppid == myPid || ppid == 2 || rss <= 0L) continue
+            if (!verifyThreadGroupLeaderIfReadable(pid, myPid)) continue
+
             var cmd = cmdRaw.split(' ').firstOrNull()?.trim().orEmpty()
             // 若可读 /proc/<pid>/cmdline，优先读取完整无截断进程名
             val procCmd = readCmdlineDirect(pid)
@@ -218,7 +297,9 @@ object ProcessScanner {
                 rssKb = rss,
                 rawProcessName = cmd,
                 allowRootInspect = true,
-                out = out
+                out = out,
+                ppidByPid = ppidByPid,
+                procIdentityByPid = procIdentityByPid
             )
         }
     }
@@ -233,12 +314,9 @@ object ProcessScanner {
 
     /**
      * 直接扫描 `/proc` 目录（免 Root / 共享 UID 模式下获取相同 UID 或可读沙箱内的应用进程）：
-     * - 关键修复 1：Android 7.0+ 的 `untrusted_app` SELinux 域禁止对 `/proc` 执行 `opendir/readdir` (`proc:dir { read }` 被拒)，
-     *   导致 `File("/proc").listFiles()` 直接返回 `null`！但 SELinux 允许对 `/proc` 执行路径穿透 (`proc:dir { search }`)，
-     *   且对同 UID + 同 MCS 类别 (`android:sharedUserId`) 的进程拥有完整的 `/proc/<pid>` 访问权 (`self:dir/file`)。
-     *   因此当 `listFiles()` 为空或未枚举全时，通过 `Os.access("/proc/$pid/status", F_OK)` 直接遍历 PID 空间，毫秒级发现所有共享 UID 进程。
-     * - 关键修复 2：当 `/proc/<pid>/cmdline` 为空或进程名被截断为 15 字符 `Name:` (`TASK_COMM_LEN`) 时，
-     *   结合 `uidMap[uid]` 与已安装应用的 15 字符前缀反查完整包名。
+     * - 严格校验 `Tgid == pid` 且非僵尸进程，排除 GGNext 自身派生的子进程 (`ppid == myPid`)；
+     * - 严格限制 UID 反查包名仅在 `cmdline` 为空且 `commName` 与包名前缀/后缀匹配时生效，
+     *   彻底消除 `android:sharedUserId` 模式下将同 UID 的 shell / 辅助进程误重命名为目标游戏导致的重复进程问题。
      */
     private fun scanProcDirectly(
         context: Context,
@@ -250,7 +328,9 @@ object ProcessScanner {
         myUid: Int,
         myPid: Int,
         mode: WorkMode,
-        out: MutableMap<Int, TargetProcess>
+        out: MutableMap<Int, TargetProcess>,
+        ppidByPid: MutableMap<Int, Int>,
+        procIdentityByPid: MutableMap<Int, String>
     ) {
         val candidatePids = LinkedHashSet<Int>()
         val procEntries = runCatching { File("/proc").listFiles() }.getOrNull()
@@ -263,8 +343,8 @@ object ProcessScanner {
             }
         }
 
-        // 当 SELinux 拦截 opendir("/proc") 或 hidepid 隐藏目录项时，通过 proc:dir search 直接探测 PID 空间
-        if (candidatePids.isEmpty() || mode == WorkMode.NO_ROOT) {
+        // 当 SELinux 拦截 opendir("/proc") 或 hidepid 隐藏目录项时，在免 Root 模式（或 Root 扫描为空时）通过 proc:dir search 直接探测 PID 空间
+        if ((candidatePids.isEmpty() && out.isEmpty()) || mode == WorkMode.NO_ROOT) {
             val maxPid = runCatching {
                 File("/proc/sys/kernel/pid_max").readText().trim().toIntOrNull()
             }.getOrNull()?.coerceIn(4096, 131072) ?: 65536
@@ -287,14 +367,25 @@ object ProcessScanner {
             if (pid <= 1 || pid == myPid || out.containsKey(pid)) continue
 
             var uid = -1
+            var tgid = 0
             var ppid = 0
             var rssKb = 0L
             var commName = ""
+            var isZombieOrDead = false
             val statusOk = runCatching {
                 File("/proc/$pid/status").forEachLine { line ->
                     when {
                         line.startsWith("Name:") -> {
                             commName = line.substringAfter("Name:").trim()
+                        }
+                        line.startsWith("State:") -> {
+                            val st = line.substringAfter("State:").trim()
+                            if (st.startsWith("Z") || st.startsWith("X") || st.startsWith("x")) {
+                                isZombieOrDead = true
+                            }
+                        }
+                        line.startsWith("Tgid:") -> {
+                            tgid = line.substringAfter("Tgid:").trim().toIntOrNull() ?: 0
                         }
                         line.startsWith("Uid:") -> {
                             uid = line.substringAfter("Uid:").trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull() ?: -1
@@ -310,37 +401,27 @@ object ProcessScanner {
                 true
             }.getOrDefault(false)
 
-            if (!statusOk || ppid == 2 || rssKb <= 0L) continue
+            // 严格过滤子线程 (tgid != pid)、僵尸进程、内核线程及 GGNext 自身派生的子进程 (ppid == myPid)
+            if (!statusOk || isZombieOrDead || tgid != pid || ppid == 2 || ppid == myPid || rssKb <= 0L) continue
             if (mode == WorkMode.NO_ROOT && uid != -1 && (uid % 100000) != myAppId) {
-                // 若非同 appId 且不可读其内存映射，则在免 Root 模式下跳过
                 val mapsReadable = runCatching { File("/proc/$pid/maps").canRead() }.getOrDefault(false)
                 if (!mapsReadable) continue
             }
 
             var procName = readCmdlineDirect(pid)
-            if (procName.isEmpty() || !procName.contains('.')) {
-                // 回退：通过同 UID 绑定的已安装应用或 15 字符 commName 还原完整包名
+            if (procName.isEmpty() && commName.length >= 6) {
+                // 仅当 /proc/<pid>/cmdline 为空且 15 字符 commName 与某已安装应用包名前缀/后缀明确匹配时还原完整包名
                 val sameUidApps = if (uid >= 0) (uidMap[uid] ?: appIdMap[uid % 100000]).orEmpty() else emptyList()
-                val matchedByUid = when {
-                    sameUidApps.size == 1 -> sameUidApps.first().packageName
-                    sameUidApps.size > 1 && commName.isNotEmpty() -> {
-                        sameUidApps.firstOrNull {
-                            it.packageName.startsWith(commName) || it.packageName.endsWith(commName) || commName.startsWith(it.packageName.take(15))
-                        }?.packageName ?: sameUidApps.first().packageName
-                    }
-                    commName.length >= 6 -> {
-                        installedApps.firstOrNull {
-                            it.packageName != context.packageName &&
-                                (it.packageName == commName || (commName.length >= 15 && it.packageName.startsWith(commName)))
-                        }?.packageName.orEmpty()
-                    }
-                    else -> ""
-                }
-                if (matchedByUid.isNotEmpty()) {
-                    procName = matchedByUid
-                } else if (procName.isEmpty()) {
-                    procName = commName
-                }
+                val matchedByComm = sameUidApps.firstOrNull {
+                    it.packageName == commName ||
+                        (commName.length >= 12 && (it.packageName.startsWith(commName) || it.packageName.endsWith(commName))) ||
+                        commName.startsWith(it.packageName.take(15))
+                }?.packageName ?: installedApps.firstOrNull {
+                    it.packageName != context.packageName &&
+                        (it.packageName == commName || (commName.length >= 15 && it.packageName.startsWith(commName)))
+                }?.packageName.orEmpty()
+
+                procName = matchedByComm.ifEmpty { commName }
             }
             if (procName.isEmpty()) continue
 
@@ -356,7 +437,9 @@ object ProcessScanner {
                 rssKb = rssKb,
                 rawProcessName = procName,
                 allowRootInspect = false,
-                out = out
+                out = out,
+                ppidByPid = ppidByPid,
+                procIdentityByPid = procIdentityByPid
             )
         }
     }
@@ -368,17 +451,20 @@ object ProcessScanner {
         uidMap: Map<Int, List<ApplicationInfo>>,
         appIdMap: Map<Int, List<ApplicationInfo>>,
         myPid: Int,
-        out: MutableMap<Int, TargetProcess>
+        out: MutableMap<Int, TargetProcess>,
+        ppidByPid: MutableMap<Int, Int>,
+        procIdentityByPid: MutableMap<Int, String>
     ) {
         runCatching {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
             am?.runningAppProcesses?.forEach { proc ->
                 if (proc.pid <= 1 || proc.pid == myPid || out.containsKey(proc.pid)) return@forEach
+                if (!verifyThreadGroupLeaderIfReadable(proc.pid, myPid)) return@forEach
                 val cmdFromProc = readCmdlineDirect(proc.pid)
                 val rawName = cmdFromProc.ifEmpty {
-                    proc.processName?.takeIf { it != context.packageName }
-                        ?: proc.pkgList?.firstOrNull { it != context.packageName }
-                        ?: return@forEach
+                    proc.processName?.takeIf {
+                        it != context.packageName && !it.startsWith("${context.packageName}:")
+                    } ?: return@forEach
                 }
                 val rss = readRssFromProc(proc.pid)
                 addCandidateIfAndroidApp(
@@ -393,7 +479,9 @@ object ProcessScanner {
                     rssKb = if (rss > 0L) rss else 64_000L,
                     rawProcessName = rawName,
                     allowRootInspect = false,
-                    out = out
+                    out = out,
+                    ppidByPid = ppidByPid,
+                    procIdentityByPid = procIdentityByPid
                 )
             }
         }
@@ -418,7 +506,9 @@ object ProcessScanner {
         rssKb: Long,
         rawProcessName: String,
         allowRootInspect: Boolean,
-        out: MutableMap<Int, TargetProcess>
+        out: MutableMap<Int, TargetProcess>,
+        ppidByPid: MutableMap<Int, Int>,
+        procIdentityByPid: MutableMap<Int, String>
     ) {
         if (ppid == 2 || rssKb <= 0L) return
         val cleanCmd = rawProcessName.trim()
@@ -556,12 +646,16 @@ object ProcessScanner {
 
         val x64 = detectProcess64Bit(pid, appInfo)
 
+        val resolvedUid = if (uid >= 0) uid else (appInfo?.uid ?: 0)
+        ppidByPid[pid] = ppid
+        procIdentityByPid[pid] = "$resolvedUid|$resolvedPkg|$cleanCmd"
+
         out[pid] = TargetProcess(
             pid = pid,
             packageName = resolvedPkg,
             label = finalLabel,
             x64 = x64,
-            uid = if (uid >= 0) uid else (appInfo?.uid ?: 0),
+            uid = resolvedUid,
             sizeBytes = rssKb * 1024L,
             running = true,
             system = isSystemApp,

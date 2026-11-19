@@ -153,13 +153,13 @@ fun ProcessSheet(ui: Ui) {
             if (ui.processLoading) {
                 SkeletonList()
             } else {
-                Box(Modifier.fillMaxWidth()) {
+                Box(Modifier.fillMaxWidth().weight(1f, fill = false)) {
                     LazyColumn(
                         state = listState,
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        itemsIndexed(list, key = { idx, p -> "${p.pid}_${p.packageName}_$idx" }) { idx, p ->
+                        itemsIndexed(list, key = { _, p -> p.pid }) { idx, p ->
                             ProcessRow(p, idx) { Session.attach(p) }
                         }
                     }

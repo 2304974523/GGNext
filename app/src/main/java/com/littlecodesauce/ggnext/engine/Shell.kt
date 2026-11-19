@@ -18,7 +18,7 @@ object Shell {
     }
 
     fun hasRoot(): Boolean {
-        cachedRoot?.let { return it }
+        if (cachedRoot == true) return true
         val ok = try {
             val p = ProcessBuilder("su", "-c", "id").redirectErrorStream(true).start()
             val text = p.inputStream.bufferedReader().readText()
@@ -26,8 +26,18 @@ object Shell {
             text.contains("uid=0")
         } catch (_: Throwable) {
             false
+        } || try {
+            val p = ProcessBuilder("su").redirectErrorStream(true).start()
+            DataOutputStream(p.outputStream).use { it.writeBytes("id\nexit\n") }
+            val text = p.inputStream.bufferedReader().readText()
+            p.waitFor()
+            text.contains("uid=0")
+        } catch (_: Throwable) {
+            false
         }
-        cachedRoot = ok
+        if (ok) {
+            cachedRoot = true
+        }
         return ok
     }
 

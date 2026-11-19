@@ -1,14 +1,47 @@
 #include "mem_engine/mmap_store.hpp"
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 
 namespace mem_engine {
 
+namespace {
+
+std::atomic<uint32_t> g_spillCounter{1};
+
+// Attempts to create an unlinked file in spillDir sized to capBytes; returns fd >= 0 on success, -1 on fallback
+int openUnlinkedSpillFile(const std::string& spillDir, const char* prefix, size_t capBytes) noexcept {
+    if (capBytes == 0) return -1;
+    char path[512];
+    uint32_t seq = g_spillCounter.fetch_add(1, std::memory_order_relaxed);
+    const char* primaryDir = spillDir.empty() ? "/data/local/tmp" : spillDir.c_str();
+    std::snprintf(path, sizeof(path), "%s/.%s_%d_%u.mmap", primaryDir, prefix, ::getpid(), seq);
+
+    int fd = ::open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 && std::strcmp(primaryDir, "/data/local/tmp") != 0) {
+        std::snprintf(path, sizeof(path), "/data/local/tmp/.%s_%d_%u.mmap", prefix, ::getpid(), seq);
+        fd = ::open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    }
+    if (fd < 0) return -1;
+    // Immediately unlink so the kernel automatically frees the inode when fd closes or process exits
+    ::unlink(path);
+
+    if (::ftruncate(fd, static_cast<off_t>(capBytes)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+} // anonymous namespace
+
 // ============================================================================
-// MmapCandidateStore Implementation (Anonymous Demand-Paged Virtual Memory)
+// MmapCandidateStore Implementation
 // ============================================================================
 MmapCandidateStore::MmapCandidateStore(size_t inMemoryThreshold, const std::string& spillDir)
     : m_threshold(std::min<size_t>(inMemoryThreshold, MAX_STORED_CANDIDATES)),
@@ -65,16 +98,27 @@ bool MmapCandidateStore::transitionToMmap(size_t requiredCount) {
     if (capCount < requiredCount) capCount = requiredCount;
     size_t capBytes = capCount * sizeof(CandidateEntry);
 
-    void* ptr = ::mmap(nullptr, capBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fd = openUnlinkedSpillFile(m_spillDir, "ggnext_cand", capBytes);
+    void* ptr = MAP_FAILED;
+    if (fd >= 0) {
+        ptr = ::mmap(nullptr, capBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (ptr == MAP_FAILED) {
+            ::close(fd);
+            fd = -1;
+        }
+    }
     if (ptr == MAP_FAILED) {
-        return false;
+        ptr = ::mmap(nullptr, capBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr == MAP_FAILED) {
+            return false;
+        }
     }
 
     ::madvise(ptr, capBytes, MADV_SEQUENTIAL);
     m_mmapPtr = static_cast<CandidateEntry*>(ptr);
     m_mmapCapacityBytes = capBytes;
     m_isMmap = true;
-    m_fd = -1;
+    m_fd = fd;
 
     if (!m_ramVec.empty()) {
         std::memcpy(m_mmapPtr, m_ramVec.data(), m_ramVec.size() * sizeof(CandidateEntry));
@@ -95,13 +139,20 @@ bool MmapCandidateStore::growMmap(size_t requiredCount) {
     );
     if (newCapBytes < neededBytes) newCapBytes = neededBytes;
 
+    if (m_fd >= 0) {
+        if (::ftruncate(m_fd, static_cast<off_t>(newCapBytes)) != 0) {
+            return false;
+        }
+    }
+
 #if defined(__linux__) && defined(MREMAP_MAYMOVE)
     void* newPtr = ::mremap(m_mmapPtr, m_mmapCapacityBytes, newCapBytes, MREMAP_MAYMOVE);
     if (newPtr == MAP_FAILED) return false;
 #else
-    void* newPtr = ::mmap(nullptr, newCapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int flags = (m_fd >= 0) ? MAP_SHARED : (MAP_PRIVATE | MAP_ANONYMOUS);
+    void* newPtr = ::mmap(nullptr, newCapBytes, PROT_READ | PROT_WRITE, flags, m_fd, 0);
     if (newPtr == MAP_FAILED) return false;
-    if (m_count > 0) {
+    if (m_fd < 0 && m_count > 0) {
         std::memcpy(newPtr, m_mmapPtr, m_count * sizeof(CandidateEntry));
     }
     ::munmap(m_mmapPtr, m_mmapCapacityBytes);
@@ -118,7 +169,7 @@ bool MmapCandidateStore::append(const CandidateEntry& entry) {
 
 bool MmapCandidateStore::appendBatch(const CandidateEntry* entries, size_t count) {
     if (count == 0 || !entries) return true;
-    if (m_count >= MAX_STORED_CANDIDATES) return true; // Cap reached safely
+    if (m_count >= MAX_STORED_CANDIDATES) return true;
 
     size_t allowed = std::min(count, MAX_STORED_CANDIDATES - m_count);
     size_t newCount = m_count + allowed;
@@ -141,6 +192,33 @@ bool MmapCandidateStore::appendBatch(const CandidateEntry* entries, size_t count
     std::memcpy(m_mmapPtr + m_count, entries, allowed * sizeof(CandidateEntry));
     m_count = newCount;
     return true;
+}
+
+size_t MmapCandidateStore::removeAddresses(const uint64_t* addrs, size_t count) {
+    if (m_count == 0 || count == 0 || !addrs) return 0;
+
+    std::vector<uint64_t> sortedRemove(addrs, addrs + count);
+    std::sort(sortedRemove.begin(), sortedRemove.end());
+    sortedRemove.erase(std::unique(sortedRemove.begin(), sortedRemove.end()), sortedRemove.end());
+
+    CandidateEntry* base = data();
+    size_t writeIdx = 0;
+    for (size_t readIdx = 0; readIdx < m_count; ++readIdx) {
+        uint64_t addr = base[readIdx].address;
+        if (!std::binary_search(sortedRemove.begin(), sortedRemove.end(), addr)) {
+            if (writeIdx != readIdx) {
+                base[writeIdx] = base[readIdx];
+            }
+            ++writeIdx;
+        }
+    }
+
+    size_t removed = m_count - writeIdx;
+    m_count = writeIdx;
+    if (!m_isMmap && m_ramVec.size() > writeIdx) {
+        m_ramVec.resize(writeIdx);
+    }
+    return removed;
 }
 
 const CandidateEntry& MmapCandidateStore::operator[](size_t idx) const noexcept {
@@ -198,7 +276,7 @@ void MmapCandidateStore::clear() noexcept {
 }
 
 // ============================================================================
-// MmapRegionSnapshotStore Implementation (Anonymous Demand-Paged Snapshot)
+// MmapRegionSnapshotStore Implementation
 // ============================================================================
 MmapRegionSnapshotStore::MmapRegionSnapshotStore(const std::string& spillDir)
     : m_spillDir(spillDir) {}
@@ -245,13 +323,23 @@ bool MmapRegionSnapshotStore::openStore(size_t reserveBytes) {
         std::max<size_t>(reserveBytes, 16 * 1024 * 1024)
     );
 
-    void* ptr = ::mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fd = openUnlinkedSpillFile(m_spillDir, "ggnext_snap", cap);
+    void* ptr = MAP_FAILED;
+    if (fd >= 0) {
+        ptr = ::mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (ptr == MAP_FAILED) {
+            ::close(fd);
+            fd = -1;
+        }
+    }
     if (ptr == MAP_FAILED) {
-        // Fallback to 64 MB initial reservation if target reserve was large
-        cap = 64 * 1024 * 1024;
         ptr = ::mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (ptr == MAP_FAILED) {
-            return false;
+            cap = 64 * 1024 * 1024;
+            ptr = ::mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (ptr == MAP_FAILED) {
+                return false;
+            }
         }
     }
 
@@ -259,7 +347,7 @@ bool MmapRegionSnapshotStore::openStore(size_t reserveBytes) {
     m_mmapPtr = static_cast<uint8_t*>(ptr);
     m_capacity = cap;
     m_writeOffset = 0;
-    m_fd = -1;
+    m_fd = fd;
     return true;
 }
 
@@ -275,13 +363,20 @@ bool MmapRegionSnapshotStore::ensureCapacity(size_t totalBytesNeeded) {
         std::max(m_capacity * 2, totalBytesNeeded + (16 * 1024 * 1024))
     );
 
+    if (m_fd >= 0) {
+        if (::ftruncate(m_fd, static_cast<off_t>(newCap)) != 0) {
+            return false;
+        }
+    }
+
 #if defined(__linux__) && defined(MREMAP_MAYMOVE)
     void* newPtr = ::mremap(m_mmapPtr, m_capacity, newCap, MREMAP_MAYMOVE);
     if (newPtr == MAP_FAILED) return false;
 #else
-    void* newPtr = ::mmap(nullptr, newCap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int flags = (m_fd >= 0) ? MAP_SHARED : (MAP_PRIVATE | MAP_ANONYMOUS);
+    void* newPtr = ::mmap(nullptr, newCap, PROT_READ | PROT_WRITE, flags, m_fd, 0);
     if (newPtr == MAP_FAILED) return false;
-    if (m_writeOffset > 0) {
+    if (m_fd < 0 && m_writeOffset > 0) {
         std::memcpy(newPtr, m_mmapPtr, m_writeOffset);
     }
     ::munmap(m_mmapPtr, m_capacity);
@@ -295,13 +390,12 @@ bool MmapRegionSnapshotStore::ensureCapacity(size_t totalBytesNeeded) {
 bool MmapRegionSnapshotStore::appendRegionChunk(uintptr_t startAddr, const uint8_t* data, size_t len, uint32_t regionFlag) {
     if (len == 0 || !data) return true;
     if (m_writeOffset >= MAX_SNAPSHOT_BYTES) {
-        // Gracefully cap snapshot at MAX_SNAPSHOT_BYTES rather than failing the scan
         return true;
     }
 
     size_t actualLen = std::min(len, MAX_SNAPSHOT_BYTES - m_writeOffset);
     if (!ensureCapacity(m_writeOffset + actualLen)) {
-        return true; // Keep existing snapshot blocks rather than aborting
+        return true;
     }
 
     std::memcpy(m_mmapPtr + m_writeOffset, data, actualLen);

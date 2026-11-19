@@ -90,6 +90,7 @@ public:
     }
     bool hasFuzzySnapshot() const noexcept { return m_hasFullSnapshot; }
     void fetchCandidates(size_t offset, size_t limit, std::vector<CandidateEntry>& out) const;
+    size_t removeCandidates(const uint64_t* addresses, size_t count);
     const ScanTelemetry& lastTelemetry() const noexcept { return m_lastTelemetry; }
 
     void clearSession() noexcept;
@@ -176,7 +177,7 @@ public:
     );
 
     // ------------------------------------------------------------------------
-    // 4. Encoded & 6. XOR Search (Offset, Static XOR, XOR Pair 32/64, Addr XOR, GG_AUTO, XOR_OFFSET)
+    // 4. Encoded & XOR Search (Offset, Static XOR, XOR Pair 32/64, Addr XOR, GG_AUTO, XOR_OFFSET)
     // ------------------------------------------------------------------------
     EngineErrc searchEncoded(
         DataType type,
@@ -214,12 +215,35 @@ public:
         ProgressCallback progress = nullptr
     );
 
+    // ------------------------------------------------------------------------
+    // 6. Native Validated Pointer Search & Refinement (VmaIndex + ArchPtrPolicy)
+    // ------------------------------------------------------------------------
+    EngineErrc searchPointers(
+        DataType ptrType,
+        uintptr_t targetAddress,
+        size_t maxOffset,
+        uint32_t protMask = PointerProtMask::ALL,
+        bool aligned = true,
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
+    );
+
+    EngineErrc refinePointers(
+        DataType ptrType,
+        uintptr_t targetAddress,
+        size_t maxOffset,
+        uint32_t protMask = PointerProtMask::ALL,
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
+    );
+
 private:
     struct ChunkTask {
         uintptr_t startAddr   = 0;
         size_t    logicalLen  = 0; // Bytes belonging to this chunk [0, logicalLen)
         size_t    readLen     = 0; // logicalLen + overlapBytes (clamped to VMA end)
         uint32_t  regionFlag  = 0;
+        bool      fileBacked  = false;
     };
 
     std::vector<ChunkTask> buildChunkTasks(size_t overlapBytes) const;

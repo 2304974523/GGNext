@@ -52,6 +52,7 @@ import com.littlecodesauce.ggnext.ui.components.clickableLongPress
 import com.littlecodesauce.ggnext.ui.components.clickableWithTooltip
 import com.littlecodesauce.ggnext.ui.components.fsp
 import com.littlecodesauce.ggnext.ui.components.monoStyle
+import com.littlecodesauce.ggnext.ui.components.rememberPersistentLazyListState
 import com.littlecodesauce.ggnext.ui.components.tr
 import com.littlecodesauce.ggnext.ui.theme.Motion
 import com.littlecodesauce.ggnext.ui.theme.Rose
@@ -80,7 +81,7 @@ fun SavedListScreen(ui: Ui) {
         }
         return
     }
-    val listState = rememberLazyListState()
+    val listState = rememberPersistentLazyListState("saved_list")
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
             state = listState,
@@ -89,7 +90,7 @@ fun SavedListScreen(ui: Ui) {
         ) {
             itemsIndexed(
                 items = ui.saved,
-                key = { idx, i -> "${i.address}_${i.flags}_$idx" },
+                key = { _, i -> (i.address shl 8) xor (i.flags and 0xFF).toLong() },
                 contentType = { _, _ -> "saved_row" }
             ) { idx, item ->
                 SavedRow(item, ui.valueMaskSaved, idx)

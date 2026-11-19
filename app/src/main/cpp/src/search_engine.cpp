@@ -17,7 +17,6 @@ uint32_t GroupFieldItem::computeSelectivityScore() const noexcept {
     if (op == 2) return 2u;  // Inverse range (~~) has very low selectivity
     if (op == 1) return 20u; // Range (~) has moderate-low selectivity
 
-    // Base score by byte width (8B > 4B > 2B > 1B)
     uint32_t score = static_cast<uint32_t>(dataTypeSize(type)) * 100u;
 
     uint64_t rawBits = 0;
@@ -32,15 +31,13 @@ uint32_t GroupFieldItem::computeSelectivityScore() const noexcept {
         rawBits = static_cast<uint64_t>(iVal);
     }
 
-    // Penalize ultra-common values (0, 1, -1, 0xFFFFFFFF)
     if (rawBits == 0) {
-        return 5u; // Very low entropy (zero pages are ubiquitous)
+        return 5u;
     }
     if (rawBits == 1 || rawBits == 0xFFFFFFFFULL || rawBits == 0xFFFFFFFFFFFFFFFFULL) {
         score = score / 3u;
     }
 
-    // Reward bit population diversity (popcount entropy + distinct non-zero bytes)
     uint32_t pop = static_cast<uint32_t>(__builtin_popcountll(rawBits));
     score += pop * 8u;
 
@@ -83,6 +80,20 @@ void SearchEngine::clearSession() noexcept {
     m_lastTelemetry = ScanTelemetry{};
 }
 
+size_t SearchEngine::removeCandidates(const uint64_t* addresses, size_t count) {
+    if (!addresses || count == 0 || m_candidates.empty()) return 0;
+    size_t removed = m_candidates.removeAddresses(addresses, count);
+    if (removed > 0) {
+        size_t curTotal = m_totalMatchedCount.load(std::memory_order_relaxed);
+        if (curTotal >= removed) {
+            m_totalMatchedCount.store(std::max(m_candidates.size(), curTotal - removed), std::memory_order_relaxed);
+        } else {
+            m_totalMatchedCount.store(m_candidates.size(), std::memory_order_relaxed);
+        }
+    }
+    return removed;
+}
+
 void SearchEngine::fetchCandidates(size_t offset, size_t limit, std::vector<CandidateEntry>& out) const {
     out.clear();
     if (limit == 0) return;
@@ -98,12 +109,13 @@ void SearchEngine::fetchCandidates(size_t offset, size_t limit, std::vector<Cand
 
     if (m_hasFullSnapshot) {
         size_t elemSz = std::max<size_t>(1, dataTypeSize(m_snapshotType));
+        size_t stepSz = std::min<size_t>(elemSz, 4);
         size_t curIndex = 0;
         out.reserve(std::min<size_t>(limit, 4096));
         for (const auto& blk : m_snapshotStore.blocks()) {
             const uint8_t* ptr = m_snapshotStore.getBlockData(blk);
-            if (!ptr) continue;
-            size_t blkElems = blk.length / elemSz;
+            if (!ptr || blk.length < elemSz) continue;
+            size_t blkElems = ((blk.length - elemSz) / stepSz) + 1;
             if (curIndex + blkElems <= offset) {
                 curIndex += blkElems;
                 continue;
@@ -111,7 +123,7 @@ void SearchEngine::fetchCandidates(size_t offset, size_t limit, std::vector<Cand
             size_t startElem = (offset > curIndex) ? (offset - curIndex) : 0;
             uint8_t rTag = regionFlagToIndex(blk.regionFlag);
             for (size_t e = startElem; e < blkElems && out.size() < limit; ++e) {
-                size_t byteOff = e * elemSz;
+                size_t byteOff = e * stepSz;
                 CandidateEntry entry{};
                 entry.address = blk.startAddress + byteOff;
                 std::memcpy(&entry.rawValue, ptr + byteOff, std::min<size_t>(elemSz, 8));
@@ -134,12 +146,13 @@ std::vector<SearchEngine::ChunkTask> SearchEngine::buildChunkTasks(size_t overla
     std::vector<ChunkTask> tasks;
     for (const auto& vma : m_regions) {
         if (!vma.isScanSafe(m_regionMask)) continue;
+        const bool isFileBacked = vma.isFileBacked();
         uintptr_t cur = vma.startAddress;
         while (cur < vma.endAddress) {
             size_t rem = vma.endAddress - cur;
             size_t logical = (rem < m_chunkSize) ? rem : m_chunkSize;
             size_t readLen = (rem < (logical + overlapBytes)) ? rem : (logical + overlapBytes);
-            tasks.push_back(ChunkTask{cur, logical, readLen, vma.regionFlag});
+            tasks.push_back(ChunkTask{cur, logical, readLen, vma.regionFlag, isFileBacked});
             cur += logical;
         }
     }
@@ -219,35 +232,59 @@ bool evalSingleExact(const uint8_t* ptr, DataType dt, int64_t intTarget, double 
 }
 
 bool evalSingleRange(const uint8_t* ptr, DataType dt, int64_t iMin, int64_t iMax, double fMin, double fMax, bool inclusive) noexcept {
+    if (iMin > iMax) std::swap(iMin, iMax);
+    if (fMin > fMax) std::swap(fMin, fMax);
+
     switch (dt) {
         case DataType::INT8: {
+            if (iMin >= 0 && iMax > 127 && iMax <= 255) {
+                uint8_t u = 0;
+                std::memcpy(&u, ptr, 1);
+                return inclusive ? (u >= static_cast<uint8_t>(iMin) && u <= static_cast<uint8_t>(iMax))
+                                 : (u >  static_cast<uint8_t>(iMin) && u <  static_cast<uint8_t>(iMax));
+            }
             int8_t v = 0;
             std::memcpy(&v, ptr, 1);
-            return inclusive ? (v >= static_cast<int8_t>(iMin) && v <= static_cast<int8_t>(iMax))
-                             : (v >  static_cast<int8_t>(iMin) && v <  static_cast<int8_t>(iMax));
+            int8_t lo = static_cast<int8_t>(std::clamp<int64_t>(iMin, -128, 127));
+            int8_t hi = static_cast<int8_t>(std::clamp<int64_t>(iMax, -128, 127));
+            return inclusive ? (v >= lo && v <= hi) : (v > lo && v < hi);
         }
         case DataType::INT16: {
+            if (iMin >= 0 && iMax > 32767 && iMax <= 65535) {
+                uint16_t u = 0;
+                std::memcpy(&u, ptr, 2);
+                return inclusive ? (u >= static_cast<uint16_t>(iMin) && u <= static_cast<uint16_t>(iMax))
+                                 : (u >  static_cast<uint16_t>(iMin) && u <  static_cast<uint16_t>(iMax));
+            }
             int16_t v = 0;
             std::memcpy(&v, ptr, 2);
-            return inclusive ? (v >= static_cast<int16_t>(iMin) && v <= static_cast<int16_t>(iMax))
-                             : (v >  static_cast<int16_t>(iMin) && v <  static_cast<int16_t>(iMax));
+            int16_t lo = static_cast<int16_t>(std::clamp<int64_t>(iMin, -32768, 32767));
+            int16_t hi = static_cast<int16_t>(std::clamp<int64_t>(iMax, -32768, 32767));
+            return inclusive ? (v >= lo && v <= hi) : (v > lo && v < hi);
         }
         case DataType::INT32: {
+            if (iMin >= 0 && iMax > 2147483647LL && iMax <= 4294967295LL) {
+                uint32_t u = 0;
+                std::memcpy(&u, ptr, 4);
+                return inclusive ? (u >= static_cast<uint32_t>(iMin) && u <= static_cast<uint32_t>(iMax))
+                                 : (u >  static_cast<uint32_t>(iMin) && u <  static_cast<uint32_t>(iMax));
+            }
             int32_t v = 0;
             std::memcpy(&v, ptr, 4);
-            return inclusive ? (v >= static_cast<int32_t>(iMin) && v <= static_cast<int32_t>(iMax))
-                             : (v >  static_cast<int32_t>(iMin) && v <  static_cast<int32_t>(iMax));
+            int32_t lo = static_cast<int32_t>(std::clamp<int64_t>(iMin, -2147483648LL, 2147483647LL));
+            int32_t hi = static_cast<int32_t>(std::clamp<int64_t>(iMax, -2147483648LL, 2147483647LL));
+            return inclusive ? (v >= lo && v <= hi) : (v > lo && v < hi);
         }
         case DataType::INT64: {
             int64_t v = 0;
             std::memcpy(&v, ptr, 8);
             bool ok = inclusive ? (v >= iMin && v <= iMax)
                                 : (v >  iMin && v <  iMax);
-            if (!ok && iMin >= 0x10000LL && iMax <= 0x00FFFFFFFFFFFFFFLL && iMin <= iMax) {
+            if (!ok && iMin >= 0x10000LL && iMax <= static_cast<int64_t>(ArchPtrPolicy::ARM64_TBI_MASK) && iMin <= iMax) {
                 uint64_t uv = static_cast<uint64_t>(v);
                 uint8_t topByte = static_cast<uint8_t>(uv >> 56);
                 if (topByte != 0 && topByte != 0xFF) {
-                    int64_t untagged = static_cast<int64_t>(uv & 0x00FFFFFFFFFFFFFFULL);
+                    int64_t untagged = static_cast<int64_t>(uv & ArchPtrPolicy::ARM64_TBI_MASK);
                     ok = inclusive ? (untagged >= iMin && untagged <= iMax)
                                    : (untagged >  iMin && untagged <  iMax);
                 }
@@ -270,6 +307,64 @@ bool evalSingleRange(const uint8_t* ptr, DataType dt, int64_t iMin, int64_t iMax
         }
         default:
             return false;
+    }
+}
+
+// Builds a per-page scan eligibility mask:
+// 1. For non-zero queries (!queryCanMatchZero), an all-zero 4KB page mathematically cannot contain a match,
+//    so skipping all-zero pages is a 100% lossless optimization.
+// 2. For queries that CAN match zero (e.g. searching "0" or a range containing 0):
+//    - In static/global data & bss segments (CD | CB | PS), we NEVER skip a resident readable page even if all
+//      4096 bytes on that page are currently 0, guaranteeing zero-initialized globals/statics are never missed!
+//    - In heap/anonymous/allocator segments, if the kernel exposed the shared zero-page PFN (pagemapZeroPfnKnown),
+//      ProcIO::readChunkFaultTolerant has already excluded unpopulated and shared empty_zero_page PTEs, while
+//      for non-PFN environments we filter untouched 100%-zero pages so unallocated virtual reservations do not
+//      produce millions of phantom hits.
+void buildScanPageMask(
+    const uint8_t* buf,
+    size_t readLen,
+    size_t pageSize,
+    uint32_t regionFlag,
+    bool queryCanMatchZero,
+    bool pagemapZeroPfnKnown,
+    const std::vector<uint8_t>& validMask,
+    std::vector<uint8_t>& outScanMask
+) noexcept {
+    const size_t numPages = validMask.size();
+    const bool isStaticDataSegment = (regionFlag & (RegionFlag::CD | RegionFlag::CB | RegionFlag::PS)) != 0;
+
+    if (queryCanMatchZero && (isStaticDataSegment || pagemapZeroPfnKnown)) {
+        outScanMask = validMask;
+        return;
+    }
+
+    outScanMask.assign(numPages, 0);
+    for (size_t p = 0; p < numPages; ++p) {
+        if (validMask[p] == 0) continue;
+        size_t pOff = p * pageSize;
+        if (pOff >= readLen) continue;
+        size_t pLen = std::min(pageSize, readLen - pOff);
+        const uint8_t* pagePtr = buf + pOff;
+        const uint64_t* w64 = reinterpret_cast<const uint64_t*>(pagePtr);
+        size_t words = pLen / sizeof(uint64_t);
+        bool nonZero = false;
+        for (size_t w = 0; w < words; ++w) {
+            if (w64[w] != 0) {
+                nonZero = true;
+                break;
+            }
+        }
+        if (!nonZero) {
+            for (size_t b = words * sizeof(uint64_t); b < pLen; ++b) {
+                if (pagePtr[b] != 0) {
+                    nonZero = true;
+                    break;
+                }
+            }
+        }
+        if (nonZero) {
+            outScanMask[p] = 1;
+        }
     }
 }
 
@@ -319,11 +414,17 @@ EngineErrc SearchEngine::searchExact(
     workers.reserve(numThreads);
 
     const size_t pageSize = m_io.pageSize();
+    const bool pagemapZeroKnown = m_io.hasPagemapResidency() && (m_io.zeroPagePfn() != 0);
+    const uint8_t zeroBytes[8] = {0};
+    const bool queryCanMatchZero = (type == DataType::AUTO)
+        ? (intTarget == 0 || std::fabs(floatTarget) <= epsilon)
+        : evalSingleExact(zeroBytes, type, intTarget, floatTarget, epsilon);
 
     for (size_t tid = 0; tid < numThreads; ++tid) {
         workers.emplace_back([&]() {
             std::vector<uint8_t> buf;
             std::vector<uint8_t> validMask;
+            std::vector<uint8_t> scanMask;
             std::vector<size_t> offsets;
             std::vector<CandidateEntry> localHits;
             localHits.reserve(8192);
@@ -337,7 +438,7 @@ EngineErrc SearchEngine::searchExact(
                 if (buf.size() < task.readLen) buf.resize(task.readLen);
 
                 size_t chunkReadable = 0;
-                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable);
+                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable, !task.fileBacked);
                 syscalls.fetch_add(1, std::memory_order_relaxed);
 
                 size_t chunkGuards = 0;
@@ -348,60 +449,86 @@ EngineErrc SearchEngine::searchExact(
                 readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed);
 
                 if (rc == EngineErrc::OK && chunkReadable > 0) {
+                    buildScanPageMask(
+                        buf.data(), task.readLen, pageSize, task.regionFlag,
+                        queryCanMatchZero, pagemapZeroKnown, validMask, scanMask
+                    );
+                    const size_t numPages = scanMask.size();
                     uint8_t rTag = regionFlagToIndex(task.regionFlag);
                     size_t chunkMatchCount = 0;
 
                     auto runTypeScan = [&](DataType dt) {
-                        offsets.clear();
-                        size_t itemSz = dataTypeSize(dt);
-                        size_t step = aligned ? itemSz : 1;
-
-                        switch (dt) {
-                            case DataType::INT8:
-                                SimdKernel::scanExactI8(buf.data(), task.readLen, static_cast<int8_t>(intTarget), offsets);
-                                break;
-                            case DataType::INT16:
-                                SimdKernel::scanExactI16(buf.data(), task.readLen, static_cast<int16_t>(intTarget), step, offsets);
-                                break;
-                            case DataType::INT32:
-                                SimdKernel::scanExactI32(buf.data(), task.readLen, static_cast<int32_t>(intTarget), step, offsets);
-                                break;
-                            case DataType::INT64:
-                                SimdKernel::scanExactI64(buf.data(), task.readLen, intTarget, step, offsets);
-                                break;
-                            case DataType::FLOAT:
-                                SimdKernel::scanExactF32(buf.data(), task.readLen, static_cast<float>(floatTarget), static_cast<float>(epsilon), step, offsets);
-                                break;
-                            case DataType::DOUBLE:
-                                SimdKernel::scanExactF64(buf.data(), task.readLen, floatTarget, epsilon, step, offsets);
-                                break;
-                            default:
-                                break;
-                        }
-
+                        size_t itemSz = std::max<size_t>(1, dataTypeSize(dt));
+                        size_t step = aligned ? std::min<size_t>(itemSz, 4) : 1;
                         bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
 
-                        for (size_t off : offsets) {
-                            if (off >= task.logicalLen) continue;
-                            if (!isRangeInValidPages(off, itemSz, task.startAddr, pageSize, validMask)) continue;
+                        size_t p = 0;
+                        while (p < numPages) {
+                            if (scanMask[p] == 0) {
+                                p++;
+                                continue;
+                            }
+                            size_t runStartPage = p;
+                            while (p < numPages && scanMask[p] != 0) p++;
+                            size_t runByteStart = runStartPage * pageSize;
+                            if (runByteStart >= task.logicalLen) break;
 
-                            chunkMatchCount++;
+                            size_t runByteEnd = std::min(p * pageSize, task.readLen);
+                            size_t scanByteEnd = runByteEnd;
+                            if (itemSz > 1 && p < numPages && validMask[p] != 0) {
+                                scanByteEnd = std::min(task.readLen, runByteEnd + itemSz - 1);
+                            }
+                            if (scanByteEnd <= runByteStart) continue;
+                            size_t scanLen = scanByteEnd - runByteStart;
+                            const uint8_t* scanPtr = buf.data() + runByteStart;
 
-                            if (!storeAlreadyFull) {
-                                CandidateEntry entry{};
-                                entry.address   = task.startAddr + off;
-                                entry.rawValue  = extractRawValue(buf.data() + off, dt);
-                                entry.type      = static_cast<uint8_t>(dt);
-                                entry.regionTag = rTag;
-                                localHits.push_back(entry);
+                            offsets.clear();
+                            switch (dt) {
+                                case DataType::INT8:
+                                    SimdKernel::scanExactI8(scanPtr, scanLen, static_cast<int8_t>(intTarget), offsets);
+                                    break;
+                                case DataType::INT16:
+                                    SimdKernel::scanExactI16(scanPtr, scanLen, static_cast<int16_t>(intTarget), step, offsets);
+                                    break;
+                                case DataType::INT32:
+                                    SimdKernel::scanExactI32(scanPtr, scanLen, static_cast<int32_t>(intTarget), step, offsets);
+                                    break;
+                                case DataType::INT64:
+                                    SimdKernel::scanExactI64(scanPtr, scanLen, intTarget, step, offsets);
+                                    break;
+                                case DataType::FLOAT:
+                                    SimdKernel::scanExactF32(scanPtr, scanLen, static_cast<float>(floatTarget), static_cast<float>(epsilon), step, offsets);
+                                    break;
+                                case DataType::DOUBLE:
+                                    SimdKernel::scanExactF64(scanPtr, scanLen, floatTarget, epsilon, step, offsets);
+                                    break;
+                                default:
+                                    break;
+                            }
 
-                                if (localHits.size() >= 16384) {
-                                    std::lock_guard<std::mutex> lk(storeMutex);
-                                    m_candidates.appendBatch(localHits.data(), localHits.size());
-                                    storedCount.store(m_candidates.size(), std::memory_order_relaxed);
-                                    localHits.clear();
-                                    if (m_candidates.isFull()) {
-                                        storeAlreadyFull = true;
+                            for (size_t relOff : offsets) {
+                                size_t off = runByteStart + relOff;
+                                if (off >= runByteEnd || off >= task.logicalLen) continue;
+                                if (!isRangeInValidPages(off, itemSz, task.startAddr, pageSize, validMask)) continue;
+
+                                chunkMatchCount++;
+
+                                if (!storeAlreadyFull) {
+                                    CandidateEntry entry{};
+                                    entry.address   = task.startAddr + off;
+                                    entry.rawValue  = extractRawValue(buf.data() + off, dt);
+                                    entry.type      = static_cast<uint8_t>(dt);
+                                    entry.regionTag = rTag;
+                                    localHits.push_back(entry);
+
+                                    if (localHits.size() >= 16384) {
+                                        std::lock_guard<std::mutex> lk(storeMutex);
+                                        m_candidates.appendBatch(localHits.data(), localHits.size());
+                                        storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                        localHits.clear();
+                                        if (m_candidates.isFull()) {
+                                            storeAlreadyFull = true;
+                                        }
                                     }
                                 }
                             }
@@ -409,10 +536,22 @@ EngineErrc SearchEngine::searchExact(
                     };
 
                     if (type == DataType::AUTO) {
-                        runTypeScan(DataType::INT32);
-                        runTypeScan(DataType::INT64);
-                        runTypeScan(DataType::FLOAT);
-                        runTypeScan(DataType::DOUBLE);
+                        bool isFractional = std::fabs(floatTarget - static_cast<double>(intTarget)) > 1e-9;
+                        if (isFractional) {
+                            runTypeScan(DataType::FLOAT);
+                            runTypeScan(DataType::DOUBLE);
+                        } else {
+                            runTypeScan(DataType::INT32);
+                            runTypeScan(DataType::FLOAT);
+                            runTypeScan(DataType::DOUBLE);
+                            runTypeScan(DataType::INT64);
+                            if (intTarget != 0 && intTarget >= -32768 && intTarget <= 65535) {
+                                runTypeScan(DataType::INT16);
+                            }
+                            if (intTarget != 0 && intTarget >= -128 && intTarget <= 255) {
+                                runTypeScan(DataType::INT8);
+                            }
+                        }
                     } else {
                         runTypeScan(type);
                     }
@@ -472,8 +611,6 @@ EngineErrc SearchEngine::refineExact(
 ) {
     auto t0 = std::chrono::steady_clock::now();
 
-    // If refining directly after a Fuzzy Snapshot (or high-cardinality UNCHANGED snapshot)
-    // where candidates are still stored in m_snapshotStore, scan the snapshot blocks against live memory!
     if (m_hasFullSnapshot && m_candidates.empty()) {
         const auto& blocks = m_snapshotStore.blocks();
         if (blocks.empty()) {
@@ -524,7 +661,8 @@ EngineErrc SearchEngine::refineExact(
 
                     blockHits.clear();
                     uint8_t rTag = regionFlagToIndex(blk.regionFlag);
-                    for (size_t off = 0; off + elemSz <= blk.length; off += elemSz) {
+                    size_t stepSz = std::min<size_t>(elemSz, 4);
+                    for (size_t off = 0; off + elemSz <= blk.length; off += stepSz) {
                         const uint8_t* valPtr = curBuf.data() + off;
                         if (evalSingleExact(valPtr, snapDt, intTarget, floatTarget, epsilon)) {
                             CandidateEntry entry{};
@@ -598,7 +736,7 @@ EngineErrc SearchEngine::refineExact(
     while (idx < count) {
         uintptr_t addr = m_candidates[idx].address;
         DataType dt = (type == DataType::AUTO) ? static_cast<DataType>(m_candidates[idx].type) : type;
-        size_t itemSz = dataTypeSize(dt);
+        size_t itemSz = std::max<size_t>(1, dataTypeSize(dt));
 
         uintptr_t spanStart = addr;
         uintptr_t spanEnd   = addr + itemSz;
@@ -608,7 +746,7 @@ EngineErrc SearchEngine::refineExact(
         while (idx < count) {
             uintptr_t nextAddr = m_candidates[idx].address;
             DataType nextDt = (type == DataType::AUTO) ? static_cast<DataType>(m_candidates[idx].type) : type;
-            size_t nextSz = dataTypeSize(nextDt);
+            size_t nextSz = std::max<size_t>(1, dataTypeSize(nextDt));
             uintptr_t nextEnd = nextAddr + nextSz;
 
             if (nextAddr <= spanEnd + 256 && (nextEnd - spanStart) <= pageSize) {
@@ -626,6 +764,7 @@ EngineErrc SearchEngine::refineExact(
 
     MmapCandidateStore nextStore(MmapCandidateStore::DEFAULT_MEMORY_THRESHOLD, m_spillDir);
     size_t syscallsIssued = 0;
+    const bool isFractional = std::fabs(floatTarget - static_cast<double>(intTarget)) > 1e-9;
 
     constexpr size_t BATCH_GROUP_LIMIT = 4096;
     for (size_t gBase = 0; gBase < groups.size(); gBase += BATCH_GROUP_LIMIT) {
@@ -657,11 +796,15 @@ EngineErrc SearchEngine::refineExact(
             for (size_t cIdx = grp.firstCandIdx; cIdx < grp.lastCandIdx; ++cIdx) {
                 CandidateEntry cand = m_candidates[cIdx];
                 DataType dt = (type == DataType::AUTO) ? static_cast<DataType>(cand.type) : type;
+                if (type == DataType::AUTO && isFractional && dt != DataType::FLOAT && dt != DataType::DOUBLE) {
+                    continue;
+                }
                 size_t relOff = cand.address - grp.startPageAddr;
                 const uint8_t* valPtr = br.localBuf + relOff;
 
                 if (evalSingleExact(valPtr, dt, intTarget, floatTarget, epsilon)) {
                     cand.rawValue = extractRawValue(valPtr, dt);
+                    cand.type     = static_cast<uint8_t>(dt);
                     nextStore.append(cand);
                 }
             }
@@ -745,7 +888,7 @@ EngineErrc SearchEngine::searchBytePattern(
                 if (buf.size() < task.readLen) buf.resize(task.readLen);
 
                 size_t chunkReadable = 0;
-                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable);
+                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable, !task.fileBacked);
                 syscalls.fetch_add(1, std::memory_order_relaxed);
                 readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed);
 
@@ -824,7 +967,6 @@ EngineErrc SearchEngine::searchString(
     if (!utf16le) {
         pattern.assign(utf8Str.begin(), utf8Str.end());
     } else {
-        // Convert ASCII/UTF-8 codepoints into UTF-16LE bytes
         pattern.reserve(utf8Str.size() * 2);
         for (unsigned char c : utf8Str) {
             pattern.push_back(c);
@@ -858,9 +1000,8 @@ EngineErrc SearchEngine::searchRange(
 
     refreshRegions();
 
-    DataType effectiveType = (type == DataType::AUTO) ? DataType::INT32 : type;
-    size_t itemSz = std::max<size_t>(1, dataTypeSize(effectiveType));
-    size_t overlap = (itemSz > 1) ? (itemSz - 1) : 0;
+    size_t maxItemSz = (type == DataType::AUTO) ? 8 : std::max<size_t>(1, dataTypeSize(type));
+    size_t overlap = (maxItemSz > 1) ? (maxItemSz - 1) : 0;
     auto tasks = buildChunkTasks(overlap);
     if (tasks.empty()) return EngineErrc::OK;
 
@@ -878,12 +1019,22 @@ EngineErrc SearchEngine::searchRange(
     size_t numThreads = std::min(m_workerThreads, tasks.size());
     std::vector<std::thread> workers;
     const size_t pageSize = m_io.pageSize();
-    const size_t step = aligned ? itemSz : 1;
+    const bool pagemapZeroKnown = m_io.hasPagemapResidency() && (m_io.zeroPagePfn() != 0);
+    const uint8_t zeroBytes[8] = {0};
+    const int64_t loI = std::min(intMin, intMax);
+    const int64_t hiI = std::max(intMin, intMax);
+    const double  loF = std::min(floatMin, floatMax);
+    const double  hiF = std::max(floatMin, floatMax);
+    const bool queryCanMatchZero = (type == DataType::AUTO)
+        ? ((inclusive ? (loI <= 0 && hiI >= 0) : (loI < 0 && hiI > 0)) ||
+           (inclusive ? (loF <= 0.0 && hiF >= 0.0) : (loF < 0.0 && hiF > 0.0)))
+        : evalSingleRange(zeroBytes, type, intMin, intMax, floatMin, floatMax, inclusive);
 
     for (size_t tid = 0; tid < numThreads; ++tid) {
         workers.emplace_back([&]() {
             std::vector<uint8_t> buf;
             std::vector<uint8_t> validMask;
+            std::vector<uint8_t> scanMask;
             std::vector<size_t> offsets;
             std::vector<CandidateEntry> localHits;
             localHits.reserve(8192);
@@ -897,60 +1048,102 @@ EngineErrc SearchEngine::searchRange(
                 if (buf.size() < task.readLen) buf.resize(task.readLen);
 
                 size_t chunkReadable = 0;
-                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable);
+                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable, !task.fileBacked);
                 syscalls.fetch_add(1, std::memory_order_relaxed);
                 readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed);
 
                 if (rc == EngineErrc::OK && chunkReadable > 0) {
-                    offsets.clear();
-                    switch (effectiveType) {
-                        case DataType::INT8:
-                            SimdKernel::scanRange<int8_t>(buf.data(), task.readLen, static_cast<int8_t>(intMin), static_cast<int8_t>(intMax), inclusive, 1, offsets);
-                            break;
-                        case DataType::INT16:
-                            SimdKernel::scanRange<int16_t>(buf.data(), task.readLen, static_cast<int16_t>(intMin), static_cast<int16_t>(intMax), inclusive, step, offsets);
-                            break;
-                        case DataType::INT32:
-                            SimdKernel::scanRange<int32_t>(buf.data(), task.readLen, static_cast<int32_t>(intMin), static_cast<int32_t>(intMax), inclusive, step, offsets);
-                            break;
-                        case DataType::INT64:
-                            SimdKernel::scanRange<int64_t>(buf.data(), task.readLen, intMin, intMax, inclusive, step, offsets);
-                            break;
-                        case DataType::FLOAT:
-                            SimdKernel::scanRangeF32(buf.data(), task.readLen, static_cast<float>(floatMin), static_cast<float>(floatMax), inclusive, step, offsets);
-                            break;
-                        case DataType::DOUBLE:
-                            SimdKernel::scanRange<double>(buf.data(), task.readLen, floatMin, floatMax, inclusive, step, offsets);
-                            break;
-                        default:
-                            break;
-                    }
-
+                    buildScanPageMask(
+                        buf.data(), task.readLen, pageSize, task.regionFlag,
+                        queryCanMatchZero, pagemapZeroKnown, validMask, scanMask
+                    );
+                    const size_t numPages = scanMask.size();
                     uint8_t rTag = regionFlagToIndex(task.regionFlag);
-                    bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
                     size_t chunkMatches = 0;
 
-                    for (size_t off : offsets) {
-                        if (off >= task.logicalLen) continue;
-                        if (!isRangeInValidPages(off, itemSz, task.startAddr, pageSize, validMask)) continue;
+                    auto runRangeType = [&](DataType dt) {
+                        size_t itemSz = std::max<size_t>(1, dataTypeSize(dt));
+                        size_t step = aligned ? std::min<size_t>(itemSz, 4) : 1;
+                        bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
 
-                        chunkMatches++;
-                        if (!storeAlreadyFull) {
-                            CandidateEntry entry{};
-                            entry.address   = task.startAddr + off;
-                            entry.rawValue  = extractRawValue(buf.data() + off, effectiveType);
-                            entry.type      = static_cast<uint8_t>(effectiveType);
-                            entry.regionTag = rTag;
-                            localHits.push_back(entry);
+                        size_t p = 0;
+                        while (p < numPages) {
+                            if (scanMask[p] == 0) {
+                                p++;
+                                continue;
+                            }
+                            size_t runStartPage = p;
+                            while (p < numPages && scanMask[p] != 0) p++;
+                            size_t runByteStart = runStartPage * pageSize;
+                            if (runByteStart >= task.logicalLen) break;
 
-                            if (localHits.size() >= 16384) {
-                                std::lock_guard<std::mutex> lk(storeMutex);
-                                m_candidates.appendBatch(localHits.data(), localHits.size());
-                                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
-                                localHits.clear();
-                                if (m_candidates.isFull()) storeAlreadyFull = true;
+                            size_t runByteEnd = std::min(p * pageSize, task.readLen);
+                            size_t scanByteEnd = runByteEnd;
+                            if (itemSz > 1 && p < numPages && validMask[p] != 0) {
+                                scanByteEnd = std::min(task.readLen, runByteEnd + itemSz - 1);
+                            }
+                            if (scanByteEnd <= runByteStart) continue;
+                            size_t scanLen = scanByteEnd - runByteStart;
+                            const uint8_t* scanPtr = buf.data() + runByteStart;
+
+                            offsets.clear();
+                            switch (dt) {
+                                case DataType::INT8:
+                                case DataType::INT16:
+                                case DataType::INT32:
+                                case DataType::INT64:
+                                    SimdKernel::scanRangeInteger(scanPtr, scanLen, dt, intMin, intMax, inclusive, step, offsets);
+                                    break;
+                                case DataType::FLOAT:
+                                    SimdKernel::scanRangeF32(scanPtr, scanLen, static_cast<float>(loF), static_cast<float>(hiF), inclusive, step, offsets);
+                                    break;
+                                case DataType::DOUBLE:
+                                    SimdKernel::scanRange<double>(scanPtr, scanLen, loF, hiF, inclusive, step, offsets);
+                                    break;
+                                default:
+                                    break;
+                            }
+
+                            for (size_t relOff : offsets) {
+                                size_t off = runByteStart + relOff;
+                                if (off >= runByteEnd || off >= task.logicalLen) continue;
+                                if (!isRangeInValidPages(off, itemSz, task.startAddr, pageSize, validMask)) continue;
+
+                                chunkMatches++;
+                                if (!storeAlreadyFull) {
+                                    CandidateEntry entry{};
+                                    entry.address   = task.startAddr + off;
+                                    entry.rawValue  = extractRawValue(buf.data() + off, dt);
+                                    entry.type      = static_cast<uint8_t>(dt);
+                                    entry.regionTag = rTag;
+                                    localHits.push_back(entry);
+
+                                    if (localHits.size() >= 16384) {
+                                        std::lock_guard<std::mutex> lk(storeMutex);
+                                        m_candidates.appendBatch(localHits.data(), localHits.size());
+                                        storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                        localHits.clear();
+                                        if (m_candidates.isFull()) storeAlreadyFull = true;
+                                    }
+                                }
                             }
                         }
+                    };
+
+                    if (type == DataType::AUTO) {
+                        bool isFractional = (std::fabs(floatMin - static_cast<double>(intMin)) > 1e-9) ||
+                                            (std::fabs(floatMax - static_cast<double>(intMax)) > 1e-9);
+                        if (isFractional) {
+                            runRangeType(DataType::FLOAT);
+                            runRangeType(DataType::DOUBLE);
+                        } else {
+                            runRangeType(DataType::INT32);
+                            runRangeType(DataType::FLOAT);
+                            runRangeType(DataType::DOUBLE);
+                            runRangeType(DataType::INT64);
+                        }
+                    } else {
+                        runRangeType(type);
                     }
 
                     if (chunkMatches > 0) {
@@ -1010,6 +1203,7 @@ EngineErrc SearchEngine::refineRange(
 
         const DataType snapDt = (type == DataType::AUTO) ? m_snapshotType : type;
         const size_t elemSz = std::max<size_t>(1, dataTypeSize(snapDt));
+        const size_t stepSz = std::min<size_t>(elemSz, 4);
         const size_t totalSnapBytes = std::max<size_t>(1, m_snapshotStore.totalSnapshotBytes());
 
         std::atomic<size_t> nextBlock{0};
@@ -1048,7 +1242,7 @@ EngineErrc SearchEngine::refineRange(
 
                     blockHits.clear();
                     uint8_t rTag = regionFlagToIndex(blk.regionFlag);
-                    for (size_t off = 0; off + elemSz <= blk.length; off += elemSz) {
+                    for (size_t off = 0; off + elemSz <= blk.length; off += stepSz) {
                         const uint8_t* valPtr = curBuf.data() + off;
                         if (evalSingleRange(valPtr, snapDt, intMin, intMax, floatMin, floatMax, inclusive)) {
                             CandidateEntry entry{};
@@ -1193,7 +1387,7 @@ EngineErrc SearchEngine::refineRange(
 }
 
 // ============================================================================
-// 3. Fuzzy / Delta Search: Anonymous Demand-Paged Full Snapshot + Refinement
+// 3. Fuzzy / Delta Search: Full Snapshot + Refinement
 // ============================================================================
 EngineErrc SearchEngine::startUnknownSnapshot(
     DataType type,
@@ -1222,6 +1416,7 @@ EngineErrc SearchEngine::startUnknownSnapshot(
     }
 
     const size_t elemSz = std::max<size_t>(1, dataTypeSize(m_snapshotType));
+    const size_t stepSz = std::min<size_t>(elemSz, 4);
     std::atomic<size_t> nextIdx{0};
     std::atomic<size_t> processedBytes{0};
     std::atomic<size_t> readableBytes{0};
@@ -1229,6 +1424,7 @@ EngineErrc SearchEngine::startUnknownSnapshot(
     std::atomic<size_t> syscalls{0};
     std::mutex          snapMutex;
     const size_t        pageSize = m_io.pageSize();
+    const bool          pagemapZeroKnown = m_io.hasPagemapResidency() && (m_io.zeroPagePfn() != 0);
 
     size_t numThreads = std::min(m_workerThreads, tasks.size());
     std::vector<std::thread> workers;
@@ -1237,6 +1433,7 @@ EngineErrc SearchEngine::startUnknownSnapshot(
         workers.emplace_back([&]() {
             std::vector<uint8_t> buf(m_chunkSize);
             std::vector<uint8_t> validMask;
+            std::vector<uint8_t> scanMask;
 
             while (true) {
                 if (token && token->isCancelled()) break;
@@ -1247,46 +1444,29 @@ EngineErrc SearchEngine::startUnknownSnapshot(
                 if (buf.size() < task.logicalLen) buf.resize(task.logicalLen);
 
                 size_t chunkReadable = 0;
-                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.logicalLen, validMask, &chunkReadable);
+                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.logicalLen, validMask, &chunkReadable, !task.fileBacked);
                 syscalls.fetch_add(1, std::memory_order_relaxed);
 
                 if (rc == EngineErrc::OK && chunkReadable > 0) {
-                    size_t numPages = validMask.size();
-                    // Filter out untouched demand-zero pages (4KB pages of 100% zeros that were faulted to ZERO_PAGE)
-                    for (size_t p = 0; p < numPages; ++p) {
-                        if (validMask[p] == 0) continue;
-                        size_t pOff = p * pageSize;
-                        if (pOff >= task.logicalLen) {
-                            validMask[p] = 0;
-                            continue;
-                        }
-                        size_t pLen = std::min(pageSize, task.logicalLen - pOff);
-                        if (pLen >= pageSize) {
-                            const uint64_t* w64 = reinterpret_cast<const uint64_t*>(buf.data() + pOff);
-                            size_t words = pLen / sizeof(uint64_t);
-                            uint64_t acc = 0;
-                            for (size_t w = 0; w < words; ++w) {
-                                acc |= w64[w];
-                                if (acc != 0) break;
-                            }
-                            if (acc == 0) {
-                                validMask[p] = 0;
-                                if (chunkReadable >= pLen) chunkReadable -= pLen;
-                            }
-                        }
-                    }
+                    buildScanPageMask(
+                        buf.data(), task.logicalLen, pageSize, task.regionFlag,
+                        true, pagemapZeroKnown, validMask, scanMask
+                    );
+                    size_t numPages = scanMask.size();
+                    size_t keptReadable = 0;
 
                     size_t p = 0;
                     while (p < numPages) {
-                        if (validMask[p] == 0) {
+                        if (scanMask[p] == 0) {
                             p++;
                             continue;
                         }
                         size_t runStart = p;
-                        while (p < numPages && validMask[p] != 0) p++;
+                        while (p < numPages && scanMask[p] != 0) p++;
                         size_t runByteOffset = runStart * pageSize;
                         size_t runByteLen    = std::min((p - runStart) * pageSize, task.logicalLen - runByteOffset);
                         if (runByteLen > 0) {
+                            keptReadable += runByteLen;
                             std::lock_guard<std::mutex> lk(snapMutex);
                             m_snapshotStore.appendRegionChunk(
                                 task.startAddr + runByteOffset,
@@ -1296,10 +1476,11 @@ EngineErrc SearchEngine::startUnknownSnapshot(
                             );
                         }
                     }
+                    chunkReadable = keptReadable;
                 }
 
                 size_t totalReadSoFar = readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed) + chunkReadable;
-                m_totalMatchedCount = totalReadSoFar / elemSz;
+                m_totalMatchedCount = totalReadSoFar / stepSz;
 
                 size_t chunkGuards = 0;
                 for (uint8_t v : validMask) {
@@ -1317,7 +1498,7 @@ EngineErrc SearchEngine::startUnknownSnapshot(
     if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
 
     m_hasFullSnapshot   = !m_snapshotStore.blocks().empty();
-    m_totalMatchedCount = m_snapshotStore.totalSnapshotBytes() / elemSz;
+    m_totalMatchedCount = m_snapshotStore.totalSnapshotBytes() / stepSz;
 
     auto t1 = std::chrono::steady_clock::now();
     m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1342,7 +1523,6 @@ EngineErrc SearchEngine::refineFuzzy(
 ) {
     auto t0 = std::chrono::steady_clock::now();
 
-    // Case 1: Refinement pass directly against the full MmapRegionSnapshotStore
     if (m_hasFullSnapshot && m_candidates.empty()) {
         const auto& blocks = m_snapshotStore.blocks();
         if (blocks.empty()) {
@@ -1350,6 +1530,8 @@ EngineErrc SearchEngine::refineFuzzy(
             return EngineErrc::OK;
         }
 
+        const size_t elemSz = std::max<size_t>(1, dataTypeSize(m_snapshotType));
+        const size_t stepSz = std::min<size_t>(elemSz, 4);
         const size_t totalSnapBytes = std::max<size_t>(1, m_snapshotStore.totalSnapshotBytes());
         std::atomic<size_t> nextBlock{0};
         std::atomic<size_t> syscalls{0};
@@ -1392,28 +1574,27 @@ EngineErrc SearchEngine::refineFuzzy(
                     uint8_t rTag = regionFlagToIndex(blk.regionFlag);
                     switch (m_snapshotType) {
                         case DataType::INT8:
-                            SimdKernel::compareBuffersDelta<int8_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int8_t>(intDelta), rTag, blockHits);
+                            SimdKernel::compareBuffersDelta<int8_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int8_t>(intDelta), rTag, blockHits, 1);
                             break;
                         case DataType::INT16:
-                            SimdKernel::compareBuffersDelta<int16_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int16_t>(intDelta), rTag, blockHits);
+                            SimdKernel::compareBuffersDelta<int16_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int16_t>(intDelta), rTag, blockHits, 2);
                             break;
                         case DataType::INT32:
-                            SimdKernel::compareBuffersDelta<int32_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int32_t>(intDelta), rTag, blockHits);
+                            SimdKernel::compareBuffersDelta<int32_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<int32_t>(intDelta), rTag, blockHits, 4);
                             break;
                         case DataType::INT64:
-                            SimdKernel::compareBuffersDelta<int64_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, intDelta, rTag, blockHits);
+                            SimdKernel::compareBuffersDelta<int64_t>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, intDelta, rTag, blockHits, stepSz);
                             break;
                         case DataType::FLOAT:
-                            SimdKernel::compareBuffersDelta<float>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<float>(floatDelta), rTag, blockHits);
+                            SimdKernel::compareBuffersDelta<float>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, static_cast<float>(floatDelta), rTag, blockHits, 4);
                             break;
                         case DataType::DOUBLE:
-                            SimdKernel::compareBuffersDelta<double>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, floatDelta, rTag, blockHits);
+                            SimdKernel::compareBuffersDelta<double>(blk.startAddress, curBuf.data(), oldPtr, blk.length, deltaOp, floatDelta, rTag, blockHits, stepSz);
                             break;
                         default:
                             break;
                     }
 
-                    // Update snapshot block in-place with current live bytes so repeated UNCHANGED passes stay fresh
                     std::memcpy(oldPtr, curBuf.data(), blk.length);
 
                     if (!blockHits.empty()) {
@@ -1437,12 +1618,10 @@ EngineErrc SearchEngine::refineFuzzy(
 
         size_t matched = totalMatches.load();
         if (deltaOp == SearchOp::UNCHANGED && matched > MmapCandidateStore::MAX_STORED_CANDIDATES) {
-            // Keep full updated snapshot active when UNCHANGED still spans >2M values so subsequent CHANGED/INCREASED/DECREASED scans full memory
             m_candidates.clear();
             m_hasFullSnapshot = true;
             m_totalMatchedCount = matched;
         } else {
-            // Narrowed into candidate store: release snapshot memory and sort candidates
             m_snapshotStore.clear();
             m_hasFullSnapshot = false;
             m_candidates.sortByAddress();
@@ -1459,7 +1638,6 @@ EngineErrc SearchEngine::refineFuzzy(
         return EngineErrc::OK;
     }
 
-    // Case 2: Subsequent iterative fuzzy refinement on existing m_candidates via tight-coalesced iovec
     if (m_candidates.empty()) {
         m_totalMatchedCount = 0;
         return EngineErrc::OK;
@@ -1481,14 +1659,16 @@ EngineErrc SearchEngine::refineFuzzy(
     while (idx < count) {
         uintptr_t addr = m_candidates[idx].address;
         DataType dt = static_cast<DataType>(m_candidates[idx].type);
-        size_t itemSz = dataTypeSize(dt);
+        size_t itemSz = std::max<size_t>(1, dataTypeSize(dt));
         uintptr_t spanStart = addr;
         uintptr_t spanEnd   = addr + itemSz;
         size_t firstIdx = idx++;
 
         while (idx < count) {
             uintptr_t nextAddr = m_candidates[idx].address;
-            uintptr_t nextEnd  = nextAddr + itemSz;
+            DataType nextDt = static_cast<DataType>(m_candidates[idx].type);
+            size_t nextSz = std::max<size_t>(1, dataTypeSize(nextDt));
+            uintptr_t nextEnd  = nextAddr + nextSz;
             if (nextAddr <= spanEnd + 256 && (nextEnd - spanStart) <= pageSize) {
                 if (nextEnd > spanEnd) spanEnd = nextEnd;
                 idx++;
@@ -1635,7 +1815,7 @@ EngineErrc SearchEngine::refineFuzzy(
 }
 
 // ============================================================================
-// 4. Encoded & 6. XOR Search (Offset, Static XOR, XOR Pair 32/64, Address XOR, GG_AUTO, XOR_OFFSET)
+// 4. Encoded & XOR Search (Offset, Static XOR, XOR Pair 32/64, Address XOR, GG_AUTO, XOR_OFFSET)
 // ============================================================================
 namespace {
 
@@ -1675,7 +1855,7 @@ int64_t signExtendRaw(uint64_t raw, DataType dt) noexcept {
 }
 
 bool evalGroupField(const uint8_t* ptr, const GroupFieldItem& fld) noexcept {
-    if (fld.op == 3) return true; // Wildcard (0~~0)
+    if (fld.op == 3) return true;
     if (fld.op == 1) {
         return evalSingleRange(ptr, fld.type, fld.iVal, fld.iMax, fld.fVal, fld.fMax, true);
     }
@@ -1699,7 +1879,6 @@ EngineErrc SearchEngine::searchEncoded(
 ) {
     DataType effectiveType = (type == DataType::AUTO) ? DataType::INT32 : type;
 
-    // Stateful GG Encrypted Search (Initial Snapshot for V1)
     if (mode == EncodedMode::GG_AUTO) {
         EngineErrc rc = startUnknownSnapshot(effectiveType, token, progress);
         if (rc == EngineErrc::OK) {
@@ -1741,7 +1920,7 @@ EngineErrc SearchEngine::searchEncoded(
     size_t spanBytes = (mode == EncodedMode::XOR_PAIR_64) ? 16
                      : (mode == EncodedMode::XOR_PAIR_32) ? 8
                      : (mode == EncodedMode::XOR_OFFSET)  ? (elemSz + absOffset) : 4;
-    size_t step = aligned ? elemSz : 1;
+    size_t step = aligned ? std::min<size_t>(elemSz, 4) : 1;
     size_t overlap = spanBytes > 1 ? (spanBytes - 1) : 0;
 
     auto tasks = buildChunkTasks(overlap);
@@ -1781,7 +1960,7 @@ EngineErrc SearchEngine::searchEncoded(
                 if (buf.size() < task.readLen) buf.resize(task.readLen);
 
                 size_t chunkReadable = 0;
-                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable);
+                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable, !task.fileBacked);
                 syscalls.fetch_add(1, std::memory_order_relaxed);
                 readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed);
 
@@ -1909,6 +2088,7 @@ EngineErrc SearchEngine::refineEncoded(
         const int64_t  iCur  = logicalInt;
         const DataType dt    = m_hasFullSnapshot ? m_snapshotType : effectiveType;
         const size_t elemSz  = std::max<size_t>(1, dataTypeSize(dt));
+        const size_t stepSz  = std::min<size_t>(elemSz, 4);
         const bool isFloatType = (dt == DataType::FLOAT || dt == DataType::DOUBLE);
 
         // Pass 1: Refine directly against full resident snapshot (V1 -> V2)
@@ -1960,7 +2140,7 @@ EngineErrc SearchEngine::refineEncoded(
                         blockHits.clear();
                         uint8_t rTag = regionFlagToIndex(blk.regionFlag);
 
-                        for (size_t off = 0; off + elemSz <= blk.length; off += elemSz) {
+                        for (size_t off = 0; off + elemSz <= blk.length; off += stepSz) {
                             uint64_t e1 = extractRawValue(oldPtr + off, dt);
                             uint64_t e2 = extractRawValue(curBuf.data() + off, dt);
                             if (e1 == 0 && e2 == 0) continue;
@@ -1978,7 +2158,7 @@ EngineErrc SearchEngine::refineEncoded(
                                 }
                             }
 
-                            // 2. Dynamic Neighbor XOR Key Invariant (e.g. ObscuredInt / struct [key, val] at ±4, ±8)
+                            // 2. Dynamic Neighbor XOR Key Invariant (ObscuredInt / struct [key, val] at ±4, ±8)
                             if (elemSz == 4 || elemSz == 8) {
                                 const int deltas[4] = {-8, -4, 4, 8};
                                 for (int d : deltas) {
@@ -2019,7 +2199,6 @@ EngineErrc SearchEngine::refineEncoded(
                             }
                         }
 
-                        // Update snapshot block in-place
                         std::memcpy(oldPtr, curBuf.data(), blk.length);
 
                         if (!blockHits.empty()) {
@@ -2066,72 +2245,93 @@ EngineErrc SearchEngine::refineEncoded(
             return EngineErrc::OK;
         }
 
-        // Pass 2+: Refine existing m_candidates (V2 -> V3 -> ...)
+        // Pass 2+: Coalesced batched refinement on existing m_candidates (V2 -> V3 -> ...)
         if (m_candidates.empty()) {
             m_totalMatchedCount = 0;
             return EngineErrc::OK;
         }
 
+        m_candidates.sortByAddress();
+        const size_t count = m_candidates.size();
         MmapCandidateStore nextStore(MmapCandidateStore::DEFAULT_MEMORY_THRESHOLD, m_spillDir);
         size_t syscalls = 0;
-        uint8_t winBuf[24];
 
-        for (size_t i = 0; i < m_candidates.size(); ++i) {
+        constexpr size_t BATCH_LIMIT = 2048;
+        for (size_t base = 0; base < count; base += BATCH_LIMIT) {
             if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
-            CandidateEntry cand = m_candidates[i];
-            DataType cDt = static_cast<DataType>(cand.type);
-            size_t cSz = std::max<size_t>(1, dataTypeSize(cDt));
+            size_t end = std::min(count, base + BATCH_LIMIT);
+            size_t batchCount = end - base;
 
-            uint64_t e1 = cand.rawValue;
-            uint64_t e2 = 0;
-            bool hasWin = false;
-            if (cand.address >= 8 && m_io.readMemory(cand.address - 8, winBuf, 24) == EngineErrc::OK) {
-                hasWin = true;
-                e2 = extractRawValue(winBuf + 8, cDt);
-            } else if (m_io.readMemory(cand.address, winBuf + 8, cSz) == EngineErrc::OK) {
-                e2 = extractRawValue(winBuf + 8, cDt);
-            } else {
-                continue;
+            std::vector<uint8_t> slab(batchCount * 24, 0);
+            std::vector<BatchReadRange> ranges(batchCount);
+            for (size_t k = 0; k < batchCount; ++k) {
+                uintptr_t cAddr = m_candidates[base + k].address;
+                ranges[k].remoteAddr = (cAddr >= 8) ? (cAddr - 8) : cAddr;
+                ranges[k].length     = (cAddr >= 8) ? 24 : 8;
+                ranges[k].localBuf   = slab.data() + (k * 24);
             }
-            syscalls++;
+            m_io.readBatchScattered(ranges);
+            syscalls += (batchCount + m_io.iovMax() - 1) / m_io.iovMax();
 
-            uint32_t prevFlags = (cand.flags == 0) ? 0x0Fu : cand.flags;
-            uint32_t nextFlags = 0;
+            for (size_t k = 0; k < batchCount; ++k) {
+                CandidateEntry cand = m_candidates[base + k];
+                DataType cDt = static_cast<DataType>(cand.type);
+                size_t cSz = std::max<size_t>(1, dataTypeSize(cDt));
 
-            if (prevFlags & 1u) {
-                if (uCur != uPrev) {
-                    if (e1 != e2 && ((e1 ^ uPrev) == (e2 ^ uCur))) nextFlags |= 1u;
+                const uint8_t* winBuf = slab.data() + (k * 24);
+                bool hasWin = (cand.address >= 8) && ranges[k].success;
+                uint64_t e1 = cand.rawValue;
+                uint64_t e2 = 0;
+
+                if (hasWin) {
+                    e2 = extractRawValue(winBuf + 8, cDt);
+                } else if (ranges[k].success && cand.address < 8) {
+                    e2 = extractRawValue(winBuf, cDt);
                 } else {
-                    if (e1 == e2) nextFlags |= 1u;
+                    uint8_t fallback[8] = {0};
+                    if (m_io.readMemory(cand.address, fallback, cSz) != EngineErrc::OK) continue;
+                    e2 = extractRawValue(fallback, cDt);
                 }
-            }
-            if ((prevFlags & 2u) && hasWin && (cSz == 4 || cSz == 8)) {
-                const int offsetsInWin[4] = {0, 4, 12, 16}; // -8, -4, +4, +8 relative to winBuf+8
-                for (int wOff : offsetsInWin) {
-                    if (cSz == 8 && (wOff == 4 || wOff == 12)) continue;
-                    uint64_t n2 = extractRawValue(winBuf + wOff, cDt);
-                    if (n2 != 0 && ((e2 ^ n2) == uCur)) {
-                        nextFlags |= 2u;
-                        break;
+
+                uint32_t prevFlags = (cand.flags == 0) ? 0x0Fu : cand.flags;
+                uint32_t nextFlags = 0;
+
+                if (prevFlags & 1u) {
+                    if (uCur != uPrev) {
+                        if (e1 != e2 && ((e1 ^ uPrev) == (e2 ^ uCur))) nextFlags |= 1u;
+                    } else {
+                        if (e1 == e2) nextFlags |= 1u;
                     }
                 }
-            }
-            if ((prevFlags & 4u) && !isFloatType) {
-                int64_t s1 = signExtendRaw(e1, cDt);
-                int64_t s2 = signExtendRaw(e2, cDt);
-                if ((s2 - s1) == (iCur - iPrev)) nextFlags |= 4u;
-            }
-            if ((prevFlags & 8u) && !isFloatType) {
-                int64_t s1 = signExtendRaw(e1, cDt);
-                int64_t s2 = signExtendRaw(e2, cDt);
-                if ((s1 - s2) == (iCur - iPrev)) nextFlags |= 8u;
-            }
+                if ((prevFlags & 2u) && hasWin && (cSz == 4 || cSz == 8)) {
+                    const int offsetsInWin[4] = {0, 4, 12, 16};
+                    for (int wOff : offsetsInWin) {
+                        if (cSz == 8 && (wOff == 4 || wOff == 12)) continue;
+                        uint64_t n2 = extractRawValue(winBuf + wOff, cDt);
+                        if (n2 != 0 && ((e2 ^ n2) == uCur)) {
+                            nextFlags |= 2u;
+                            break;
+                        }
+                    }
+                }
+                if ((prevFlags & 4u) && !isFloatType) {
+                    int64_t s1 = signExtendRaw(e1, cDt);
+                    int64_t s2 = signExtendRaw(e2, cDt);
+                    if ((s2 - s1) == (iCur - iPrev)) nextFlags |= 4u;
+                }
+                if ((prevFlags & 8u) && !isFloatType) {
+                    int64_t s1 = signExtendRaw(e1, cDt);
+                    int64_t s2 = signExtendRaw(e2, cDt);
+                    if ((s1 - s2) == (iCur - iPrev)) nextFlags |= 8u;
+                }
 
-            if (nextFlags != 0) {
-                cand.rawValue = e2;
-                cand.flags    = nextFlags;
-                nextStore.append(cand);
+                if (nextFlags != 0) {
+                    cand.rawValue = e2;
+                    cand.flags    = nextFlags;
+                    nextStore.append(cand);
+                }
             }
+            if (progress) progress(end, count);
         }
 
         m_encPrevLogicalInt = logicalInt;
@@ -2152,6 +2352,8 @@ EngineErrc SearchEngine::refineEncoded(
         return EngineErrc::OK;
     }
 
+    m_candidates.sortByAddress();
+    const size_t count = m_candidates.size();
     size_t elemSz = std::max<size_t>(1, dataTypeSize(effectiveType));
     int64_t xorByteOffset = static_cast<int64_t>(keyOrMask);
     size_t spanBytes = (mode == EncodedMode::XOR_PAIR_64) ? 16
@@ -2159,55 +2361,79 @@ EngineErrc SearchEngine::refineEncoded(
 
     MmapCandidateStore nextStore(MmapCandidateStore::DEFAULT_MEMORY_THRESHOLD, m_spillDir);
     size_t syscalls = 0;
-    uint8_t rawBuf[16];
 
-    for (size_t i = 0; i < m_candidates.size(); ++i) {
+    constexpr size_t BATCH_LIMIT = 2048;
+    for (size_t base = 0; base < count; base += BATCH_LIMIT) {
         if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
-        CandidateEntry cand = m_candidates[i];
-
-        bool matched = false;
-        uint64_t curRaw = cand.rawValue;
+        size_t end = std::min(count, base + BATCH_LIMIT);
+        size_t batchCount = end - base;
 
         if (mode == EncodedMode::XOR_OFFSET) {
-            uint8_t vBuf[8] = {0};
-            uint8_t kBuf[8] = {0};
-            uintptr_t kAddr = static_cast<uintptr_t>(static_cast<int64_t>(cand.address) + xorByteOffset);
-            if (m_io.readMemory(cand.address, vBuf, elemSz) != EngineErrc::OK) continue;
-            if (m_io.readMemory(kAddr, kBuf, elemSz) != EngineErrc::OK) continue;
-            syscalls += 2;
-            uint64_t v = extractRawValue(vBuf, effectiveType);
-            uint64_t k = extractRawValue(kBuf, effectiveType);
-            matched = (v != 0 && k != 0 && (v ^ k) == targetBits64);
-            curRaw = v;
+            std::vector<uint8_t> slab(batchCount * 16, 0);
+            std::vector<BatchReadRange> ranges(batchCount * 2);
+            for (size_t k = 0; k < batchCount; ++k) {
+                uintptr_t vAddr = m_candidates[base + k].address;
+                uintptr_t kAddr = static_cast<uintptr_t>(static_cast<int64_t>(vAddr) + xorByteOffset);
+                ranges[k * 2 + 0] = BatchReadRange{vAddr, elemSz, slab.data() + (k * 16), false};
+                ranges[k * 2 + 1] = BatchReadRange{kAddr, elemSz, slab.data() + (k * 16 + 8), false};
+            }
+            m_io.readBatchScattered(ranges);
+            syscalls += (ranges.size() + m_io.iovMax() - 1) / m_io.iovMax();
+
+            for (size_t k = 0; k < batchCount; ++k) {
+                if (!ranges[k * 2 + 0].success || !ranges[k * 2 + 1].success) continue;
+                CandidateEntry cand = m_candidates[base + k];
+                uint64_t v = extractRawValue(slab.data() + (k * 16), effectiveType);
+                uint64_t keyVal = extractRawValue(slab.data() + (k * 16 + 8), effectiveType);
+                if (v != 0 && keyVal != 0 && (v ^ keyVal) == targetBits64) {
+                    cand.rawValue = v;
+                    nextStore.append(cand);
+                }
+            }
         } else {
-            if (m_io.readMemory(cand.address, rawBuf, spanBytes) != EngineErrc::OK) continue;
-            syscalls++;
-            if (mode == EncodedMode::XOR_PAIR_32) {
-                uint32_t w0 = 0, w1 = 0;
-                std::memcpy(&w0, rawBuf, 4);
-                std::memcpy(&w1, rawBuf + 4, 4);
-                matched = (w0 != 0 && w1 != 0 && (w0 ^ w1) == targetBits32);
-                curRaw = w0;
-            } else if (mode == EncodedMode::XOR_PAIR_64) {
-                uint64_t q0 = 0, q1 = 0;
-                std::memcpy(&q0, rawBuf, 8);
-                std::memcpy(&q1, rawBuf + 8, 8);
-                matched = (q0 != 0 && q1 != 0 && (q0 ^ q1) == targetBits64);
-                curRaw = q0;
-            } else if (mode == EncodedMode::XOR_ADDRESS) {
-                uint32_t stored = 0;
-                std::memcpy(&stored, rawBuf, 4);
-                uint32_t mask32 = (keyOrMask == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>(keyOrMask);
-                uint32_t addrKey = static_cast<uint32_t>(cand.address) & mask32;
-                matched = ((stored ^ addrKey) == targetBits32);
-                curRaw = stored;
+            std::vector<uint8_t> slab(batchCount * 16, 0);
+            std::vector<BatchReadRange> ranges(batchCount);
+            for (size_t k = 0; k < batchCount; ++k) {
+                ranges[k] = BatchReadRange{static_cast<uintptr_t>(m_candidates[base + k].address), spanBytes, slab.data() + (k * 16), false};
+            }
+            m_io.readBatchScattered(ranges);
+            syscalls += (ranges.size() + m_io.iovMax() - 1) / m_io.iovMax();
+
+            for (size_t k = 0; k < batchCount; ++k) {
+                if (!ranges[k].success) continue;
+                CandidateEntry cand = m_candidates[base + k];
+                const uint8_t* rawBuf = slab.data() + (k * 16);
+                bool matched = false;
+                uint64_t curRaw = cand.rawValue;
+
+                if (mode == EncodedMode::XOR_PAIR_32) {
+                    uint32_t w0 = 0, w1 = 0;
+                    std::memcpy(&w0, rawBuf, 4);
+                    std::memcpy(&w1, rawBuf + 4, 4);
+                    matched = (w0 != 0 && w1 != 0 && (w0 ^ w1) == targetBits32);
+                    curRaw = w0;
+                } else if (mode == EncodedMode::XOR_PAIR_64) {
+                    uint64_t q0 = 0, q1 = 0;
+                    std::memcpy(&q0, rawBuf, 8);
+                    std::memcpy(&q1, rawBuf + 8, 8);
+                    matched = (q0 != 0 && q1 != 0 && (q0 ^ q1) == targetBits64);
+                    curRaw = q0;
+                } else if (mode == EncodedMode::XOR_ADDRESS) {
+                    uint32_t stored = 0;
+                    std::memcpy(&stored, rawBuf, 4);
+                    uint32_t mask32 = (keyOrMask == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>(keyOrMask);
+                    uint32_t addrKey = static_cast<uint32_t>(cand.address) & mask32;
+                    matched = ((stored ^ addrKey) == targetBits32);
+                    curRaw = stored;
+                }
+
+                if (matched) {
+                    cand.rawValue = curRaw;
+                    nextStore.append(cand);
+                }
             }
         }
-
-        if (matched) {
-            cand.rawValue = curRaw;
-            nextStore.append(cand);
-        }
+        if (progress) progress(end, count);
     }
 
     m_candidates = std::move(nextStore);
@@ -2238,7 +2464,6 @@ EngineErrc SearchEngine::searchGroup(
 
     refreshRegions();
 
-    // 1. Anchor-First Selectivity Scheduling: pick the field with highest entropy score
     size_t anchorIdx = 0;
     uint32_t bestScore = 0;
     for (size_t i = 0; i < query.fields.size(); ++i) {
@@ -2268,11 +2493,15 @@ EngineErrc SearchEngine::searchGroup(
     size_t numThreads = std::min(m_workerThreads, tasks.size());
     std::vector<std::thread> workers;
     const size_t pageSize = m_io.pageSize();
+    const bool pagemapZeroKnown = m_io.hasPagemapResidency() && (m_io.zeroPagePfn() != 0);
+    const uint8_t zeroBytes[8] = {0};
+    const bool anchorCanMatchZero = evalGroupField(zeroBytes, anchor);
 
     for (size_t tid = 0; tid < numThreads; ++tid) {
         workers.emplace_back([&]() {
             std::vector<uint8_t> buf;
             std::vector<uint8_t> validMask;
+            std::vector<uint8_t> scanMask;
             std::vector<size_t> anchorOffsets;
             std::vector<CandidateEntry> localHits;
 
@@ -2285,7 +2514,7 @@ EngineErrc SearchEngine::searchGroup(
                 if (buf.size() < task.readLen) buf.resize(task.readLen);
 
                 size_t chunkReadable = 0;
-                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable);
+                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable, !task.fileBacked);
                 syscalls.fetch_add(1, std::memory_order_relaxed);
                 readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed);
 
@@ -2295,23 +2524,21 @@ EngineErrc SearchEngine::searchGroup(
                     continue;
                 }
 
+                buildScanPageMask(
+                    buf.data(), task.readLen, pageSize, task.regionFlag,
+                    anchorCanMatchZero, pagemapZeroKnown, validMask, scanMask
+                );
                 anchorOffsets.clear();
-                size_t anchorSz = dataTypeSize(anchor.type);
-                size_t anchorStep = query.aligned ? anchorSz : 1;
+                size_t anchorSz = std::max<size_t>(1, dataTypeSize(anchor.type));
+                size_t anchorStep = query.aligned ? std::min<size_t>(anchorSz, 4) : 1;
 
                 if (anchor.op == 1) {
                     switch (anchor.type) {
                         case DataType::INT8:
-                            SimdKernel::scanRange<int8_t>(buf.data(), task.readLen, static_cast<int8_t>(anchor.iVal), static_cast<int8_t>(anchor.iMax), true, 1, anchorOffsets);
-                            break;
                         case DataType::INT16:
-                            SimdKernel::scanRange<int16_t>(buf.data(), task.readLen, static_cast<int16_t>(anchor.iVal), static_cast<int16_t>(anchor.iMax), true, anchorStep, anchorOffsets);
-                            break;
                         case DataType::INT32:
-                            SimdKernel::scanRange<int32_t>(buf.data(), task.readLen, static_cast<int32_t>(anchor.iVal), static_cast<int32_t>(anchor.iMax), true, anchorStep, anchorOffsets);
-                            break;
                         case DataType::INT64:
-                            SimdKernel::scanRange<int64_t>(buf.data(), task.readLen, anchor.iVal, anchor.iMax, true, anchorStep, anchorOffsets);
+                            SimdKernel::scanRangeInteger(buf.data(), task.readLen, anchor.type, anchor.iVal, anchor.iMax, true, anchorStep, anchorOffsets);
                             break;
                         case DataType::FLOAT:
                             SimdKernel::scanRangeF32(buf.data(), task.readLen, static_cast<float>(anchor.fVal), static_cast<float>(anchor.fMax), true, anchorStep, anchorOffsets);
@@ -2360,6 +2587,8 @@ EngineErrc SearchEngine::searchGroup(
                 std::vector<size_t> matchedOffsets(numFields, 0);
 
                 for (size_t aOff : anchorOffsets) {
+                    size_t anchorPage = aOff / pageSize;
+                    if (anchorPage >= scanMask.size() || scanMask[anchorPage] == 0) continue;
                     if (!isRangeInValidPages(aOff, anchorSz, task.startAddr, pageSize, validMask)) continue;
 
                     size_t winStart = (aOff > query.maxSpanBytes) ? (aOff - query.maxSpanBytes) : 0;
@@ -2378,7 +2607,7 @@ EngineErrc SearchEngine::searchGroup(
                             size_t fIdx = anchorIdx - 1 - rev;
                             const auto& fld = query.fields[fIdx];
                             size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
-                            size_t fStep = query.aligned ? fSz : 1;
+                            size_t fStep = query.aligned ? std::min<size_t>(fSz, 4) : 1;
 
                             if (curUpperBound < winStart + fSz) {
                                 allMatched = false;
@@ -2412,13 +2641,12 @@ EngineErrc SearchEngine::searchGroup(
                         minMatchedOffset = (anchorIdx == 0) ? aOff : firstFieldOffset;
 
                         size_t prevEnd = aOff + anchorSz;
-                        // In Original GG, "100;200::100" means the address distance (lastAddr - firstAddr) <= maxSpanBytes
                         size_t maxAllowedStart = minMatchedOffset + query.maxSpanBytes;
 
                         for (size_t fIdx = anchorIdx + 1; fIdx < numFields; ++fIdx) {
                             const auto& fld = query.fields[fIdx];
                             size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
-                            size_t fStep = query.aligned ? fSz : 1;
+                            size_t fStep = query.aligned ? std::min<size_t>(fSz, 4) : 1;
                             size_t alignedStart = prevEnd;
                             if (fStep > 1 && (alignedStart % fStep) != 0) {
                                 alignedStart += fStep - (alignedStart % fStep);
@@ -2452,13 +2680,11 @@ EngineErrc SearchEngine::searchGroup(
                             if (fIdx == anchorIdx) continue;
                             const auto& fld = query.fields[fIdx];
                             size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
-                            size_t fStep = query.aligned ? fSz : 1;
+                            size_t fStep = query.aligned ? std::min<size_t>(fSz, 4) : 1;
 
                             auto overlapsMatched = [&](size_t candPos, size_t candSz) noexcept -> bool {
                                 size_t candEnd = candPos + candSz;
-                                // Check anchor
                                 if (candPos < aOff + anchorSz && aOff < candEnd) return true;
-                                // Check all previously matched fields
                                 for (size_t prevIdx = 0; prevIdx < fIdx; ++prevIdx) {
                                     if (prevIdx == anchorIdx) continue;
                                     size_t pPos = matchedOffsets[prevIdx];
@@ -2468,7 +2694,6 @@ EngineErrc SearchEngine::searchGroup(
                                 return false;
                             };
 
-                            // Search outward from anchor aOff so we pick the closest valid match first
                             size_t center = aOff;
                             if (fStep > 1 && (center % fStep) != 0) {
                                 center -= (center % fStep);
@@ -2479,7 +2704,6 @@ EngineErrc SearchEngine::searchGroup(
                             size_t maxRadius = query.maxSpanBytes;
 
                             for (size_t dist = 0; dist <= maxRadius; dist += fStep) {
-                                // Try before anchor (center - dist) and after anchor (center + dist)
                                 for (int dir = 0; dir < 2; ++dir) {
                                     if (dist == 0 && dir == 1) continue;
                                     size_t pos = 0;
@@ -2613,7 +2837,6 @@ EngineErrc SearchEngine::refineGroup(
         size_t    lastCandIdx;
     };
 
-    // Group candidates that are within maxSpan * 2 + 256 of each other
     std::vector<CoalescedGroup> groups;
     size_t idx = 0;
     while (idx < count) {
@@ -2637,8 +2860,6 @@ EngineErrc SearchEngine::refineGroup(
             }
         }
 
-        // If the cluster has fewer candidates than numFields (e.g. only anchor was stored previously),
-        // expand read window within the same 4KB page so neighboring fields can still be verified.
         uintptr_t readStart = clusterMin;
         uintptr_t readEnd   = clusterMaxEnd;
         if ((idx - firstIdx) < numFields) {
@@ -2686,7 +2907,6 @@ EngineErrc SearchEngine::refineGroup(
             const size_t candCountInGrp = grp.lastCandIdx - grp.firstCandIdx;
 
             if (candCountInGrp >= numFields) {
-                // Standard GG Group Refine: match query fields among existing candidates in this cluster
                 for (size_t startC = grp.firstCandIdx; startC < grp.lastCandIdx; ++startC) {
                     const CandidateEntry& c0 = m_candidates[startC];
                     const uint8_t* ptr0 = br.localBuf + (c0.address - grp.readStartAddr);
@@ -2732,7 +2952,6 @@ EngineErrc SearchEngine::refineGroup(
                             }
                         }
                     } else {
-                        // Unordered group refine across existing candidates in cluster
                         if (!evalGroupField(ptr0, query.fields[0])) continue;
                         matchedCandIndices[0] = startC;
                         uintptr_t minAddr = c0.address;
@@ -2755,7 +2974,6 @@ EngineErrc SearchEngine::refineGroup(
                                     continue;
                                 }
 
-                                // Ensure distinct non-overlapping address from previously matched fields
                                 bool overlaps = false;
                                 for (size_t p = 0; p < fIdx; ++p) {
                                     uintptr_t pAddr = m_candidates[matchedCandIndices[p]].address;
@@ -2804,7 +3022,6 @@ EngineErrc SearchEngine::refineGroup(
                     }
                 }
             } else {
-                // Fallback when cluster has fewer candidates than numFields (e.g., single-address candidate refined as group)
                 for (size_t startC = grp.firstCandIdx; startC < grp.lastCandIdx; ++startC) {
                     const CandidateEntry& c0 = m_candidates[startC];
                     size_t aOff = c0.address - grp.readStartAddr;
@@ -2820,7 +3037,7 @@ EngineErrc SearchEngine::refineGroup(
                     for (size_t fIdx = 1; fIdx < numFields; ++fIdx) {
                         const auto& fld = query.fields[fIdx];
                         size_t fSz = std::max<size_t>(1, dataTypeSize(fld.type));
-                        size_t fStep = query.aligned ? fSz : 1;
+                        size_t fStep = query.aligned ? std::min<size_t>(fSz, 4) : 1;
                         size_t searchStart = query.ordered ? prevEnd : 0;
                         if (fStep > 1 && (searchStart % fStep) != 0) {
                             searchStart += fStep - (searchStart % fStep);
@@ -2878,6 +3095,327 @@ EngineErrc SearchEngine::refineGroup(
     }
 
     nextStore.sortByAddress();
+    m_candidates = std::move(nextStore);
+    m_totalMatchedCount = m_candidates.size();
+
+    auto t1 = std::chrono::steady_clock::now();
+    m_lastTelemetry.elapsedMs       = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    m_lastTelemetry.candidatesFound = m_totalMatchedCount;
+    m_lastTelemetry.syscallsIssued  = syscallsIssued;
+    m_lastTelemetry.spilledToMmap   = m_candidates.isSpilledToDisk();
+    return EngineErrc::OK;
+}
+
+// ============================================================================
+// 6. Native Validated Pointer Search & Refinement (VmaIndex + ArchPtrPolicy)
+// Inspired by KittyPtrValidator & frida-gum gum_memory_find_pointers
+// ============================================================================
+EngineErrc SearchEngine::searchPointers(
+    DataType ptrType,
+    uintptr_t targetAddress,
+    size_t maxOffset,
+    uint32_t protMask,
+    bool aligned,
+    CancellationToken* token,
+    ProgressCallback progress
+) {
+    auto t0 = std::chrono::steady_clock::now();
+    m_candidates.clear();
+    m_snapshotStore.clear();
+    m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
+    m_totalMatchedCount = 0;
+    m_lastTelemetry = ScanTelemetry{};
+
+    refreshRegions();
+    VmaIndex vmaIndex(MapsParser::parseProcessMaps(m_io.pid(), 0, false));
+    if (vmaIndex.empty()) return EngineErrc::OK;
+
+    const bool is64Target = m_io.targetIs64Bit();
+    DataType effectiveDt = (ptrType == DataType::INT32 || ptrType == DataType::INT64)
+        ? ptrType
+        : (is64Target ? DataType::INT64 : DataType::INT32);
+    const size_t ptrWidth = (effectiveDt == DataType::INT32) ? 4 : 8;
+    const size_t step = aligned ? ptrWidth : 1;
+    const uint32_t effectiveProtMask = (protMask == 0) ? PointerProtMask::ALL : protMask;
+
+    const uintptr_t cleanTarget = static_cast<uintptr_t>(ArchPtrPolicy::untag(targetAddress, is64Target));
+    const uintptr_t minTarget = (cleanTarget > 0)
+        ? ((cleanTarget > maxOffset) ? std::max<uintptr_t>(ArchPtrPolicy::MIN_VALID_USER_ADDR, cleanTarget - maxOffset) : ArchPtrPolicy::MIN_VALID_USER_ADDR)
+        : ArchPtrPolicy::MIN_VALID_USER_ADDR;
+    const uintptr_t maxTarget = (cleanTarget > 0)
+        ? ((maxOffset > std::numeric_limits<uintptr_t>::max() - cleanTarget)
+            ? std::numeric_limits<uintptr_t>::max()
+            : (cleanTarget + maxOffset))
+        : (is64Target ? static_cast<uintptr_t>(ArchPtrPolicy::ARM64_TBI_MASK) : static_cast<uintptr_t>(0xFFFF0000u));
+
+    size_t overlap = ptrWidth - 1;
+    auto tasks = buildChunkTasks(overlap);
+    if (tasks.empty()) return EngineErrc::OK;
+
+    size_t totalPlannedBytes = 0;
+    for (const auto& t : tasks) totalPlannedBytes += t.logicalLen;
+
+    std::atomic<size_t> nextIdx{0};
+    std::atomic<size_t> processedBytes{0};
+    std::atomic<size_t> readableBytes{0};
+    std::atomic<size_t> syscalls{0};
+    std::atomic<size_t> totalMatches{0};
+    std::atomic<size_t> storedCount{0};
+    std::mutex storeMutex;
+
+    size_t numThreads = std::min(m_workerThreads, tasks.size());
+    std::vector<std::thread> workers;
+    const size_t pageSize = m_io.pageSize();
+
+    for (size_t tid = 0; tid < numThreads; ++tid) {
+        workers.emplace_back([&]() {
+            std::vector<uint8_t> buf;
+            std::vector<uint8_t> validMask;
+            std::vector<uint8_t> nonEmptyMask;
+            std::vector<CandidateEntry> localHits;
+            localHits.reserve(8192);
+            // Thread-local copy of VmaIndex so MRU atomic hint has zero cross-thread contention
+            VmaIndex localVma = vmaIndex;
+
+            while (true) {
+                if (token && token->isCancelled()) break;
+                size_t idx = nextIdx.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= tasks.size()) break;
+
+                const ChunkTask& task = tasks[idx];
+                if (buf.size() < task.readLen) buf.resize(task.readLen);
+
+                size_t chunkReadable = 0;
+                EngineErrc rc = m_io.readChunkFaultTolerant(task.startAddr, buf.data(), task.readLen, validMask, &chunkReadable, !task.fileBacked);
+                syscalls.fetch_add(1, std::memory_order_relaxed);
+                readableBytes.fetch_add(chunkReadable, std::memory_order_relaxed);
+
+                if (rc == EngineErrc::OK && chunkReadable > 0) {
+                    // Valid pointers are never 0, so skipping all-zero pages is 100% exact
+                    buildScanPageMask(buf.data(), task.readLen, pageSize, task.regionFlag, false, true, validMask, nonEmptyMask);
+                    const size_t numPages = nonEmptyMask.size();
+                    uint8_t rTag = regionFlagToIndex(task.regionFlag);
+                    bool storeAlreadyFull = (storedCount.load(std::memory_order_relaxed) >= MmapCandidateStore::MAX_STORED_CANDIDATES);
+                    size_t chunkMatches = 0;
+
+                    for (size_t p = 0; p < numPages; ++p) {
+                        if (nonEmptyMask[p] == 0) continue;
+                        size_t pStart = p * pageSize;
+                        if (pStart >= task.logicalLen) break;
+                        size_t pEnd = std::min((p + 1) * pageSize, task.logicalLen);
+
+                        for (size_t off = pStart; off < pEnd && off + ptrWidth <= task.readLen; off += step) {
+                            uint64_t rawVal = 0;
+                            std::memcpy(&rawVal, buf.data() + off, ptrWidth);
+                            if (rawVal == 0) continue;
+
+                            if (!ArchPtrPolicy::isCanonicalUserPtr(rawVal, ptrWidth == 8)) continue;
+                            uintptr_t untagged = static_cast<uintptr_t>(ArchPtrPolicy::untag(rawVal, ptrWidth == 8));
+                            if (untagged < minTarget || untagged > maxTarget) continue;
+
+                            uintptr_t candAddr = task.startAddr + off;
+                            if (cleanTarget == 0) {
+                                // General pointer discovery: filter unaligned & self-pointing noise
+                                if ((untagged & (ptrWidth - 1)) != 0) continue;
+                                if (untagged == candAddr) continue;
+                            }
+
+                            uint32_t pClass = localVma.classifyPointer(untagged, false);
+                            if ((pClass & effectiveProtMask) == 0) continue;
+                            if (!isRangeInValidPages(off, ptrWidth, task.startAddr, pageSize, validMask)) continue;
+
+                            chunkMatches++;
+                            if (!storeAlreadyFull) {
+                                CandidateEntry entry{};
+                                entry.address   = candAddr;
+                                entry.rawValue  = rawVal;
+                                entry.type      = static_cast<uint8_t>(effectiveDt);
+                                entry.regionTag = rTag;
+                                entry.flags     = pClass;
+                                localHits.push_back(entry);
+
+                                if (localHits.size() >= 16384) {
+                                    std::lock_guard<std::mutex> lk(storeMutex);
+                                    m_candidates.appendBatch(localHits.data(), localHits.size());
+                                    storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+                                    localHits.clear();
+                                    if (m_candidates.isFull()) storeAlreadyFull = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if (chunkMatches > 0) {
+                        m_totalMatchedCount = totalMatches.fetch_add(chunkMatches, std::memory_order_relaxed) + chunkMatches;
+                    }
+                }
+
+                size_t done = processedBytes.fetch_add(task.logicalLen, std::memory_order_relaxed) + task.logicalLen;
+                if (progress) progress(done, totalPlannedBytes);
+            }
+
+            if (!localHits.empty()) {
+                std::lock_guard<std::mutex> lk(storeMutex);
+                m_candidates.appendBatch(localHits.data(), localHits.size());
+                storedCount.store(m_candidates.size(), std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (auto& w : workers) w.join();
+    if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
+
+    m_candidates.sortByAddress();
+    m_totalMatchedCount = std::max(totalMatches.load(), m_candidates.size());
+
+    auto t1 = std::chrono::steady_clock::now();
+    m_lastTelemetry.elapsedMs         = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    m_lastTelemetry.totalVmasScanned  = m_regions.size();
+    m_lastTelemetry.totalBytesScanned = processedBytes.load();
+    m_lastTelemetry.readableBytes     = readableBytes.load();
+    m_lastTelemetry.candidatesFound   = m_totalMatchedCount;
+    m_lastTelemetry.syscallsIssued    = syscalls.load();
+    m_lastTelemetry.spilledToMmap     = m_candidates.isSpilledToDisk();
+    return EngineErrc::OK;
+}
+
+EngineErrc SearchEngine::refinePointers(
+    DataType ptrType,
+    uintptr_t targetAddress,
+    size_t maxOffset,
+    uint32_t protMask,
+    CancellationToken* token,
+    ProgressCallback progress
+) {
+    auto t0 = std::chrono::steady_clock::now();
+    m_snapshotStore.clear();
+    m_hasFullSnapshot = false;
+    m_encryptedSnapshot = false;
+
+    if (m_candidates.empty()) {
+        m_totalMatchedCount = 0;
+        return EngineErrc::OK;
+    }
+
+    VmaIndex vmaIndex(MapsParser::parseProcessMaps(m_io.pid(), 0, false));
+    if (vmaIndex.empty()) {
+        m_candidates.clear();
+        m_totalMatchedCount = 0;
+        return EngineErrc::OK;
+    }
+
+    const bool is64Target = m_io.targetIs64Bit();
+    DataType defaultDt = (ptrType == DataType::INT32 || ptrType == DataType::INT64)
+        ? ptrType
+        : (is64Target ? DataType::INT64 : DataType::INT32);
+    const uint32_t effectiveProtMask = (protMask == 0) ? PointerProtMask::ALL : protMask;
+
+    const uintptr_t cleanTarget = static_cast<uintptr_t>(ArchPtrPolicy::untag(targetAddress, is64Target));
+    const uintptr_t minTarget = (cleanTarget > 0)
+        ? ((cleanTarget > maxOffset) ? std::max<uintptr_t>(ArchPtrPolicy::MIN_VALID_USER_ADDR, cleanTarget - maxOffset) : ArchPtrPolicy::MIN_VALID_USER_ADDR)
+        : ArchPtrPolicy::MIN_VALID_USER_ADDR;
+    const uintptr_t maxTarget = (cleanTarget > 0)
+        ? ((maxOffset > std::numeric_limits<uintptr_t>::max() - cleanTarget)
+            ? std::numeric_limits<uintptr_t>::max()
+            : (cleanTarget + maxOffset))
+        : (is64Target ? static_cast<uintptr_t>(ArchPtrPolicy::ARM64_TBI_MASK) : static_cast<uintptr_t>(0xFFFF0000u));
+
+    m_candidates.sortByAddress();
+    const size_t count = m_candidates.size();
+    const size_t pageSize = m_io.pageSize();
+
+    struct CoalescedGroup {
+        uintptr_t startPageAddr;
+        size_t    byteLen;
+        size_t    firstCandIdx;
+        size_t    lastCandIdx;
+    };
+
+    std::vector<CoalescedGroup> groups;
+    size_t idx = 0;
+    while (idx < count) {
+        uintptr_t addr = m_candidates[idx].address;
+        size_t itemSz = 8;
+        uintptr_t spanStart = addr;
+        uintptr_t spanEnd   = addr + itemSz;
+        size_t firstIdx = idx++;
+
+        while (idx < count) {
+            uintptr_t nextAddr = m_candidates[idx].address;
+            uintptr_t nextEnd  = nextAddr + 8;
+            if (nextAddr <= spanEnd + 256 && (nextEnd - spanStart) <= pageSize) {
+                if (nextEnd > spanEnd) spanEnd = nextEnd;
+                idx++;
+            } else {
+                break;
+            }
+        }
+        groups.push_back(CoalescedGroup{spanStart, spanEnd - spanStart, firstIdx, idx});
+    }
+
+    MmapCandidateStore nextStore(MmapCandidateStore::DEFAULT_MEMORY_THRESHOLD, m_spillDir);
+    size_t syscallsIssued = 0;
+
+    constexpr size_t BATCH_GROUP_LIMIT = 4096;
+    for (size_t gBase = 0; gBase < groups.size(); gBase += BATCH_GROUP_LIMIT) {
+        if (token && token->isCancelled()) return EngineErrc::ERR_CANCELLED;
+        size_t gEnd = std::min(groups.size(), gBase + BATCH_GROUP_LIMIT);
+        size_t batchBytes = 0;
+        for (size_t i = gBase; i < gEnd; ++i) batchBytes += groups[i].byteLen;
+
+        std::vector<uint8_t> slab(batchBytes, 0);
+        std::vector<BatchReadRange> ranges(gEnd - gBase);
+        size_t offset = 0;
+        for (size_t i = gBase; i < gEnd; ++i) {
+            ranges[i - gBase].remoteAddr = groups[i].startPageAddr;
+            ranges[i - gBase].length     = groups[i].byteLen;
+            ranges[i - gBase].localBuf   = slab.data() + offset;
+            offset += groups[i].byteLen;
+        }
+
+        m_io.readBatchScattered(ranges);
+        syscallsIssued += (ranges.size() + m_io.iovMax() - 1) / m_io.iovMax();
+
+        for (size_t i = gBase; i < gEnd; ++i) {
+            const auto& br = ranges[i - gBase];
+            if (!br.success) continue;
+            const auto& grp = groups[i];
+            for (size_t cIdx = grp.firstCandIdx; cIdx < grp.lastCandIdx; ++cIdx) {
+                CandidateEntry cand = m_candidates[cIdx];
+                DataType dt = (cand.type == static_cast<uint8_t>(DataType::INT32) || cand.type == static_cast<uint8_t>(DataType::INT64))
+                    ? static_cast<DataType>(cand.type)
+                    : defaultDt;
+                size_t ptrWidth = (dt == DataType::INT32) ? 4 : 8;
+                const uint8_t* valPtr = br.localBuf + (cand.address - grp.startPageAddr);
+
+                uint64_t rawVal = 0;
+                std::memcpy(&rawVal, valPtr, ptrWidth);
+                if (rawVal == 0) continue;
+
+                if (!ArchPtrPolicy::isCanonicalUserPtr(rawVal, ptrWidth == 8)) continue;
+                uintptr_t untagged = static_cast<uintptr_t>(ArchPtrPolicy::untag(rawVal, ptrWidth == 8));
+                if (untagged < minTarget || untagged > maxTarget) continue;
+
+                if (cleanTarget == 0) {
+                    if ((untagged & (ptrWidth - 1)) != 0) continue;
+                    if (untagged == cand.address) continue;
+                }
+
+                uint32_t pClass = vmaIndex.classifyPointer(untagged, false);
+                if ((pClass & effectiveProtMask) == 0) continue;
+
+                cand.rawValue = rawVal;
+                cand.type     = static_cast<uint8_t>(dt);
+                cand.flags    = pClass;
+                nextStore.append(cand);
+            }
+        }
+
+        m_totalMatchedCount = nextStore.size();
+        if (progress) progress(gEnd, groups.size());
+    }
+
     m_candidates = std::move(nextStore);
     m_totalMatchedCount = m_candidates.size();
 

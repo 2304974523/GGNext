@@ -14,11 +14,13 @@ namespace mem_engine {
 // MmapCandidateStore: Hybrid In-Memory + Automatic Disk-Spillover (`mmap`)
 // Prevents OOM crashes when candidate counts exceed inMemoryThreshold
 // (default: 1,000,000 hits = 24 MB RAM cap).
+// Uses an unlinked file in `spillDir` (with anonymous mmap fallback) so disk
+// blocks are automatically reclaimed by the kernel on close/exit.
 // ============================================================================
 class MmapCandidateStore {
 public:
-    static constexpr size_t DEFAULT_MEMORY_THRESHOLD = 1000000; // 1M candidates
-    static constexpr size_t MAX_STORED_CANDIDATES    = 2000000; // Hard cap: 2M candidates (48 MB anonymous mmap)
+    static constexpr size_t DEFAULT_MEMORY_THRESHOLD = 1000000;  // 1M candidates in RAM before mmap spillover
+    static constexpr size_t MAX_STORED_CANDIDATES    = 16000000; // 16M candidates cap (~384 MB)
 
     explicit MmapCandidateStore(size_t inMemoryThreshold = DEFAULT_MEMORY_THRESHOLD,
                                 const std::string& spillDir = "/data/local/tmp");
@@ -31,6 +33,9 @@ public:
 
     bool append(const CandidateEntry& entry);
     bool appendBatch(const CandidateEntry* entries, size_t count);
+
+    // Prunes any candidate whose address is in `addrs[0..count)`
+    size_t removeAddresses(const uint64_t* addrs, size_t count);
 
     size_t size() const noexcept { return m_count; }
     bool empty() const noexcept { return m_count == 0; }
@@ -57,7 +62,7 @@ private:
     std::vector<CandidateEntry> m_ramVec;
     size_t                      m_count     = 0;
 
-    // Anonymous demand-paged mmap state
+    // File-backed or anonymous demand-paged mmap state
     bool                        m_isMmap            = false;
     int                         m_fd                = -1;
     CandidateEntry*             m_mmapPtr           = nullptr;
@@ -65,8 +70,8 @@ private:
 };
 
 // ============================================================================
-// MmapRegionSnapshotStore: Anonymous Demand-Paged Full Memory Snapshot for
-// Unknown Initial Value Fuzzy Searches without touching flash storage or heap!
+// MmapRegionSnapshotStore: Unlinked-File / Demand-Paged Full Memory Snapshot
+// for Unknown Initial Value Fuzzy Searches without OOM!
 // ============================================================================
 class MmapRegionSnapshotStore {
 public:

@@ -32,10 +32,22 @@ public:
     template <typename T>
     static void scanRange(const uint8_t* buf, size_t len, T minVal, T maxVal, bool inclusive, size_t step, std::vector<size_t>& outOffsets);
 
+    // Generalized Signed + Unsigned Integer Range Kernel (handles e.g. BYTE 0..255, WORD 0..65535, DWORD 0..4294967295)
+    static void scanRangeInteger(
+        const uint8_t* buf,
+        size_t len,
+        DataType dt,
+        int64_t iMin,
+        int64_t iMax,
+        bool inclusive,
+        size_t step,
+        std::vector<size_t>& outOffsets
+    );
+
     // 3. Vectorized Float32 Range Kernel (NEON vcgeq_f32 / vcleq_f32 + Scalar)
     static void scanRangeF32(const uint8_t* buf, size_t len, float minVal, float maxVal, bool inclusive, size_t step, std::vector<size_t>& outOffsets);
 
-    // 4. Byte Array / Masked Pattern Search (SIMD first-byte + last-byte filter)
+    // 4. Byte Array / Masked Pattern Search (High-entropy anchor selection + memchr)
     static void scanBytePattern(const uint8_t* buf, size_t len, const uint8_t* pattern, const uint8_t* mask, size_t patLen, std::vector<size_t>& outOffsets);
 
     // 5. Encoded & XOR Kernels
@@ -53,7 +65,8 @@ public:
         SearchOp op,
         T exactDelta,
         uint8_t regionTag,
-        std::vector<CandidateEntry>& outCandidates
+        std::vector<CandidateEntry>& outCandidates,
+        size_t step = 0
     );
 };
 

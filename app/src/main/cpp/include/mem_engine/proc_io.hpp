@@ -22,6 +22,9 @@ struct BatchReadRange {
 
 class ProcIO {
 public:
+    // Adaptive transfer promotion threshold (inspired by KittyMemoryEx KT_RETRY_NORMAL_AFTER)
+    static constexpr size_t RETRY_NORMAL_TRANSFER_BYTES = 64 * 1024;
+
     ProcIO();
     explicit ProcIO(int pid);
     ~ProcIO();
@@ -38,20 +41,27 @@ public:
     int pid() const noexcept { return m_pid; }
     size_t pageSize() const noexcept { return m_pageSize; }
     size_t iovMax() const noexcept { return m_iovMax; }
+    bool targetIs64Bit() const noexcept { return m_targetIs64Bit; }
+    bool hasPagemapResidency() const noexcept { return m_pagemapUsable.load(std::memory_order_relaxed); }
+    uint64_t zeroPagePfn() const noexcept { return m_zeroPagePfn; }
 
-    // Standard single-range read/write: process_vm_readv/writev -> /proc/[pid]/mem pread64/pwrite64 fallback
+    // Standard single-range read/write:
+    // - Read: process_vm_readv -> /proc/[pid]/mem pread64 fallback with EINTR retry
+    // - Write: process_vm_writev -> /proc/[pid]/mem pwrite64 fallback (FOLL_FORCE for read-only/code pages)
     EngineErrc readMemory(uintptr_t addr, void* buf, size_t size, size_t* outBytesRead = nullptr) const noexcept;
     EngineErrc writeMemory(uintptr_t addr, const void* buf, size_t size) const noexcept;
 
-    // Fault-tolerant chunk read: if a chunk spans one or more PROT_NONE guard pages (EFAULT),
-    // automatically isolates unmapped pages at m_pageSize granularity, zero-filling unmapped pages
-    // and filling outValidPageMask (1 byte per page: 1 = readable, 0 = guard/EFAULT) in O(pages/IOV_MAX) syscalls!
+    // Fault-tolerant chunk read:
+    // 1. Pre-filters unallocated / shared-zero pages via /proc/[pid]/pagemap when available.
+    // 2. Uses adaptive Normal <-> Page transfer (re-promoting to bulk read after 64KB of contiguous valid pages).
+    // 3. Fills outValidPageMask (1 byte per page: 1 = populated & readable, 0 = unallocated/guard/EFAULT).
     EngineErrc readChunkFaultTolerant(
         uintptr_t startAddr,
         uint8_t* buf,
         size_t size,
         std::vector<uint8_t>& outValidPageMask,
-        size_t* outReadableBytes = nullptr
+        size_t* outReadableBytes = nullptr,
+        bool usePagemap = true
     ) const;
 
     // Page-batched iovec read for iterative refinement across scattered candidate addresses
@@ -76,13 +86,17 @@ public:
 
     static size_t querySystemPageSize() noexcept;
     static size_t querySystemIovMax() noexcept;
+    static uint64_t detectKernelZeroPagePfn(size_t pageSize) noexcept;
+    static bool detectProcessIs64Bit(int pid) noexcept;
 
 private:
-    int    m_pid        = -1;
-    int    m_memFd      = -1;
-    int    m_pagemapFd  = -1;
-    size_t m_pageSize   = 4096;
-    size_t m_iovMax     = 1024;
+    int      m_pid           = -1;
+    int      m_memFd         = -1;
+    int      m_pagemapFd     = -1;
+    size_t   m_pageSize      = 4096;
+    size_t   m_iovMax        = 1024;
+    uint64_t m_zeroPagePfn   = 0;
+    bool     m_targetIs64Bit = true;
     mutable std::atomic<bool> m_pvmSupported{true};
     mutable std::atomic<bool> m_pagemapUsable{false};
 
@@ -90,7 +104,8 @@ private:
 };
 
 // ============================================================================
-// High-Precision Value Locker (for Automated QA Boundary Condition Testing)
+// High-Precision Multi-Mode Value Locker (Single Authoritative Freeze Worker)
+// Supports EXACT, INCREMENT, DECREMENT, and RANGE_CLAMP natively in C++
 // ============================================================================
 class ValueLocker {
 public:
@@ -101,28 +116,48 @@ public:
     ValueLocker& operator=(const ValueLocker&) = delete;
 
     void lockAddress(uintptr_t addr, const void* data, size_t size);
+    void lockAddressConfigured(
+        uintptr_t addr,
+        const void* data,
+        size_t size,
+        DataType type,
+        FreezeMode mode,
+        int64_t minVal = 0,
+        int64_t maxVal = 0
+    );
+
     template <typename T>
     void lockValue(uintptr_t addr, const T& val) {
         lockAddress(addr, &val, sizeof(T));
     }
+
     void unlockAddress(uintptr_t addr);
     void unlockAll();
     void setIntervalMs(uint32_t intervalMs);
+    uint32_t intervalMs() const;
+    void setPaused(bool paused);
+    bool isPaused() const;
     size_t lockedCount() const;
 
 private:
     struct LockedItem {
-        uintptr_t addr;
+        uintptr_t            addr   = 0;
         std::vector<uint8_t> bytes;
+        DataType             type   = DataType::INT32;
+        FreezeMode           mode   = FreezeMode::EXACT;
+        int64_t              minVal = 0;
+        int64_t              maxVal = 0;
     };
 
     void workerLoop();
+    void applyFreezeStep(LockedItem& item);
 
     ProcIO& m_io;
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::unordered_map<uintptr_t, LockedItem> m_items;
     uint32_t m_intervalMs = 5;
+    bool m_paused  = false;
     bool m_running = true;
     std::thread m_worker;
 };

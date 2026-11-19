@@ -7,6 +7,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -54,42 +55,71 @@ fun NextSheetCard(
     val metrics = LocalUiMetrics.current
     val corner = metrics.dialogCorner.dp
     val cardAlpha = (metrics.bgOpacity + 0.04f).coerceIn(0.55f, 1.0f)
-    Column(
-        modifier
-            .padding(horizontal = 10.dp)
-            .fillMaxWidth()
-            .clickable(
-                indication = null,
-                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
-            ) { /* 消费弹窗内容区域点击，防止误触发关闭 */ }
-            .background(Rose.Card.copy(alpha = cardAlpha), RoundedCornerShape(corner))
-            .border(1.dp, Rose.Divider, RoundedCornerShape(corner))
+
+    BoxWithConstraints(
+        modifier = modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
     ) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(start = 18.dp, end = 12.dp, top = 16.dp, bottom = if (subtitle.isNullOrBlank()) 8.dp else 2.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(tr(title), color = Rose.Text, fontSize = fsp(20f), fontWeight = FontWeight.Medium)
-            Spacer(Modifier.weight(1f))
-            CloseBadge(onDismiss)
+        val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+        val fallbackHeightDp = configuration.screenHeightDp.coerceAtLeast(240)
+        val availHeightDp = if (maxHeight.value.isFinite() && maxHeight.value > 120f) {
+            maxHeight.value.toInt()
+        } else {
+            fallbackHeightDp
         }
-        if (!subtitle.isNullOrBlank()) {
-            Text(
-                tr(subtitle),
-                color = Rose.TextSecond,
-                fontSize = fsp(13f),
-                modifier = Modifier.padding(start = 18.dp, end = 18.dp, bottom = 6.dp)
-            )
+        val isCompactHeight = availHeightDp < 460
+        val maxCardHeight = (availHeightDp - if (isCompactHeight) 8 else 20).coerceAtLeast(160).dp
+        val headerReserve = if (isCompactHeight) {
+            if (subtitle.isNullOrBlank()) 44 else 60
+        } else {
+            if (subtitle.isNullOrBlank()) 60 else 84
         }
+        val effectiveMaxBodyHeight = minOf(maxBodyHeight, (availHeightDp - headerReserve - 12).coerceAtLeast(110)).dp
+
         Column(
             Modifier
+                .padding(horizontal = 10.dp, vertical = if (isCompactHeight) 3.dp else 6.dp)
                 .fillMaxWidth()
-                .heightIn(max = maxBodyHeight.dp)
-                .padding(horizontal = 14.dp)
-                .padding(bottom = 14.dp)
-        ) { body() }
+                .heightIn(max = maxCardHeight)
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+                ) { /* 消费弹窗内容区域点击，防止误触发关闭 */ }
+                .background(Rose.Card.copy(alpha = cardAlpha), RoundedCornerShape(corner))
+                .border(1.dp, Rose.Divider, RoundedCornerShape(corner))
+        ) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(
+                        start = 18.dp,
+                        end = 12.dp,
+                        top = if (isCompactHeight) 7.dp else 13.dp,
+                        bottom = if (subtitle.isNullOrBlank()) (if (isCompactHeight) 4.dp else 7.dp) else 2.dp
+                    ),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(tr(title), color = Rose.Text, fontSize = fsp(if (isCompactHeight) 17f else 20f), fontWeight = FontWeight.Medium)
+                Spacer(Modifier.weight(1f))
+                CloseBadge(onDismiss)
+            }
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    tr(subtitle),
+                    color = Rose.TextSecond,
+                    fontSize = fsp(if (isCompactHeight) 11.5f else 13f),
+                    modifier = Modifier.padding(start = 18.dp, end = 18.dp, bottom = if (isCompactHeight) 3.dp else 6.dp)
+                )
+            }
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false)
+                    .heightIn(max = effectiveMaxBodyHeight)
+                    .padding(horizontal = 14.dp)
+                    .padding(bottom = if (isCompactHeight) 8.dp else 12.dp)
+            ) { body() }
+        }
     }
 }
 

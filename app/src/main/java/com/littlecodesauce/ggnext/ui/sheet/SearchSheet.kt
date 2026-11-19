@@ -8,6 +8,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -764,128 +765,135 @@ fun FilterSearchSheet(ui: Ui) {
     val metrics = LocalUiMetrics.current
     val corner = metrics.dialogCorner.dp
     val cardAlpha = (metrics.bgOpacity + 0.04f).coerceIn(0.55f, 1.0f)
-    Column(
-        Modifier
-            .padding(horizontal = 10.dp)
-            .fillMaxWidth()
-            .clickableNoRipple(remember { MutableInteractionSource() }) {}
-            .background(Rose.Card.copy(alpha = cardAlpha), RoundedCornerShape(corner))
-            .border(1.dp, Rose.Divider, RoundedCornerShape(corner))
-            .padding(top = 10.dp, bottom = 8.dp)
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
     ) {
+        val fallbackHeightDp = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.coerceAtLeast(240)
+        val availHeightDp = if (maxHeight.value.isFinite() && maxHeight.value > 120f) {
+            maxHeight.value.toInt()
+        } else {
+            fallbackHeightDp
+        }
+        val maxCardHeight = (availHeightDp - 10).coerceAtLeast(160).dp
         Column(
             Modifier
+                .padding(horizontal = 10.dp, vertical = 4.dp)
                 .fillMaxWidth()
-                .heightIn(max = if (showKeyboard) 370.dp else 560.dp)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 14.dp)
+                .heightIn(max = maxCardHeight)
+                .clickableNoRipple(remember { MutableInteractionSource() }) {}
+                .background(Rose.Card.copy(alpha = cardAlpha), RoundedCornerShape(corner))
+                .border(1.dp, Rose.Divider, RoundedCornerShape(corner))
+                .padding(top = 8.dp, bottom = 6.dp)
         ) {
-            Row(
+            Column(
                 Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 14.dp)
             ) {
-                Text(tr("最大显示记录: "), color = Rose.Text, fontSize = fsp(14.5f))
-                UnderlinedFilterInput(
-                    value = maxShowTf,
-                    focused = focusedField == FilterFocusField.MAX_SHOW,
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(tr("最大显示记录: "), color = Rose.Text, fontSize = fsp(14.5f))
+                    UnderlinedFilterInput(
+                        value = maxShowTf,
+                        focused = focusedField == FilterFocusField.MAX_SHOW,
+                        suppressSystemKeyboard = showKeyboard,
+                        onFocus = {
+                            focusedField = FilterFocusField.MAX_SHOW
+                        },
+                        onValueChange = {
+                            focusedField = FilterFocusField.MAX_SHOW
+                            onActiveTfChange(it)
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        Modifier
+                            .size(32.dp)
+                            .clickableWithTooltip { showKeyboard = !showKeyboard },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Rounded.Keyboard,
+                            contentDescription = "内置键盘",
+                            tint = if (showKeyboard) Rose.Primary else Rose.TextSecond,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+
+                FilterDivider()
+
+                FilterInputCheckRow(
+                    checked = st.addrGreatEnabled,
+                    onCheckChange = { st = st.copy(addrGreatEnabled = it) },
+                    label = "地址:  ≥",
+                    value = addrGreatTf,
+                    focused = focusedField == FilterFocusField.ADDR_GREAT,
                     suppressSystemKeyboard = showKeyboard,
                     onFocus = {
-                        focusedField = FilterFocusField.MAX_SHOW
-                        showKeyboard = true
+                        focusedField = FilterFocusField.ADDR_GREAT
                     },
                     onValueChange = {
-                        focusedField = FilterFocusField.MAX_SHOW
+                        focusedField = FilterFocusField.ADDR_GREAT
                         onActiveTfChange(it)
-                    },
-                    modifier = Modifier.weight(1f)
+                    }
                 )
-                Spacer(Modifier.width(6.dp))
-                Box(
-                    Modifier
-                        .size(32.dp)
-                        .clickableWithTooltip { showKeyboard = !showKeyboard },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        Icons.Rounded.Keyboard,
-                        contentDescription = "内置键盘",
-                        tint = if (showKeyboard) Rose.Primary else Rose.TextSecond,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
-            }
+                FilterInputCheckRow(
+                    checked = st.addrLessEnabled,
+                    onCheckChange = { st = st.copy(addrLessEnabled = it) },
+                    label = "地址:  ≤",
+                    value = addrLessTf,
+                    focused = focusedField == FilterFocusField.ADDR_LESS,
+                    suppressSystemKeyboard = showKeyboard,
+                    onFocus = {
+                        focusedField = FilterFocusField.ADDR_LESS
+                    },
+                    onValueChange = {
+                        focusedField = FilterFocusField.ADDR_LESS
+                        onActiveTfChange(it)
+                    }
+                )
 
-            FilterDivider()
+                FilterDivider()
 
-            FilterInputCheckRow(
-                checked = st.addrGreatEnabled,
-                onCheckChange = { st = st.copy(addrGreatEnabled = it) },
-                label = "地址:  ≥",
-                value = addrGreatTf,
-                focused = focusedField == FilterFocusField.ADDR_GREAT,
-                suppressSystemKeyboard = showKeyboard,
-                onFocus = {
-                    focusedField = FilterFocusField.ADDR_GREAT
-                    showKeyboard = true
-                },
-                onValueChange = {
-                    focusedField = FilterFocusField.ADDR_GREAT
-                    onActiveTfChange(it)
-                }
-            )
-            FilterInputCheckRow(
-                checked = st.addrLessEnabled,
-                onCheckChange = { st = st.copy(addrLessEnabled = it) },
-                label = "地址:  ≤",
-                value = addrLessTf,
-                focused = focusedField == FilterFocusField.ADDR_LESS,
-                suppressSystemKeyboard = showKeyboard,
-                onFocus = {
-                    focusedField = FilterFocusField.ADDR_LESS
-                    showKeyboard = true
-                },
-                onValueChange = {
-                    focusedField = FilterFocusField.ADDR_LESS
-                    onActiveTfChange(it)
-                }
-            )
-
-            FilterDivider()
-
-            FilterInputCheckRow(
-                checked = st.valGreatEnabled,
-                onCheckChange = { st = st.copy(valGreatEnabled = it) },
-                label = "数值:  ≥",
-                value = valGreatTf,
-                focused = focusedField == FilterFocusField.VAL_GREAT,
-                suppressSystemKeyboard = showKeyboard,
-                onFocus = {
-                    focusedField = FilterFocusField.VAL_GREAT
-                    showKeyboard = true
-                },
-                onValueChange = {
-                    focusedField = FilterFocusField.VAL_GREAT
-                    onActiveTfChange(it)
-                }
-            )
-            FilterInputCheckRow(
-                checked = st.valLessEnabled,
-                onCheckChange = { st = st.copy(valLessEnabled = it) },
-                label = "数值:  ≤",
-                value = valLessTf,
-                focused = focusedField == FilterFocusField.VAL_LESS,
-                suppressSystemKeyboard = showKeyboard,
-                onFocus = {
-                    focusedField = FilterFocusField.VAL_LESS
-                    showKeyboard = true
-                },
-                onValueChange = {
-                    focusedField = FilterFocusField.VAL_LESS
-                    onActiveTfChange(it)
-                }
-            )
+                FilterInputCheckRow(
+                    checked = st.valGreatEnabled,
+                    onCheckChange = { st = st.copy(valGreatEnabled = it) },
+                    label = "数值:  ≥",
+                    value = valGreatTf,
+                    focused = focusedField == FilterFocusField.VAL_GREAT,
+                    suppressSystemKeyboard = showKeyboard,
+                    onFocus = {
+                        focusedField = FilterFocusField.VAL_GREAT
+                    },
+                    onValueChange = {
+                        focusedField = FilterFocusField.VAL_GREAT
+                        onActiveTfChange(it)
+                    }
+                )
+                FilterInputCheckRow(
+                    checked = st.valLessEnabled,
+                    onCheckChange = { st = st.copy(valLessEnabled = it) },
+                    label = "数值:  ≤",
+                    value = valLessTf,
+                    focused = focusedField == FilterFocusField.VAL_LESS,
+                    suppressSystemKeyboard = showKeyboard,
+                    onFocus = {
+                        focusedField = FilterFocusField.VAL_LESS
+                    },
+                    onValueChange = {
+                        focusedField = FilterFocusField.VAL_LESS
+                        onActiveTfChange(it)
+                    }
+                )
 
             FilterDivider()
 
@@ -1013,7 +1021,6 @@ fun FilterSearchSheet(ui: Ui) {
                     suppressSystemKeyboard = showKeyboard,
                     onFocus = {
                         focusedField = FilterFocusField.FRACTIONAL
-                        showKeyboard = true
                     },
                     onValueChange = {
                         focusedField = FilterFocusField.FRACTIONAL
@@ -1122,16 +1129,16 @@ fun FilterSearchSheet(ui: Ui) {
             FormatCheckItem("ARM (x64)操作码", st.formatArm64, Rose.Violet) {
                 st = st.copy(formatArm64 = it)
             }
-        }
 
-        AnimatedVisibility(showKeyboard, enter = expandEnter(), exit = expandExit()) {
-            Column(Modifier.padding(horizontal = 6.dp, vertical = 4.dp)) {
-                BuiltInKeyboard(
-                    value = activeTf,
-                    onValueChange = ::onActiveTfChange,
-                    onHistory = { Session.openSheet(Sheet.HISTORY) },
-                    onDismiss = { showKeyboard = false }
-                )
+            AnimatedVisibility(showKeyboard, enter = expandEnter(), exit = expandExit()) {
+                Column(Modifier.padding(vertical = 4.dp)) {
+                    BuiltInKeyboard(
+                        value = activeTf,
+                        onValueChange = ::onActiveTfChange,
+                        onHistory = { Session.openSheet(Sheet.HISTORY) },
+                        onDismiss = { showKeyboard = false }
+                    )
+                }
             }
         }
 
@@ -1170,6 +1177,7 @@ fun FilterSearchSheet(ui: Ui) {
                 Session.applyFilter(st)
             }
         }
+    }
     }
 }
 
@@ -1362,15 +1370,28 @@ fun FuzzySearchSheet(ui: Ui) {
     val metrics = LocalUiMetrics.current
     val corner = metrics.dialogCorner.dp
     val cardAlpha = (metrics.bgOpacity + 0.04f).coerceIn(0.55f, 1.0f)
-    Column(
-        Modifier
-            .padding(horizontal = 10.dp)
-            .fillMaxWidth()
-            .clickableNoRipple(remember { MutableInteractionSource() }) {}
-            .background(Rose.Card.copy(alpha = cardAlpha), RoundedCornerShape(corner))
-            .border(1.dp, Rose.Divider, RoundedCornerShape(corner))
-            .padding(horizontal = 14.dp, vertical = 12.dp)
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
     ) {
+        val fallbackHeightDp = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.coerceAtLeast(240)
+        val availHeightDp = if (maxHeight.value.isFinite() && maxHeight.value > 120f) {
+            maxHeight.value.toInt()
+        } else {
+            fallbackHeightDp
+        }
+        val maxCardHeight = (availHeightDp - 10).coerceAtLeast(160).dp
+        Column(
+            Modifier
+                .padding(horizontal = 10.dp, vertical = 4.dp)
+                .fillMaxWidth()
+                .heightIn(max = maxCardHeight)
+                .clickableNoRipple(remember { MutableInteractionSource() }) {}
+                .background(Rose.Card.copy(alpha = cardAlpha), RoundedCornerShape(corner))
+                .border(1.dp, Rose.Divider, RoundedCornerShape(corner))
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 14.dp, vertical = 10.dp)
+        ) {
         if (!hasResults) {
             // 无搜索结果时的初始模糊搜索界面
             Row(
@@ -1934,6 +1955,7 @@ fun FuzzySearchSheet(ui: Ui) {
                 }
             }
         }
+        }
     }
 }
 
@@ -1976,7 +1998,9 @@ private fun FuzzyOptionButton(
 @Composable
 fun MaskSearchSheet(ui: Ui) {
     var addrTf by remember {
-        val init = ui.search.text.ifEmpty { "79F165B???" }
+        val baseHex = java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
+        val fallbackPattern = if (baseHex.length > 3) baseHex.dropLast(3) + "???" else "$baseHex???"
+        val init = ui.search.text.ifEmpty { fallbackPattern }
         mutableStateOf(TextFieldValue(init, TextRange(0, init.length)))
     }
     var maskTf by remember {
@@ -2112,7 +2136,9 @@ fun MaskSearchSheet(ui: Ui) {
 fun PointerSearchSheet(ui: Ui) {
     val defaultAddr = ui.contextItem?.cachedAddressHex
         ?: ui.editing?.cachedAddressHex
-        ?: ui.search.text.ifEmpty { "79F165BD8C" }
+        ?: ui.search.text.ifEmpty {
+            java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
+        }
     var addrTf by remember {
         mutableStateOf(TextFieldValue(defaultAddr, TextRange(0, defaultAddr.length)))
     }

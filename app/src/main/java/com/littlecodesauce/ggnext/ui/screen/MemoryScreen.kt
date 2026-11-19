@@ -48,6 +48,7 @@ import com.littlecodesauce.ggnext.ui.components.clickableLongPress
 import com.littlecodesauce.ggnext.ui.components.clickableWithTooltip
 import com.littlecodesauce.ggnext.ui.components.fsp
 import com.littlecodesauce.ggnext.ui.components.monoStyle
+import com.littlecodesauce.ggnext.ui.components.rememberPersistentLazyListState
 import com.littlecodesauce.ggnext.ui.components.tr
 import com.littlecodesauce.ggnext.ui.components.valueText
 import com.littlecodesauce.ggnext.ui.theme.Motion
@@ -57,16 +58,13 @@ import com.littlecodesauce.ggnext.ui.theme.pointerTypeLabel
 import com.littlecodesauce.ggnext.ui.theme.typeColor
 import kotlinx.coroutines.launch
 
-/**
- * 内存编辑器页：
- * - 界面调整 5：删除内存功能页上的快捷按钮（顶部右侧快捷胶囊按钮、右下角浮动快捷圆钮、空状态快捷按钮），
- *   仅保留左上角跳转地址 `0x...`（点击自动定位到该地址）与内存地址列表。
- * - 界面调整 3：采用与滚动容器协同的 clickableLongPress，手指在任意地址或按钮上滑动时均可顺畅上下滚动。
- */
 @Composable
 fun MemoryScreen(ui: Ui) {
-    val listState = rememberLazyListState()
+    val listState = rememberPersistentLazyListState("memory_list")
     val scope = rememberCoroutineScope()
+    var lastHandledMemoryScrollTrigger by androidx.compose.runtime.saveable.rememberSaveable {
+        androidx.compose.runtime.mutableIntStateOf(-1)
+    }
 
     val firstAddr = ui.memoryRows.firstOrNull()?.address ?: 0L
     val lastAddr = ui.memoryRows.lastOrNull()?.address ?: 0L
@@ -74,17 +72,20 @@ fun MemoryScreen(ui: Ui) {
     val topJumpOffset = if (hasTopBoundary) 1 else 0
 
     LaunchedEffect(ui.memoryScrollTrigger, ui.memoryHighlightAddress, ui.memoryRows.size) {
-        val targetAddr = ui.memoryHighlightAddress
-        if (targetAddr != null && ui.memoryRows.isNotEmpty()) {
-            val idx = ui.memoryRows.indexOfFirst { it.address == targetAddr }
-            if (idx >= 0) {
-                val listIdx = idx + topJumpOffset
-                val scrollIdx = when {
-                    idx == 0 -> listIdx
-                    idx >= ui.memoryRows.lastIndex - 1 -> (listIdx - 4).coerceAtLeast(0)
-                    else -> (listIdx - 2).coerceAtLeast(0)
+        if (ui.memoryScrollTrigger != lastHandledMemoryScrollTrigger && ui.memoryRows.isNotEmpty()) {
+            lastHandledMemoryScrollTrigger = ui.memoryScrollTrigger
+            val targetAddr = ui.memoryHighlightAddress
+            if (targetAddr != null) {
+                val idx = ui.memoryRows.indexOfFirst { it.address == targetAddr }
+                if (idx >= 0) {
+                    val listIdx = idx + topJumpOffset
+                    val scrollIdx = when {
+                        idx == 0 -> listIdx
+                        idx >= ui.memoryRows.lastIndex - 1 -> (listIdx - 4).coerceAtLeast(0)
+                        else -> (listIdx - 2).coerceAtLeast(0)
+                    }
+                    listState.scrollToItem(scrollIdx)
                 }
-                listState.scrollToItem(scrollIdx)
             }
         }
     }
@@ -127,7 +128,7 @@ fun MemoryScreen(ui: Ui) {
                     }
                     itemsIndexed(
                         items = ui.memoryRows,
-                        key = { idx, i -> "${i.address}_$idx" },
+                        key = { _, i -> i.address },
                         contentType = { _, _ -> "mem_row" }
                     ) { _, item ->
                         MemoryRow(
@@ -159,7 +160,9 @@ private fun MemoryBoundaryJumpButton(
     isUpward: Boolean
 ) {
     val bgOpacity = com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics.current.bgOpacity.coerceIn(0.25f, 1.0f)
-    val addrHex = remember(targetAddress) { Formatter.addr(targetAddress) }
+    val addrHex = remember(targetAddress) {
+        "0x" + java.lang.Long.toHexString(targetAddress).uppercase()
+    }
     var pressed by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(if (pressed) 0.98f else 1f, Motion.Fast, label = "memBoundaryScale")
 

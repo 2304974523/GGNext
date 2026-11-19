@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
@@ -35,6 +36,134 @@ inline std::string stripDeleted(const std::string& raw) {
 
 } // anonymous namespace
 
+// ============================================================================
+// VmaIndex Implementation (Inspired by KittyPtrValidator & frida-gum)
+// ============================================================================
+VmaIndex::VmaIndex(std::vector<VmaRegion> regions) {
+    rebuild(std::move(regions));
+}
+
+VmaIndex::VmaIndex(const VmaIndex& other)
+    : m_regions(other.m_regions),
+      m_lastHitIdx(other.m_lastHitIdx.load(std::memory_order_relaxed)) {}
+
+VmaIndex& VmaIndex::operator=(const VmaIndex& other) {
+    if (this != &other) {
+        m_regions = other.m_regions;
+        m_lastHitIdx.store(other.m_lastHitIdx.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    return *this;
+}
+
+VmaIndex::VmaIndex(VmaIndex&& other) noexcept
+    : m_regions(std::move(other.m_regions)),
+      m_lastHitIdx(other.m_lastHitIdx.load(std::memory_order_relaxed)) {
+    other.m_lastHitIdx.store(0, std::memory_order_relaxed);
+}
+
+VmaIndex& VmaIndex::operator=(VmaIndex&& other) noexcept {
+    if (this != &other) {
+        m_regions = std::move(other.m_regions);
+        m_lastHitIdx.store(other.m_lastHitIdx.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        other.m_lastHitIdx.store(0, std::memory_order_relaxed);
+    }
+    return *this;
+}
+
+void VmaIndex::rebuild(std::vector<VmaRegion> regions) {
+    m_regions = std::move(regions);
+    if (m_regions.size() > 1) {
+        auto cmp = [](const VmaRegion& a, const VmaRegion& b) noexcept {
+            return a.startAddress < b.startAddress;
+        };
+        if (!std::is_sorted(m_regions.begin(), m_regions.end(), cmp)) {
+            std::sort(m_regions.begin(), m_regions.end(), cmp);
+        }
+    }
+    m_lastHitIdx.store(0, std::memory_order_relaxed);
+}
+
+void VmaIndex::clear() noexcept {
+    m_regions.clear();
+    m_lastHitIdx.store(0, std::memory_order_relaxed);
+}
+
+const VmaRegion* VmaIndex::findRegion(uintptr_t rawAddr, bool is64Bit) const noexcept {
+    if (m_regions.empty()) return nullptr;
+    const uintptr_t addr = static_cast<uintptr_t>(ArchPtrPolicy::untag(rawAddr, is64Bit));
+
+    // 1. Check MRU cached region index first (O(1) sequential locality hit)
+    size_t hint = m_lastHitIdx.load(std::memory_order_relaxed);
+    if (hint < m_regions.size() && m_regions[hint].contains(addr)) {
+        return &m_regions[hint];
+    }
+    if (hint + 1 < m_regions.size() && m_regions[hint + 1].contains(addr)) {
+        m_lastHitIdx.store(hint + 1, std::memory_order_relaxed);
+        return &m_regions[hint + 1];
+    }
+
+    // 2. Binary search via std::lower_bound (O(log N))
+    auto it = std::lower_bound(
+        m_regions.begin(),
+        m_regions.end(),
+        addr,
+        [](const VmaRegion& r, uintptr_t a) noexcept {
+            return r.endAddress <= a;
+        }
+    );
+
+    if (it != m_regions.end() && it->contains(addr)) {
+        size_t idx = static_cast<size_t>(it - m_regions.begin());
+        m_lastHitIdx.store(idx, std::memory_order_relaxed);
+        return &(*it);
+    }
+    return nullptr;
+}
+
+bool VmaIndex::isSpanReadable(uintptr_t rawAddr, size_t len, bool is64Bit) const noexcept {
+    if (len == 0 || m_regions.empty()) return false;
+    uintptr_t cur = static_cast<uintptr_t>(ArchPtrPolicy::untag(rawAddr, is64Bit));
+    uintptr_t end = cur + len;
+    if (end < cur) return false; // Overflow
+
+    while (cur < end) {
+        const VmaRegion* r = findRegion(cur, false);
+        if (!r || !r->readable || r->regionFlag == RegionFlag::B) {
+            return false;
+        }
+        cur = r->endAddress;
+    }
+    return true;
+}
+
+uint32_t VmaIndex::classifyPointer(uintptr_t rawPtrVal, bool is64Bit) const noexcept {
+    if (!ArchPtrPolicy::isCanonicalUserPtr(rawPtrVal, is64Bit)) {
+        return PointerProtMask::NONE;
+    }
+    const uintptr_t addr = static_cast<uintptr_t>(ArchPtrPolicy::untag(rawPtrVal, is64Bit));
+    const VmaRegion* r = findRegion(addr, false);
+    if (!r) return PointerProtMask::NONE;
+    return r->pointerProtClass();
+}
+
+const char* VmaIndex::regionTagAt(uintptr_t rawAddr, bool is64Bit) const noexcept {
+    const VmaRegion* r = findRegion(rawAddr, is64Bit);
+    return r ? regionFlagToTag(r->regionFlag) : "O";
+}
+
+uintptr_t VmaIndex::firstRegionBase(uint32_t regionFlag) const noexcept {
+    for (const auto& r : m_regions) {
+        if (!r.readable || r.regionFlag == RegionFlag::B) continue;
+        if (regionFlag == 0 || (r.regionFlag & regionFlag) != 0) {
+            return r.startAddress;
+        }
+    }
+    return 0;
+}
+
+// ============================================================================
+// MapsParser Implementation
+// ============================================================================
 uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFileBackedPath) {
     if (vma.length == 0) {
         return RegionFlag::B;
@@ -50,8 +179,6 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
     }
 
     // 2. Bad (B): Fonts, ICU/Hyphenation Data (~137 MB), Kernel Trap Pages, Binder & Special Device Nodes
-    // Checked BEFORE !vma.readable so ---p guard/reservation mappings (3.5+ GB) fall into O (Other) just like original GG,
-    // while genuine Bad mappings are tagged B (~137 MB). Both B and !vma.readable are skipped during scanning via isScanSafe().
     if (endsWith(path, ".ttf") || endsWith(path, ".otf") || endsWith(path, ".ttc") || endsWith(path, ".woff") ||
         containsStr(path, "/system/fonts/") || containsStr(path, "/product/fonts/") || containsStr(path, "/vendor/fonts/") ||
         startsWith(path, "/system/usr/icu/") || startsWith(path, "/apex/com.android.i18n/etc/icu/") ||
@@ -70,7 +197,6 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
     }
 
     // 3. Unreadable / PROT_NONE virtual address reservations (---p) -> O (Other)
-    // Original GG counts ---p reservations in O (~3.9 GB), while VmaRegion::isScanSafe() skips !readable pages.
     if (!vma.readable) {
         return RegionFlag::O;
     }
@@ -86,8 +212,6 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
     }
 
     // 5. Executable Code Regions: App Code (Xa) vs System Code (Xs)
-    // Original GG strictly separates app binaries (/data/app, /data/user, app dalvik-cache) into Xa (~16 MB)
-    // and all system/APEX/vendor libraries, boot/system dalvik-cache, [vdso], and ART JIT code-cache into Xs (~151 MB).
     if (vma.executable) {
         if (path == "[vdso]" || path == "[vsyscall]" ||
             startsWith(path, "/memfd:jit-") ||
@@ -125,7 +249,6 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
     }
 
     // 8. Java Heap (Jh) vs Java Runtime Structures (J)
-    // Non-executable /memfd:jit-cache and /memfd:jit-zygote-cache belong to J (NOT As!).
     if (startsWith(path, "/memfd:jit-")) {
         return RegionFlag::J;
     }
@@ -152,8 +275,6 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
             containsStr(path, "aux-structure") ||
             containsStr(path, "CompilerMetadata") ||
             containsStr(path, "jit") ||
-            containsStr(path, "zygote") ||
-            containsStr(path, "non moving") ||
             containsStr(path, "image space") ||
             containsStr(path, "intern table") ||
             containsStr(path, "class table");
@@ -163,6 +284,8 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
             containsStr(path, "alloc space") ||
             containsStr(path, "region space") ||
             containsStr(path, "large object") ||
+            containsStr(path, "non moving space") ||
+            containsStr(path, "zygote space") ||
             containsStr(path, "bump-pointer") ||
             containsStr(path, "rosalloc") ||
             containsStr(path, "dlmalloc") ||
@@ -193,19 +316,18 @@ uint32_t MapsParser::classifyVma(const VmaRegion& vma, const std::string& prevFi
         return RegionFlag::CB;
     }
     if (path.empty() && vma.writable && !vma.executable && vma.isPrivate && !prevFileBackedPath.empty()) {
-        if (endsWith(prevFileBackedPath, ".so") || containsStr(prevFileBackedPath, ".so!")) {
+        if (endsWith(prevFileBackedPath, ".so") || containsStr(prevFileBackedPath, ".so!") || endsWith(prevFileBackedPath, ".apk")) {
             return RegionFlag::CB;
         }
     }
 
-    // 11. C++ .data Segment (Cd): Writable private segment of an ELF shared library (.so / .oat / .odex)
+    // 11. C++ .data Segment (Cd): Writable private segment of an ELF shared library (.so / .oat / .odex / uncompressed .apk)
     if (vma.writable && vma.isPrivate &&
-        (endsWith(path, ".so") || containsStr(path, ".so!") || endsWith(path, ".oat") || endsWith(path, ".odex"))) {
+        (endsWith(path, ".so") || containsStr(path, ".so!") || endsWith(path, ".oat") || endsWith(path, ".odex") || endsWith(path, ".apk"))) {
         return RegionFlag::CD;
     }
 
     // 12. Ashmem Shared Memory (As)
-    // Strictly genuine Ashmem (/dev/ashmem excluding dalvik/jit/gralloc, [anon:ashmem, /memfd:ashmem).
     if ((startsWith(path, "/dev/ashmem") && !containsStr(path, "dalvik") &&
          !containsStr(path, "jit") && !containsStr(path, "gralloc") && !containsStr(path, "GFX")) ||
         startsWith(path, "[anon:ashmem") || startsWith(path, "/memfd:ashmem")) {
@@ -241,7 +363,6 @@ std::vector<VmaRegion> MapsParser::parseMapsContent(const std::string& content, 
 
         if (lineLen == 0) continue;
 
-        // Parse: start-end perms offset dev inode [pathname]
         char* endPtr = nullptr;
         unsigned long long start = std::strtoull(linePtr, &endPtr, 16);
         if (!endPtr || *endPtr != '-') continue;
@@ -290,10 +411,9 @@ std::vector<VmaRegion> MapsParser::parseMapsContent(const std::string& content, 
 
         vma.regionFlag   = classifyVma(vma, prevFileBackedPath);
 
-        // Track last file-backed .so mapping to accurately tag the single immediately following unnamed rw-p as Cb (.bss)
         if (!vma.pathname.empty() && vma.pathname[0] == '/') {
             prevFileBackedPath = stripDeleted(vma.pathname);
-        } else {
+        } else if (vma.regionFlag != RegionFlag::CB) {
             prevFileBackedPath.clear();
         }
 
@@ -332,12 +452,11 @@ bool MapsParser::querySmapsForAddress(int pid, uintptr_t targetStart, SmapsDetai
     bool inTargetVma = false;
 
     while (std::fgets(line, sizeof(line), fp)) {
-        // Check header line: hex-hex perms ...
         if (std::isxdigit(static_cast<unsigned char>(line[0]))) {
             char* endPtr = nullptr;
             unsigned long long start = std::strtoull(line, &endPtr, 16);
             if (endPtr && *endPtr == '-') {
-                if (inTargetVma) break; // Finished reading target VMA block
+                if (inTargetVma) break;
                 if (static_cast<uintptr_t>(start) == targetStart) {
                     inTargetVma = true;
                 }

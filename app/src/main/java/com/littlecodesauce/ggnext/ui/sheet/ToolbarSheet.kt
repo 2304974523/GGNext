@@ -137,7 +137,7 @@ fun ToolbarSheet(ui: Ui) {
             Column(
                 Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 480.dp)
+                    .weight(1f, fill = false)
                     .verticalScroll(scrollState, enabled = draggingPinnedTool == null && draggingFlowingTool == null)
             ) {
                 // ==================== 第一区：固定工具栏 (右侧常驻) ====================
@@ -473,7 +473,7 @@ fun ToolbarPickSheet(ui: Ui) {
                 }
             }
             Spacer(Modifier.height(10.dp))
-            Column(Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState())) {
+            Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
                 ALL_TOOLS.forEach { id ->
                     val on = current.contains(id)
                     Row(

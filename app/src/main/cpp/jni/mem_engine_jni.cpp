@@ -62,6 +62,7 @@ struct NativeEngineSession {
     std::unique_ptr<mem_engine::ValueLocker>  locker;
     mem_engine::CancellationToken             cancelToken;
     std::vector<mem_engine::VmaRegion>        cachedAllRegions;
+    mem_engine::VmaIndex                      vmaIndex;
 
     explicit NativeEngineSession(size_t threads, const std::string& spillDir)
         : scanner(std::make_unique<mem_engine::SearchEngine>(io, threads, spillDir)),
@@ -73,6 +74,7 @@ struct NativeEngineSession {
         } else {
             cachedAllRegions.clear();
         }
+        vmaIndex.rebuild(cachedAllRegions);
     }
 };
 
@@ -542,6 +544,7 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionTotals(
         session->refreshAllRegions();
     } else if (pid > 0) {
         session->cachedAllRegions = mem_engine::MapsParser::parseProcessMaps(static_cast<int>(pid), 0, false);
+        session->vmaIndex.rebuild(session->cachedAllRegions);
     }
 
     // 45 longs: [size_0..size_14, base_0..base_14, count_0..count_14] in GGNext RegionCatalog.ALL order
@@ -579,13 +582,11 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionCodeAt(
     if (!session) return env->NewStringUTF("O");
     std::lock_guard<std::mutex> lk(session->mtx);
 
-    uintptr_t uaddr = static_cast<uintptr_t>(address) & 0x00FFFFFFFFFFFFFFULL;
-    for (const auto& r : session->cachedAllRegions) {
-        if (uaddr >= r.startAddress && uaddr < r.endAddress) {
-            return env->NewStringUTF(mem_engine::regionFlagToTag(r.regionFlag));
-        }
-    }
-    return env->NewStringUTF("O");
+    const char* tag = session->vmaIndex.regionTagAt(
+        static_cast<uintptr_t>(address),
+        session->io.targetIs64Bit()
+    );
+    return env->NewStringUTF(tag);
 }
 
 JNIEXPORT jint JNICALL
@@ -599,20 +600,11 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeClassifyPointer(
     if (!session) return 0;
     std::lock_guard<std::mutex> lk(session->mtx);
 
-    // Strip ARM64 Top-Byte-Ignore (TBI) tag bits
-    uintptr_t uaddr = static_cast<uintptr_t>(ptrValue) & 0x00FFFFFFFFFFFFFFULL;
-    if (uaddr < 0x10000ULL) return 0;
-
-    for (const auto& r : session->cachedAllRegions) {
-        if (uaddr >= r.startAddress && uaddr < r.endAddress) {
-            if (!r.readable) return 0;
-            if (r.writable && r.executable) return 1; // WX
-            if (r.executable) return 2;               // X
-            if (r.writable) return 16;                // W
-            return 8;                                 // RO
-        }
-    }
-    return 0;
+    uint32_t mask = session->vmaIndex.classifyPointer(
+        static_cast<uint64_t>(ptrValue),
+        session->io.targetIs64Bit()
+    );
+    return static_cast<jint>(mask);
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -798,6 +790,56 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineRange(
     return Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineRange(
         env, reinterpret_cast<jobject>(clazz), handle, dataType, intMin, intMax, floatMin, floatMax, inclusive
     );
+}
+
+JNIEXPORT jint JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchPointers(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
+    jlong handle,
+    jint dataType,
+    jlong targetAddress,
+    jlong maxOffset,
+    jint protMask,
+    jboolean aligned
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->searchPointers(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<uintptr_t>(targetAddress),
+        static_cast<uint64_t>(maxOffset >= 0 ? maxOffset : -maxOffset),
+        static_cast<uint32_t>(protMask),
+        aligned == JNI_TRUE,
+        &session->cancelToken
+    );
+    return static_cast<jint>(rc);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefinePointers(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
+    jlong handle,
+    jint dataType,
+    jlong targetAddress,
+    jlong maxOffset,
+    jint protMask
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->refinePointers(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<uintptr_t>(targetAddress),
+        static_cast<uint64_t>(maxOffset >= 0 ? maxOffset : -maxOffset),
+        static_cast<uint32_t>(protMask),
+        &session->cancelToken
+    );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jint JNICALL
@@ -1041,13 +1083,17 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetCandidatesPacked
     if (slice.empty()) return env->NewLongArray(0);
 
     size_t count = slice.size();
-    // Pack 3 longs per candidate: [address, rawValue, (type | (regionTag << 8))]
+    // Pack 3 longs per candidate: [address, rawValue, (type | (regionTag << 8) | (flags << 16))]
     std::vector<jlong> packed(count * 3);
     for (size_t i = 0; i < count; ++i) {
         const auto& c = slice[i];
         packed[i * 3 + 0] = static_cast<jlong>(c.address);
         packed[i * 3 + 1] = static_cast<jlong>(c.rawValue);
-        packed[i * 3 + 2] = static_cast<jlong>(static_cast<uint64_t>(c.type) | (static_cast<uint64_t>(c.regionTag) << 8));
+        packed[i * 3 + 2] = static_cast<jlong>(
+            static_cast<uint64_t>(c.type) |
+            (static_cast<uint64_t>(c.regionTag) << 8) |
+            (static_cast<uint64_t>(c.flags) << 16)
+        );
     }
 
     jlongArray arr = env->NewLongArray(static_cast<jsize>(count * 3));
@@ -1055,6 +1101,38 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetCandidatesPacked
         env->SetLongArrayRegion(arr, 0, static_cast<jsize>(count * 3), packed.data());
     }
     return arr;
+}
+
+JNIEXPORT void JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRemoveCandidates(
+    JNIEnv* env,
+    jclass /*clazz*/,
+    jlong handle,
+    jlongArray addressesJarr
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session || !addressesJarr) return;
+    std::lock_guard<std::mutex> lk(session->mtx);
+
+    jsize len = env->GetArrayLength(addressesJarr);
+    if (len <= 0) return;
+    jlong* ptr = env->GetLongArrayElements(addressesJarr, nullptr);
+    if (!ptr) return;
+
+    session->scanner->removeCandidates(reinterpret_cast<const uint64_t*>(ptr), static_cast<size_t>(len));
+    env->ReleaseLongArrayElements(addressesJarr, ptr, 0);
+}
+
+JNIEXPORT void JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeClearSession(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
+    jlong handle
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return;
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->scanner->clearSession();
 }
 
 JNIEXPORT void JNICALL
@@ -1068,6 +1146,64 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeLockAddress(
     Java_com_qa_memengine_MemDiagnosticEngine_nativeLockAddress(
         env, reinterpret_cast<jobject>(clazz), handle, address, bytesJarr
     );
+}
+
+JNIEXPORT void JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeLockAddressConfigured(
+    JNIEnv* env,
+    jclass /*clazz*/,
+    jlong handle,
+    jlong address,
+    jbyteArray bytesJarr,
+    jint dataType,
+    jint freezeMode,
+    jlong minVal,
+    jlong maxVal
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session || !bytesJarr) return;
+    std::lock_guard<std::mutex> lk(session->mtx);
+
+    jsize len = env->GetArrayLength(bytesJarr);
+    jbyte* ptr = env->GetByteArrayElements(bytesJarr, nullptr);
+    if (!ptr) return;
+
+    session->locker->lockAddressConfigured(
+        static_cast<uintptr_t>(address),
+        ptr,
+        static_cast<size_t>(len),
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<mem_engine::FreezeMode>(freezeMode),
+        static_cast<int64_t>(minVal),
+        static_cast<int64_t>(maxVal)
+    );
+    env->ReleaseByteArrayElements(bytesJarr, ptr, 0);
+}
+
+JNIEXPORT void JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSetFreezePaused(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
+    jlong handle,
+    jboolean paused
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return;
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->locker->setPaused(paused == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSetFreezeIntervalMs(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
+    jlong handle,
+    jint intervalMs
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session || intervalMs <= 0) return;
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->locker->setIntervalMs(static_cast<uint32_t>(intervalMs));
 }
 
 JNIEXPORT void JNICALL

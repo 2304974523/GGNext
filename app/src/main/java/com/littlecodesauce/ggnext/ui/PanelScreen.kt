@@ -130,7 +130,11 @@ fun PanelScreen(
                 Modifier
                     .fillMaxSize()
                     .clickableNoRipple(remember { MutableInteractionSource() }) {
-                        if (ui.sheet != Sheet.NONE) Session.closeSheet() else onMinimize()
+                        // Bug 2.2 修复：屏幕占比 < 100% 时，点击修改器面板外空白处不将修改器最小化；
+                        // 仅当存在弹窗界面 (ui.sheet != Sheet.NONE) 时，点击空白处关闭当前弹窗。
+                        if (ui.sheet != Sheet.NONE) {
+                            Session.closeSheet()
+                        }
                     }
             )
         }
@@ -239,10 +243,10 @@ fun PanelScreen(
                     onClick = { Session.openSheet(Sheet.REGION) }
                 )
             }
-
-            SheetHost(ui)
-            ui.toast?.let { ToastBubble(it) { Session.consumeToast() } }
         }
+
+        SheetHost(ui)
+        ui.toast?.let { ToastBubble(it) { Session.consumeToast() } }
     }
 }
 

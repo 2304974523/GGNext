@@ -63,6 +63,7 @@ import com.littlecodesauce.ggnext.ui.components.clickableWithTooltip
 import com.littlecodesauce.ggnext.ui.components.dialogEnter
 import com.littlecodesauce.ggnext.ui.components.dialogExit
 import com.littlecodesauce.ggnext.ui.components.fsp
+import com.littlecodesauce.ggnext.ui.components.rememberPersistentLazyListState
 import com.littlecodesauce.ggnext.ui.components.tr
 import com.littlecodesauce.ggnext.ui.theme.Motion
 import com.littlecodesauce.ggnext.ui.theme.Rose
@@ -85,10 +86,12 @@ fun SettingsScreen(ui: Ui, embedded: Boolean = false) {
 
     var confirmKillProcess by remember { mutableStateOf(false) }
     var confirmExitApp by remember { mutableStateOf(false) }
+    val listState = rememberPersistentLazyListState(if (embedded) "home_settings_list" else "settings_list")
 
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
-            Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize(),
+            state = listState,
             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {

@@ -10,7 +10,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import java.util.Locale
 import java.util.zip.ZipFile
 
 /**
@@ -20,23 +19,42 @@ import java.util.zip.ZipFile
  * 与 SELinux 限制无法直接打开其他 UID 进程的 `/proc/<pid>/mem` 或调用 `process_vm_readv` 的核心问题。
  *
  * 通过在持久化的 `su` (`uid=0`) 进程中运行原生编译的 `libmem_engine_root.so`，
- * 实现 100% 真实的跨进程 VMA 区域解析、ARM64 NEON SIMD 搜索、内存读写、内存复制/导出与高频锁值。
+ * 实现 100% 真实的跨进程 VMA 区域解析、ARM64 NEON SIMD 搜索、原生指针链扫描、内存读写、内存复制/导出与高频锁值。
  */
 object RootMemDaemon {
 
     private var process: Process? = null
     private var writer: BufferedWriter? = null
     private var reader: BufferedReader? = null
+    private var stderrThread: Thread? = null
     private var lastAppContext: Context? = null
     private var lastAttachedPid: Int = 0
     private var lastRegionMask: Int = 0x3FFF
     private var isRecovering: Boolean = false
+
+    @Volatile
+    var lastStartError: String = ""
+        private set
 
     data class RawCandidate(
         val address: Long,
         val rawValue: Long,
         val meta: Int
     )
+
+    private fun shellQuote(s: String): String =
+        "'" + s.replace("'", "'\"'\"'") + "'"
+
+    /**
+     * 无损格式化 IEEE-754 双精度浮点数供 C++ `std::istringstream` 解析，
+     * 避免 `String.format("%.8f")` 截断极小浮点数 (`1e-9` -> `0.00000000`) 或科学计数法精度丢失。
+     */
+    private fun formatDouble(v: Double): String = when {
+        v.isNaN() -> "0.0"
+        v == Double.POSITIVE_INFINITY -> "1.7976931348623157E308"
+        v == Double.NEGATIVE_INFINITY -> "-1.7976931348623157E308"
+        else -> java.lang.Double.toString(v)
+    }
 
     @Synchronized
     fun ensureStarted(context: Context?): Boolean {
@@ -45,46 +63,135 @@ object RootMemDaemon {
         }
         if (isAlive()) return true
         stop()
-        if (!Shell.hasRoot()) return false
+        lastStartError = ""
+        if (!Shell.hasRoot()) {
+            lastStartError = "未获取到 Root (su) 权限"
+            return false
+        }
 
         val ctx = context ?: lastAppContext
-        val binPath = resolveExecutablePath(ctx) ?: return false
+        val binPath = resolveExecutablePath(ctx)
+        if (binPath == null) {
+            lastStartError = "未找到 libmem_engine_root.so 可执行引擎"
+            return false
+        }
         val spillDir = ctx?.cacheDir?.absolutePath ?: "/data/local/tmp"
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
+        val nativeDir = ctx?.applicationInfo?.nativeLibraryDir
 
+        // 依次尝试全局挂载命名空间 (--mount-master / -mm) 与标准 su，
+        // 统一通过 `su -c <script>` 传递启动脚本，彻底避免 mksh 读取缓冲吞掉 stdin 中的首条 `PING` 指令
+        val variants = listOf(
+            listOf("su", "--mount-master", "-c"),
+            listOf("su", "-mm", "-c"),
+            listOf("su", "-c")
+        )
+        for (suPrefix in variants) {
+            if (tryStartDaemonProcess(suPrefix, binPath, spillDir, threads, nativeDir)) {
+                lastStartError = ""
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun tryStartDaemonProcess(
+        suPrefix: List<String>,
+        binPath: String,
+        spillDir: String,
+        threads: Int,
+        nativeDir: String?
+    ): Boolean {
         return try {
-            val pb = ProcessBuilder("su")
+            val binDir = File(binPath).parent ?: "/data/local/tmp"
+            // 绝不可将 /system/lib64 或 /system/lib 注入 LD_LIBRARY_PATH，
+            // 否则在 Android 10~15 APEX Bionic 环境下会覆盖 runtime bionic 导致 linker 崩溃
+            val appLibDirs = listOfNotNull(nativeDir, binDir).distinct().joinToString(":")
+
+            val stageTmp = "/data/local/tmp/.ggnext_root_daemon"
+            val stageDev = "/dev/.ggnext_root_daemon"
+            val qSpill = shellQuote(spillDir)
+            val qBin = shellQuote(binPath)
+            val qStageTmp = shellQuote(stageTmp)
+            val qStageDev = shellQuote(stageDev)
+
+            // 所有前置准备工作严格重定向 >/dev/null 2>&1，确保不污染 stdout 握手协议；
+            // 先 rm -f 再 cp -f 消除重复启动时的 ETXTBSY (Text file busy)；
+            // 仅当 exit code 为 126/127 (无法 exec) 时才回退下一路径。
+            val launchScript = buildString {
+                append("magiskpolicy --live \"allow su proc_mem file *\" \"allow magisk proc_mem file *\" >/dev/null 2>&1 || ")
+                append("ksud sepolicy patch \"allow su proc_mem file *\" >/dev/null 2>&1 || true; ")
+                append("mkdir -p ").append(qSpill).append(" >/dev/null 2>&1 || true; ")
+                append("rm -f ").append(qStageTmp).append(' ').append(qStageDev).append(" >/dev/null 2>&1 || true; ")
+                if (appLibDirs.isNotEmpty()) {
+                    append("export LD_LIBRARY_PATH=").append(shellQuote(appLibDirs)).append("; ")
+                }
+                append("if cp -f ").append(qBin).append(' ').append(qStageTmp).append(" >/dev/null 2>&1; then ")
+                append("chmod 755 ").append(qStageTmp).append(" >/dev/null 2>&1 || true; ")
+                append("chcon u:object_r:system_file:s0 ").append(qStageTmp)
+                    .append(" >/dev/null 2>&1 || chcon u:object_r:shell_data_file:s0 ").append(qStageTmp)
+                    .append(" >/dev/null 2>&1 || true; ")
+                append(qStageTmp).append(' ').append(qSpill).append(' ').append(threads).append("; ")
+                append("rc=$?; if [ \"\$rc\" -ne 126 ] && [ \"\$rc\" -ne 127 ]; then exit \"\$rc\"; fi; ")
+                append("fi; ")
+                append("if cp -f ").append(qBin).append(' ').append(qStageDev).append(" >/dev/null 2>&1; then ")
+                append("chmod 755 ").append(qStageDev).append(" >/dev/null 2>&1 || true; ")
+                append("chcon u:object_r:system_file:s0 ").append(qStageDev).append(" >/dev/null 2>&1 || true; ")
+                append(qStageDev).append(' ').append(qSpill).append(' ').append(threads).append("; ")
+                append("rc=$?; if [ \"\$rc\" -ne 126 ] && [ \"\$rc\" -ne 127 ]; then exit \"\$rc\"; fi; ")
+                append("fi; ")
+                append("chmod 755 ").append(qBin).append(" >/dev/null 2>&1 || true; ")
+                append("exec ").append(qBin).append(' ').append(qSpill).append(' ').append(threads)
+            }
+
+            val pb = ProcessBuilder(suPrefix + launchScript)
             pb.redirectErrorStream(false)
             val p = pb.start()
             val w = BufferedWriter(OutputStreamWriter(p.outputStream, Charsets.UTF_8))
             val r = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
 
-            val binDir = File(binPath).parent ?: "/data/local/tmp"
-            val nativeDir = ctx?.applicationInfo?.nativeLibraryDir
-            val libDirs = listOfNotNull(nativeDir, binDir, "/system/lib64", "/system/lib")
-                .distinct()
-                .joinToString(":")
-            // 赋予可执行权限并注入 LD_LIBRARY_PATH (c++_shared) 后直接 exec 启动 C++20 Root 引擎守护进程
-            w.write("chmod 755 \"$binPath\" 2>/dev/null || true\n")
-            w.write("export LD_LIBRARY_PATH=\"$libDirs:\${LD_LIBRARY_PATH:-}\"\n")
-            w.write("exec \"$binPath\" \"$spillDir\" $threads\n")
-            w.flush()
+            val stderrLines = java.util.Collections.synchronizedList(ArrayList<String>(8))
+            val errThread = Thread({
+                try {
+                    BufferedReader(InputStreamReader(p.errorStream, Charsets.UTF_8)).use { errReader ->
+                        while (true) {
+                            val errLine = errReader.readLine() ?: break
+                            if (stderrLines.size < 16) {
+                                stderrLines.add(errLine)
+                            }
+                            AppLog.w("RootMemDaemon[stderr]", errLine)
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }, "RootMemDaemon-stderr").apply {
+                isDaemon = true
+                start()
+            }
 
             process = p
             writer = w
             reader = r
+            stderrThread = errThread
 
             val pong = sendRawLocked("PING")
             val ok = pong != null && pong.startsWith("OK")
             if (ok) {
-                AppLog.i("RootMemDaemon", "Started uid=0 C++20 MemEngine daemon: $binPath")
+                AppLog.i("RootMemDaemon", "Started uid=0 C++20 MemEngine daemon (${suPrefix.joinToString(" ")}): $binPath")
             } else {
-                AppLog.w("RootMemDaemon", "Failed to receive PONG from $binPath (resp=$pong)")
+                val errSummary = stderrLines.joinToString(" | ").take(200)
+                lastStartError = buildString {
+                    append("${suPrefix.joinToString(" ")} 握手失败")
+                    if (pong != null) append(" (resp=${pong.take(80)})")
+                    if (errSummary.isNotEmpty()) append(": $errSummary")
+                }
+                AppLog.w("RootMemDaemon", lastStartError)
                 stop()
             }
             ok
         } catch (t: Throwable) {
-            AppLog.e("RootMemDaemon", "Failed to start RootMemDaemon", t)
+            lastStartError = "${suPrefix.joinToString(" ")} 异常: ${t.message}"
+            AppLog.e("RootMemDaemon", lastStartError, t)
             stop()
             false
         }
@@ -98,7 +205,7 @@ object RootMemDaemon {
         } catch (_: Throwable) {
         }
         try {
-             reader?.close()
+            reader?.close()
         } catch (_: Throwable) {
         }
         try {
@@ -112,6 +219,7 @@ object RootMemDaemon {
         process = null
         writer = null
         reader = null
+        stderrThread = null
     }
 
     private fun isAlive(): Boolean {
@@ -132,30 +240,33 @@ object RootMemDaemon {
             return directSo.absolutePath
         }
 
-        // 若系统未解压 nativeLibs，则直接从 APK (sourceDir) 中提取对应 ABI 的 libmem_engine_root.so 与 libc++_shared.so
         val extractDir = context.codeCacheDir ?: context.filesDir
         val extracted = File(extractDir, "libmem_engine_root.so")
         val extractedCpp = File(extractDir, "libc++_shared.so")
-        if (extracted.exists() && extracted.length() > 0L && extractedCpp.exists() && extractedCpp.length() > 0L) {
-            extracted.setExecutable(true, false)
-            return extracted.absolutePath
-        }
-
-        val apkPath = context.applicationInfo.sourceDir ?: return null
+        val apkPath = context.applicationInfo.sourceDir ?: return extracted.takeIf { it.exists() && it.length() > 0L }?.absolutePath
         val abis = Build.SUPPORTED_ABIS ?: arrayOf("arm64-v8a", "armeabi-v7a", "x86_64")
         return try {
             ZipFile(apkPath).use { zip ->
                 for (abi in abis) {
                     val entry = zip.getEntry("lib/$abi/libmem_engine_root.so") ?: continue
+                    val expectedSize = entry.size
+                    if (extracted.exists() && extracted.length() > 0L && (expectedSize <= 0L || extracted.length() == expectedSize)) {
+                        extracted.setExecutable(true, false)
+                        return extracted.absolutePath
+                    }
+                    extracted.delete()
                     zip.getInputStream(entry).use { input ->
                         FileOutputStream(extracted).use { output ->
                             input.copyTo(output)
                         }
                     }
                     zip.getEntry("lib/$abi/libc++_shared.so")?.let { cppEntry ->
-                        zip.getInputStream(cppEntry).use { input ->
-                            FileOutputStream(extractedCpp).use { output ->
-                                input.copyTo(output)
+                        if (!extractedCpp.exists() || (cppEntry.size > 0L && extractedCpp.length() != cppEntry.size)) {
+                            extractedCpp.delete()
+                            zip.getInputStream(cppEntry).use { input ->
+                                FileOutputStream(extractedCpp).use { output ->
+                                    input.copyTo(output)
+                                }
                             }
                         }
                     }
@@ -163,10 +274,10 @@ object RootMemDaemon {
                     return extracted.absolutePath
                 }
             }
-            null
+            extracted.takeIf { it.exists() && it.length() > 0L }?.absolutePath
         } catch (t: Throwable) {
             AppLog.e("RootMemDaemon", "Failed to extract libmem_engine_root.so from APK", t)
-            null
+            extracted.takeIf { it.exists() && it.length() > 0L }?.absolutePath
         }
     }
 
@@ -209,7 +320,11 @@ object RootMemDaemon {
                 false
             } else {
                 if (lastAttachedPid > 0) {
-                    sendRawLocked("ATTACH $lastAttachedPid")
+                    val attachResp = sendRawLocked("ATTACH $lastAttachedPid")
+                    if (attachResp == null || !attachResp.startsWith("OK ")) {
+                        lastStartError = "恢复附加 pid=$lastAttachedPid 失败 (${attachResp ?: "EOF"})"
+                        return false
+                    }
                     val uMask = lastRegionMask.toLong() and 0xFFFFFFFFL
                     sendRawLocked("SET_MASK $uMask")
                 }
@@ -227,7 +342,6 @@ object RootMemDaemon {
         if (!ensureRecoveredAndAttached()) return null
         val firstTry = sendRawLocked(cmd, onProgress)
         if (firstTry != null) return firstTry
-        // 若守护进程在命令执行期间意外断开，自动重连恢复并重试一次
         if (!ensureRecoveredAndAttached()) return null
         return sendRawLocked(cmd, onProgress)
     }
@@ -238,9 +352,26 @@ object RootMemDaemon {
             lastAppContext = context.applicationContext ?: context
         }
         lastAttachedPid = pid
+        if (ensureStarted(lastAppContext)) {
+            val resp = sendRawLocked("ATTACH $pid")
+            if (resp != null && resp.startsWith("OK ")) {
+                lastStartError = ""
+                return true
+            }
+            if (resp != null) {
+                lastStartError = "守护进程 ATTACH $pid 失败 ($resp)"
+            }
+        }
+        // 若首次 ATTACH 因管道断开或守护进程异常退出失败，重启守护进程并重试一次
+        stop()
         if (!ensureStarted(lastAppContext)) return false
-        val resp = sendRawLocked("ATTACH $pid") ?: return false
-        return resp.startsWith("OK ")
+        val retryResp = sendRawLocked("ATTACH $pid")
+        if (retryResp != null && retryResp.startsWith("OK ")) {
+            lastStartError = ""
+            return true
+        }
+        lastStartError = "守护进程重试 ATTACH $pid 失败 (${retryResp ?: "EOF"})"
+        return false
     }
 
     @Synchronized
@@ -366,6 +497,33 @@ object RootMemDaemon {
     }
 
     @Synchronized
+    fun lockAddressConfigured(
+        address: Long,
+        data: ByteArray,
+        dataType: Int,
+        freezeMode: Int,
+        minVal: Long,
+        maxVal: Long
+    ) {
+        if (data.isEmpty()) return
+        val addrHex = java.lang.Long.toUnsignedString(address, 16)
+        val hex = bytesToHex(data)
+        sendCommandLocked("LOCK_CONFIG $addrHex $hex $dataType $freezeMode $minVal $maxVal")
+    }
+
+    @Synchronized
+    fun setFreezePaused(paused: Boolean) {
+        val p = if (paused) 1 else 0
+        sendCommandLocked("LOCK_PAUSE $p")
+    }
+
+    @Synchronized
+    fun setFreezeIntervalMs(intervalMs: Int) {
+        val safeMs = intervalMs.coerceIn(5, 5000)
+        sendCommandLocked("LOCK_INTERVAL $safeMs")
+    }
+
+    @Synchronized
     fun unlockAddress(address: Long) {
         val addrHex = java.lang.Long.toUnsignedString(address, 16)
         sendCommandLocked("UNLOCK $addrHex")
@@ -374,6 +532,28 @@ object RootMemDaemon {
     @Synchronized
     fun unlockAll() {
         sendCommandLocked("UNLOCK_ALL")
+    }
+
+    @Synchronized
+    fun clearSession() {
+        sendCommandLocked("CLEAR_SESSION")
+    }
+
+    @Synchronized
+    fun removeCandidates(addresses: Collection<Long>): Long {
+        if (addresses.isEmpty()) return 0L
+        var remaining = 0L
+        for (chunk in addresses.chunked(512)) {
+            val sb = StringBuilder("REMOVE_CANDIDATES ").append(chunk.size)
+            for (addr in chunk) {
+                sb.append(' ').append(java.lang.Long.toUnsignedString(addr, 16))
+            }
+            val resp = sendCommandLocked(sb.toString()) ?: continue
+            if (resp.startsWith("OK ")) {
+                remaining = resp.removePrefix("OK ").trim().toLongOrNull() ?: remaining
+            }
+        }
+        return remaining
     }
 
     @Synchronized
@@ -386,10 +566,8 @@ object RootMemDaemon {
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
         val a = if (aligned) 1 else 0
-        val resp = sendCommandLocked(
-            String.format(Locale.US, "SEARCH_EXACT %d %d %.8f %.8f %d", dataType, intTarget, floatTarget, epsilon, a),
-            onProgress
-        ) ?: return 0L
+        val cmd = "SEARCH_EXACT $dataType $intTarget ${formatDouble(floatTarget)} ${formatDouble(epsilon)} $a"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
         return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
     }
 
@@ -401,10 +579,8 @@ object RootMemDaemon {
         epsilon: Double,
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
-        val resp = sendCommandLocked(
-            String.format(Locale.US, "REFINE_EXACT %d %d %.8f %.8f", dataType, intTarget, floatTarget, epsilon),
-            onProgress
-        ) ?: return 0L
+        val cmd = "REFINE_EXACT $dataType $intTarget ${formatDouble(floatTarget)} ${formatDouble(epsilon)}"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
         return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
     }
 
@@ -421,14 +597,8 @@ object RootMemDaemon {
     ): Long {
         val inc = if (inclusive) 1 else 0
         val aln = if (aligned) 1 else 0
-        val resp = sendCommandLocked(
-            String.format(
-                Locale.US,
-                "SEARCH_RANGE %d %d %d %.8f %.8f %d %d",
-                dataType, intMin, intMax, floatMin, floatMax, inc, aln
-            ),
-            onProgress
-        ) ?: return 0L
+        val cmd = "SEARCH_RANGE $dataType $intMin $intMax ${formatDouble(floatMin)} ${formatDouble(floatMax)} $inc $aln"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
         return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
     }
 
@@ -443,14 +613,42 @@ object RootMemDaemon {
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
         val inc = if (inclusive) 1 else 0
-        val resp = sendCommandLocked(
-            String.format(
-                Locale.US,
-                "REFINE_RANGE %d %d %d %.8f %.8f %d",
-                dataType, intMin, intMax, floatMin, floatMax, inc
-            ),
-            onProgress
-        ) ?: return 0L
+        val cmd = "REFINE_RANGE $dataType $intMin $intMax ${formatDouble(floatMin)} ${formatDouble(floatMax)} $inc"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
+        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+    }
+
+    @Synchronized
+    fun searchPointers(
+        dataType: Int,
+        targetAddress: Long,
+        maxOffset: Long,
+        protMask: Int = NativeMemBridge.PTR_PROT_ALL,
+        aligned: Boolean = true,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): Long {
+        val aln = if (aligned) 1 else 0
+        val addrHex = java.lang.Long.toUnsignedString(targetAddress, 16)
+        val uOff = java.lang.Long.toUnsignedString(if (maxOffset >= 0L) maxOffset else -maxOffset)
+        val uProt = protMask.toLong() and 0xFFFFFFFFL
+        val cmd = "SEARCH_POINTER $dataType $addrHex $uOff $uProt $aln"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
+        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+    }
+
+    @Synchronized
+    fun refinePointers(
+        dataType: Int,
+        targetAddress: Long,
+        maxOffset: Long,
+        protMask: Int = NativeMemBridge.PTR_PROT_ALL,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): Long {
+        val addrHex = java.lang.Long.toUnsignedString(targetAddress, 16)
+        val uOff = java.lang.Long.toUnsignedString(if (maxOffset >= 0L) maxOffset else -maxOffset)
+        val uProt = protMask.toLong() and 0xFFFFFFFFL
+        val cmd = "REFINE_POINTER $dataType $addrHex $uOff $uProt"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
         return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
     }
 
@@ -506,9 +704,9 @@ object RootMemDaemon {
             val op = fieldOps.getOrElse(i) { 0 }
             sb.append(' ').append(types[i])
                 .append(' ').append(intVals[i])
-                .append(' ').append(String.format(Locale.US, "%.8f", floatVals[i]))
+                .append(' ').append(formatDouble(floatVals[i]))
                 .append(' ').append(iMax)
-                .append(' ').append(String.format(Locale.US, "%.8f", fMax))
+                .append(' ').append(formatDouble(fMax))
                 .append(' ').append(op)
         }
         val resp = sendCommandLocked(sb.toString(), onProgress) ?: return 0L
@@ -539,14 +737,8 @@ object RootMemDaemon {
     ): Long {
         val aln = if (aligned) 1 else 0
         val uKey = java.lang.Long.toUnsignedString(keyOrMask)
-        val resp = sendCommandLocked(
-            String.format(
-                Locale.US,
-                "SEARCH_ENCODED %d %d %d %.8f %s %d",
-                dataType, encodedMode, logicalInt, logicalFloat, uKey, aln
-            ),
-            onProgress
-        ) ?: return 0L
+        val cmd = "SEARCH_ENCODED $dataType $encodedMode $logicalInt ${formatDouble(logicalFloat)} $uKey $aln"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
         return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
     }
 
@@ -560,14 +752,8 @@ object RootMemDaemon {
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
         val uKey = java.lang.Long.toUnsignedString(keyOrMask)
-        val resp = sendCommandLocked(
-            String.format(
-                Locale.US,
-                "REFINE_ENCODED %d %d %d %.8f %s",
-                dataType, encodedMode, logicalInt, logicalFloat, uKey
-            ),
-            onProgress
-        ) ?: return 0L
+        val cmd = "REFINE_ENCODED $dataType $encodedMode $logicalInt ${formatDouble(logicalFloat)} $uKey"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
         return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
     }
 
@@ -588,10 +774,8 @@ object RootMemDaemon {
         epsilon: Double = 1e-4,
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
-        val resp = sendCommandLocked(
-            String.format(Locale.US, "FUZZY_REFINE %d %d %.8f %.8f", deltaOp, intDelta, floatDelta, epsilon),
-            onProgress
-        ) ?: return 0L
+        val cmd = "FUZZY_REFINE $deltaOp $intDelta ${formatDouble(floatDelta)} ${formatDouble(epsilon)}"
+        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
         return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
     }
 

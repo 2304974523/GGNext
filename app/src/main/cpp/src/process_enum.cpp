@@ -51,6 +51,7 @@ bool readStatusMetadata(int pid, int& outPpid, uint32_t& outUid, size_t& outVmRs
     outUid = 0;
     outVmRssKB = 0;
     outComm.clear();
+    int tgid = 0;
 
     char line[512];
     while (std::fgets(line, sizeof(line), fp)) {
@@ -61,6 +62,8 @@ bool readStatusMetadata(int pid, int& outPpid, uint32_t& outUid, size_t& outVmRs
             while (!outComm.empty() && (outComm.back() == '\n' || outComm.back() == '\r')) {
                 outComm.pop_back();
             }
+        } else if (std::strncmp(line, "Tgid:", 5) == 0) {
+            tgid = std::atoi(line + 5);
         } else if (std::strncmp(line, "PPid:", 5) == 0) {
             outPpid = std::atoi(line + 5);
         } else if (std::strncmp(line, "Uid:", 4) == 0) {
@@ -77,6 +80,10 @@ bool readStatusMetadata(int pid, int& outPpid, uint32_t& outUid, size_t& outVmRs
     }
 
     std::fclose(fp);
+    // Filter out threads (TIDs) that resolve when probing /proc/<tid>/status directly in sharedUserId mode
+    if (tgid > 0 && tgid != pid) {
+        return false;
+    }
     return true;
 }
 

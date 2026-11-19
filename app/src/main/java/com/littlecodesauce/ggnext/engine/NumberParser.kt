@@ -215,8 +215,9 @@ object NumberParser {
             }
         }
 
-        val targetType = if (type == ValueType.AUTO) {
-            if (s.contains('.')) ValueType.FLOAT else ValueType.DWORD
+        val isAuto = (type and 0x7F) == ValueType.AUTO
+        val targetType = if (isAuto) {
+            if (s.contains('.')) ValueType.FLOAT else ValueType.AUTO
         } else type
 
         return when (targetType and 0x7F) {
@@ -228,11 +229,11 @@ object NumberParser {
                 val d = s.toDoubleOrNull() ?: throw ParseException("无效的双精度数: $s")
                 d.toRawBits() to ValueType.DOUBLE
             }
-            ValueType.QWORD -> {
+            ValueType.QWORD, ValueType.AUTO -> {
                 val v = s.toLongOrNull() ?: s.toULongOrNull()?.toLong()
                     ?: s.toULongOrNull(16)?.toLong()
-                    ?: throw ParseException("无效的 64 位数值: $s")
-                v to ValueType.QWORD
+                    ?: throw ParseException("无效的数值: $s")
+                v to (targetType and 0x7F)
             }
             else -> {
                 val v = s.toLongOrNull() ?: s.toULongOrNull()?.toLong()
@@ -342,21 +343,21 @@ object NumberParser {
         val types = ArrayList<Int>(items.size)
         val ops = ArrayList<Int>(items.size)
 
+        val groupDefaultType = if ((defaultType and 0x7F) == ValueType.AUTO) ValueType.DWORD else defaultType
         items.forEach { item ->
             val clean = item.trim()
             when {
                 clean == "*" || clean == "?" || clean.startsWith("0~~0", true) -> {
                     // 通配任意值 (如 0~~0, 0~~0D, *, ?)
                     val suffixChar = clean.last().lowercaseChar()
-                    val wcType = TYPE_SUFFIX[suffixChar]
-                        ?: (if (defaultType == ValueType.AUTO) ValueType.DWORD else defaultType)
+                    val wcType = TYPE_SUFFIX[suffixChar] ?: groupDefaultType
                     values.add(0L)
                     maxValues.add(0L)
                     types.add(wcType and 0x7F)
                     ops.add(3) // 3 = WILDCARD
                 }
                 clean.contains('~') -> {
-                    val r = parseRange(clean, defaultType, ValueType.SIGN_EQUAL)
+                    val r = parseRange(clean, groupDefaultType, ValueType.SIGN_EQUAL)
                     val vMin = r.numbers.first()
                     val vMax = r.to.firstOrNull() ?: vMin
                     val t = r.types.first()
@@ -373,7 +374,7 @@ object NumberParser {
                     }
                 }
                 else -> {
-                    val p = parseNumber(clean, defaultType)
+                    val p = parseNumber(clean, groupDefaultType)
                     values.add(p.first)
                     maxValues.add(p.first)
                     types.add(p.second)

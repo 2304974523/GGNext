@@ -66,6 +66,7 @@ import androidx.compose.ui.unit.sp
 import com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics
 import com.littlecodesauce.ggnext.ui.theme.Rose
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.collectLatest
 
 /**
  * 界面调整 9：
@@ -636,15 +637,43 @@ fun GgTextField(
 ) {
     val focusRequester = remember { FocusRequester() }
     val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    val view = androidx.compose.ui.platform.LocalView.current
     var wasFocused by remember { mutableStateOf(false) }
     var showContextMenu by remember { mutableStateOf(false) }
     var textLayoutResult by remember { mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null) }
     val currentVal by androidx.compose.runtime.rememberUpdatedState(value)
     val currentOnValueChange by androidx.compose.runtime.rememberUpdatedState(onValueChange)
+    val currentSuppress by androidx.compose.runtime.rememberUpdatedState(suppressSystemKeyboard)
+
+    var wakeNonce by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+
+    fun wakeExternalKeyboardIfAllowed() {
+        if (!currentSuppress) {
+            wakeNonce++
+            view.requestFocus()
+            keyboardController?.show()
+            val imm = view.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+            imm?.showSoftInput(view, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        }
+    }
 
     if (initialFocus) {
         androidx.compose.runtime.LaunchedEffect(Unit) {
             runCatching { focusRequester.requestFocus() }
+            wakeExternalKeyboardIfAllowed()
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(suppressSystemKeyboard, wasFocused, wakeNonce) {
+        if (wasFocused) {
+            if (suppressSystemKeyboard) {
+                keyboardController?.hide()
+            } else {
+                keyboardController?.show()
+                val imm = view.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+                imm?.showSoftInput(view, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+            }
         }
     }
 
@@ -654,11 +683,17 @@ fun GgTextField(
     ) {
         InterceptPlatformTextInput(
             interceptor = { request, nextHandler ->
-                if (suppressSystemKeyboard) {
-                    awaitCancellation()
-                } else {
-                    nextHandler.startInputMethod(request)
-                }
+                androidx.compose.runtime.snapshotFlow { currentSuppress to wakeNonce }
+                    .collectLatest { (suppress, _) ->
+                        if (suppress) {
+                            keyboardController?.hide()
+                            awaitCancellation()
+                        } else {
+                            keyboardController?.show()
+                            nextHandler.startInputMethod(request)
+                        }
+                    }
+                awaitCancellation()
             }
         ) {
             BasicTextField(
@@ -681,6 +716,7 @@ fun GgTextField(
                         if (focusState.isFocused && !wasFocused) {
                             wasFocused = true
                             onFocus?.invoke()
+                            wakeExternalKeyboardIfAllowed()
                         } else if (!focusState.isFocused) {
                             wasFocused = false
                         }
@@ -714,11 +750,13 @@ fun GgTextField(
                                         onLongPress = {
                                             focusRequester.requestFocus()
                                             onFocus?.invoke()
+                                            wakeExternalKeyboardIfAllowed()
                                             showContextMenu = true
                                         },
                                         onTap = { tapOffset ->
                                             focusRequester.requestFocus()
                                             onFocus?.invoke()
+                                            wakeExternalKeyboardIfAllowed()
                                             val text = currentVal.text
                                             if (text.isEmpty()) {
                                                 currentOnValueChange(
@@ -871,12 +909,44 @@ private fun ContextToolbarDivider() {
 }
 
 /**
- * 其他改进 1 & 问题 6 修复：列表右侧快速滑动条 (VerticalFastScrollbar)
- * - 颜色跟随当前主题色 (Rose.Primary)
- * - 防误触设计：
- *   1. 仅当手指按下位置命中当前滑块 (thumb) 区域时才进入候选拖拽状态，点击空白轨道绝不拦截或跳页；
- *   2. 加入按住驻留阈值 (80ms) 与快速划动识别：若用户在列表右侧边缘快速上下划动屏幕（<80ms 内快速划出），判定为普通列表滑动并自动放行；
- *   3. 激活拖拽后采用相对于按下点的增量位移 (relative delta)，避免按下瞬间列表突跳。
+ * 持久化列表滚动位置状态（Bug 2.1 修复）：
+ * 在切换标签页或最小化修改器后再次展开时，自动恢复列表此前的首条可见索引与像素偏移量。
+ */
+@Composable
+fun rememberPersistentLazyListState(listKey: String): LazyListState {
+    val saved = remember(listKey) {
+        com.littlecodesauce.ggnext.core.Session.getListScrollPosition(listKey)
+    }
+    val listState = remember(listKey) {
+        LazyListState(
+            firstVisibleItemIndex = saved.first,
+            firstVisibleItemScrollOffset = saved.second
+        )
+    }
+    androidx.compose.runtime.LaunchedEffect(listState, listKey) {
+        androidx.compose.runtime.snapshotFlow {
+            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        }.collect { (idx, off) ->
+            com.littlecodesauce.ggnext.core.Session.saveListScrollPosition(listKey, idx, off)
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(listState, listKey) {
+        onDispose {
+            com.littlecodesauce.ggnext.core.Session.saveListScrollPosition(
+                listKey,
+                listState.firstVisibleItemIndex,
+                listState.firstVisibleItemScrollOffset
+            )
+        }
+    }
+    return listState
+}
+
+/**
+ * 列表右侧快速滑动条 (VerticalFastScrollbar)（Bug 2 修复）：
+ * - 修复此前因 pointerInput(totalItems, visibleItems) 在滚动过程中随 visibleItems ±1 抖动重启协程导致拖拽中断的问题；
+ * - 移除强制长按 80ms 才能拖动的限制：只要手指按在滑块 (thumb) 区域并垂直拖动即可立即顺滑跟手响应；
+ * - 空白轨道区域不拦截点击或普通滑动，彻底兼顾防误触与直接拖动体验。
  */
 @Composable
 fun VerticalFastScrollbar(
@@ -899,33 +969,33 @@ fun VerticalFastScrollbar(
     }
     val scrollFraction = if (isDragging) dragFraction else liveFraction
     val currentLiveFraction by androidx.compose.runtime.rememberUpdatedState(liveFraction)
+    val currentTotalItems by androidx.compose.runtime.rememberUpdatedState(totalItems)
+    val currentVisibleItems by androidx.compose.runtime.rememberUpdatedState(visibleItems)
 
     val thumbAlpha by animateFloatAsState(
         targetValue = when {
-            isDragging -> 0.95f
-            listState.isScrollInProgress -> 0.80f
-            else -> 0.42f
+            isDragging -> 0.96f
+            listState.isScrollInProgress -> 0.82f
+            else -> 0.48f
         },
-        animationSpec = tween(180),
+        animationSpec = tween(150),
         label = "sbAlpha"
     )
     val thumbWidthDp by animateFloatAsState(
-        targetValue = if (isDragging) 5.5f else 3.5f,
-        animationSpec = tween(150),
+        targetValue = if (isDragging) 6.5f else 4.0f,
+        animationSpec = tween(140),
         label = "sbWidth"
     )
     val primaryColor = Rose.Primary
-    val trackColor = Rose.Divider.copy(alpha = if (isDragging) 0.32f else 0.12f)
+    val trackColor = Rose.Divider.copy(alpha = if (isDragging) 0.34f else 0.14f)
 
     BoxWithConstraints(
         modifier = modifier
             .fillMaxHeight()
-            .width(14.dp)
-            .pointerInput(totalItems, visibleItems) {
-                val minThumbPx = 28.dp.toPx()
-                val hitPadPx = 8.dp.toPx()
-                val holdThresholdMs = 80L
-                val touchSlopPx = viewConfiguration.touchSlop
+            .width(18.dp)
+            .pointerInput(Unit) {
+                val minThumbPx = 30.dp.toPx()
+                val hitPadPx = 14.dp.toPx()
 
                 awaitPointerEventScope {
                     while (true) {
@@ -933,8 +1003,12 @@ fun VerticalFastScrollbar(
                         val downChange = downEvent.changes.firstOrNull() ?: continue
                         if (!downChange.pressed || downChange.isConsumed) continue
 
+                        val curTotal = currentTotalItems
+                        val curVisible = currentVisibleItems
+                        if (curTotal <= curVisible || curTotal <= 0) continue
+
                         val trackH = size.height.toFloat().coerceAtLeast(1f)
-                        val thumbRatio = (visibleItems.toFloat() / totalItems.toFloat()).coerceIn(0.08f, 0.55f)
+                        val thumbRatio = (curVisible.toFloat() / curTotal.toFloat()).coerceIn(0.08f, 0.55f)
                         val thumbH = (trackH * thumbRatio).coerceAtLeast(minThumbPx)
                         val availRange = (trackH - thumbH).coerceAtLeast(1f)
                         val startFrac = currentLiveFraction
@@ -942,7 +1016,7 @@ fun VerticalFastScrollbar(
 
                         val downX = downChange.position.x
                         val downY = downChange.position.y
-                        // 1. 仅当触点落在滑块 (thumb) 上下容差范围内时才候选触发，空白轨道区域直接放行给列表滚动
+                        // 仅当按下位置命中滑块 (thumb) 上下容差范围时接管拖拽，空白轨道不拦截普通列表滑动
                         val hitThumb = downY >= (curThumbTop - hitPadPx) && downY <= (curThumbTop + thumbH + hitPadPx)
                         if (!hitThumb) {
                             while (true) {
@@ -952,9 +1026,8 @@ fun VerticalFastScrollbar(
                             continue
                         }
 
-                        val downTime = android.os.SystemClock.uptimeMillis()
                         var activated = false
-                        var abortedAsNormalScroll = false
+                        var abortedHorizontal = false
                         var grabAnchorY = downY
                         var anchorFrac = startFrac
 
@@ -965,33 +1038,31 @@ fun VerticalFastScrollbar(
 
                             val dx = kotlin.math.abs(ch.position.x - downX)
                             val dy = kotlin.math.abs(ch.position.y - downY)
-                            val elapsed = android.os.SystemClock.uptimeMillis() - downTime
 
-                            if (!activated && !abortedAsNormalScroll) {
-                                // 2. 如果未满驻留时间就发生大幅度快速划动，或水平位移大于垂直位移，判定为普通页面滑动并放弃接管
-                                if (dx > touchSlopPx && dx > dy) {
-                                    abortedAsNormalScroll = true
-                                } else if (elapsed < holdThresholdMs && dy > touchSlopPx * 1.4f) {
-                                    abortedAsNormalScroll = true
-                                } else if (elapsed >= holdThresholdMs && dy >= touchSlopPx * 0.5f) {
+                            if (!activated && !abortedHorizontal) {
+                                if (dx > 12.dp.toPx() && dx > dy * 1.5f) {
+                                    abortedHorizontal = true
+                                } else if (dy >= 0.5.dp.toPx()) {
                                     activated = true
                                     isDragging = true
-                                    grabAnchorY = ch.position.y
-                                    anchorFrac = currentLiveFraction
-                                    dragFraction = anchorFrac
+                                    grabAnchorY = downY
+                                    anchorFrac = startFrac
+                                    dragFraction = startFrac
                                 }
                             }
 
-                            if (abortedAsNormalScroll) {
+                            if (abortedHorizontal) {
                                 continue
                             }
 
                             if (activated) {
+                                val latestTotal = currentTotalItems
+                                val latestVis = currentVisibleItems.coerceAtLeast(1)
                                 val deltaY = ch.position.y - grabAnchorY
                                 val nextFrac = (anchorFrac + deltaY / availRange).coerceIn(0f, 1f)
                                 dragFraction = nextFrac
-                                val maxIdx = (totalItems - visibleItems).coerceAtLeast(1)
-                                val nextIdx = (nextFrac * maxIdx).toInt().coerceIn(0, totalItems - 1)
+                                val maxIdx = (latestTotal - latestVis).coerceAtLeast(1)
+                                val nextIdx = (nextFrac * maxIdx).toInt().coerceIn(0, (latestTotal - 1).coerceAtLeast(0))
                                 scope.launch { listState.scrollToItem(nextIdx) }
                                 ch.consume()
                             }
@@ -1004,7 +1075,7 @@ fun VerticalFastScrollbar(
         val density = LocalDensity.current
         val trackHeightPx = with(density) { maxHeight.toPx() }
         val thumbRatio = (visibleItems.toFloat() / totalItems.toFloat()).coerceIn(0.08f, 0.55f)
-        val thumbHeightPx = (trackHeightPx * thumbRatio).coerceAtLeast(with(density) { 28.dp.toPx() })
+        val thumbHeightPx = (trackHeightPx * thumbRatio).coerceAtLeast(with(density) { 30.dp.toPx() })
         val availableRangePx = (trackHeightPx - thumbHeightPx).coerceAtLeast(0f)
         val thumbTopPx = availableRangePx * scrollFraction
 

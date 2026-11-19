@@ -8,6 +8,8 @@
 #include <vector>
 #include <atomic>
 #include <functional>
+#include <limits>
+#include <type_traits>
 
 namespace mem_engine {
 
@@ -36,6 +38,44 @@ namespace RegionFlag {
     constexpr uint32_t DEFAULT_RW  = JH | CH | CA | CD | CB | A | S | AS | PS | J;
     constexpr uint32_t ALL_SAFE    = DEFAULT_RW | XA | XS | O;
 }
+
+// ============================================================================
+// Pointer Target Protection Classification Bitmasks (matches UI filter flags)
+// ============================================================================
+namespace PointerProtMask {
+    constexpr uint32_t NONE = 0;
+    constexpr uint32_t WX   = 1u << 0; // 1: Writable + Executable
+    constexpr uint32_t X    = 1u << 1; // 2: Executable only (r-x)
+    constexpr uint32_t RO   = 1u << 3; // 8: Read-Only (r--)
+    constexpr uint32_t W    = 1u << 4; // 16: Read-Write (rw-)
+    constexpr uint32_t ALL  = WX | X | RO | W; // 27
+}
+
+// ============================================================================
+// Architecture-Aware Pointer Untagging Policy (ARM64 TBI/MTE & 32-bit compat)
+// Inspired by KittyMemoryEx (KittyUtils::untagPointer) & frida-gum
+// ============================================================================
+struct ArchPtrPolicy {
+    static constexpr uint64_t ARM64_TBI_MASK = (1ULL << 56) - 1ULL; // 0x00FFFFFFFFFFFFFFULL
+    static constexpr uint64_t ARM32_MASK     = 0x00000000FFFFFFFFULL;
+    static constexpr uintptr_t MIN_VALID_USER_ADDR = 0x10000ULL;
+
+    static constexpr uint64_t untag(uint64_t rawPtr, bool is64BitTarget = true) noexcept {
+        return is64BitTarget ? (rawPtr & ARM64_TBI_MASK) : (rawPtr & ARM32_MASK);
+    }
+
+    static constexpr bool isCanonicalUserPtr(uint64_t rawPtr, bool is64BitTarget = true) noexcept {
+        if (!is64BitTarget) {
+            uint64_t u32 = rawPtr & ARM32_MASK;
+            return u32 >= MIN_VALID_USER_ADDR && u32 < 0xFFFF0000ULL;
+        }
+        uint8_t topByte = static_cast<uint8_t>(rawPtr >> 56);
+        // Reject negative kernel/sign-extended non-pointer values (0xFF...) unless valid user tag
+        if (topByte == 0xFF) return false;
+        uint64_t untagged = rawPtr & ARM64_TBI_MASK;
+        return untagged >= MIN_VALID_USER_ADDR && untagged <= 0x0000FFFFFFFFFFFFULL;
+    }
+};
 
 inline const char* regionFlagToTag(uint32_t flag) noexcept {
     switch (flag) {
@@ -139,7 +179,17 @@ enum class EncodedMode : uint8_t {
 };
 
 // ============================================================================
-// 5. System Status & Error Codes
+// 5. Value Freeze / Lock Modes (Unified C++ & Kotlin Contract)
+// ============================================================================
+enum class FreezeMode : uint8_t {
+    EXACT       = 0, // Continuously write exact locked value
+    INCREMENT   = 1, // Increment stored value on each freeze cycle
+    DECREMENT   = 2, // Decrement stored value on each freeze cycle
+    RANGE_CLAMP = 3  // Clamp live memory value into [minVal, maxVal]
+};
+
+// ============================================================================
+// 6. System Status & Error Codes
 // ============================================================================
 enum class EngineErrc : int32_t {
     OK                = 0,
@@ -152,7 +202,7 @@ enum class EngineErrc : int32_t {
 };
 
 // ============================================================================
-// 6. Thread-Safe Cancellation Token & Progress Callback
+// 7. Thread-Safe Cancellation Token & Progress Callback
 // ============================================================================
 class CancellationToken {
 public:
@@ -167,7 +217,7 @@ private:
 using ProgressCallback = std::function<void(size_t bytesProcessed, size_t totalBytes)>;
 
 // ============================================================================
-// 7. Compact Candidate Record (16-byte aligned for zero-padding mmap storage)
+// 8. Compact Candidate Record (24-byte packed for mmap storage)
 // ============================================================================
 #pragma pack(push, 1)
 struct CandidateEntry {
@@ -176,7 +226,7 @@ struct CandidateEntry {
     uint8_t  type;     // DataType cast to uint8_t
     uint8_t  regionTag;// RegionFlag bit index
     uint16_t reserved;
-    uint32_t flags;
+    uint32_t flags;    // Mode-specific metadata (e.g. EncodedMode invariants or PointerProtMask)
 };
 #pragma pack(pop)
 

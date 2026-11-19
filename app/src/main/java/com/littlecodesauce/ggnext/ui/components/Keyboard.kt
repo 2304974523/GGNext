@@ -63,8 +63,15 @@ fun BuiltInKeyboard(
     var symbolMode by remember { mutableStateOf(false) }
     var compactRows by remember { mutableStateOf(false) }
     var showHistoryTray by remember { mutableStateOf(false) }
-    val gap = 5.dp
-    val rowHeight = if (compactRows) 36.dp else 43.dp
+    val screenHeightDp = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp
+    val isLandscapeCompact = screenHeightDp < 480
+    val gap = if (isLandscapeCompact) 3.5.dp else 5.dp
+    val rowHeight = when {
+        isLandscapeCompact && compactRows -> 27.dp
+        isLandscapeCompact -> 31.dp
+        compactRows -> 36.dp
+        else -> 43.dp
+    }
     val corner = LocalUiMetrics.current.dialogCorner.dp
 
     Column(
