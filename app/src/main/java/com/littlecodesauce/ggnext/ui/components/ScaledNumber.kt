@@ -20,7 +20,8 @@ fun ScaledNumber(item: MemoryItem, mask: Int) {
     val text = remember(item.value, item.previousValue, item.manuallyEdited, item.flags, mask) {
         valueTextWithMask(item, mask)
     }
-    val color = remember(item.flags) { typeColor(item.flags) }
+    val isDark = Rose.IsDark
+    val color = remember(item.flags, isDark) { typeColor(item.flags) }
     Text(
         text = text,
         style = monoStyle(15, color),
@@ -67,14 +68,9 @@ fun valueTextWithMask(item: MemoryItem, mask: Int): String {
         val s = Formatter.bytesToAscii(item.value, item.size)
         if (s.isNotEmpty()) extras.append("  '").append(s).append('\'')
     }
-    if (mask and Formatter.F_ARM != 0) {
-        extras.append("  MOV R0, #0x").append(Formatter.hex(item.value, 2))
-    }
-    if (mask and Formatter.F_THUMB != 0) {
-        extras.append("  MOVS R0, #0x").append(Formatter.hex(item.value, 1))
-    }
-    if (mask and Formatter.F_ARM8 != 0) {
-        extras.append("  MOV X0, #0x").append(Formatter.hex(item.value, 2))
+    if (mask and Formatter.F_XOR != 0) {
+        val xored = ((item.value and 0xFFFFFFFFL) xor (item.address and 0xFFFFFFFFL)).toInt()
+        extras.append("  X:").append(xored)
     }
     if (extras.isEmpty()) return base
     return base + extras.toString()

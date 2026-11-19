@@ -37,6 +37,11 @@ object SettingKeys {
     const val GROUP_GLOBAL = "通用设置"
     const val GROUP_UI = "界面设置"
     const val GROUP_OTHER = "其余选项"
+
+    const val KEY_HISTORY_SEARCH_JSON = "history_search_json"
+    const val KEY_HISTORY_GOTO_JSON = "history_goto_json"
+    const val KEY_HISTORY_SCRIPT_JSON = "history_script_json"
+    const val KEY_SAVED_LIST_JSON = "saved_list_json"
 }
 
 object SettingsSpecs {
@@ -52,10 +57,7 @@ object SettingsSpecs {
         Formatter.F_XOR to "Xor",
         Formatter.F_RHEX to "HEX 逆序",
         Formatter.F_STRING to "字符串",
-        Formatter.F_JAVA to "Java 字符串",
-        Formatter.F_ARM to "ARM x32",
-        Formatter.F_THUMB to "Thumb",
-        Formatter.F_ARM8 to "ARM x64"
+        Formatter.F_JAVA to "Java 字符串"
     )
 
     val game = listOf(
@@ -159,6 +161,24 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setString(id: String, value: String) {
         context.dataStore.edit { it[K.key(id)] = value }
+    }
+
+    suspend fun setStrings(pairs: Map<String, String>) {
+        if (pairs.isEmpty()) return
+        context.dataStore.edit { prefs ->
+            pairs.forEach { (id, value) ->
+                prefs[K.key(id)] = value
+            }
+        }
+    }
+
+    suspend fun removeKeys(ids: Collection<String>) {
+        if (ids.isEmpty()) return
+        context.dataStore.edit { prefs ->
+            ids.forEach { id ->
+                prefs.remove(K.key(id))
+            }
+        }
     }
 
     suspend fun setValueFormatMask(mask: Int) {

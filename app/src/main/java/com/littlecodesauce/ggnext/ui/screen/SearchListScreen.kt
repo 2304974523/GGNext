@@ -71,7 +71,7 @@ fun SearchListScreen(ui: Ui) {
                 key = { _, i -> (i.address shl 8) xor (i.flags and 0xFF).toLong() },
                 contentType = { _, _ -> "addr_row" }
             ) { idx, item ->
-                AddressRow(item, ui.valueMask, idx)
+                AddressRow(item, ui.isSearchItemSelected(item), ui.valueMask, idx)
             }
         }
         VerticalFastScrollbar(
@@ -83,18 +83,19 @@ fun SearchListScreen(ui: Ui) {
 
 /**
  * 搜索结果行：
- * 界面调整 3：全面使用与滚动容器协同的 clickableLongPress / clickableWithTooltip，
+ * 全面使用与滚动容器协同的 clickableLongPress / clickableWithTooltip，
  * 当手指按在任意地址或按钮上滑动屏幕时，列表平滑滚动绝不卡顿。
  */
 @Composable
-fun AddressRow(item: MemoryItem, mask: Int, index: Int) {
+fun AddressRow(item: MemoryItem, checked: Boolean, mask: Int, index: Int) {
     val currentItem by rememberUpdatedState(item)
     val bgOpacity = com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics.current.bgOpacity.coerceIn(0.25f, 1.0f)
-    val accent = remember(item.flags) { typeColor(item.flags) }
-    val regColor = remember(item.region) { regionColor(item.region) }
+    val isDark = Rose.IsDark
+    val accent = remember(item.flags, isDark) { typeColor(item.flags) }
+    val regColor = remember(item.region, isDark) { regionColor(item.region) }
     val shortType = remember(item.flags) { ValueType.shortName(item.flags) }
     val bg by animateColorAsState(
-        if (item.checked) Rose.Primary.copy(alpha = if (Rose.IsDark) 0.18f else 0.22f)
+        if (checked) Rose.Primary.copy(alpha = if (isDark) 0.18f else 0.20f)
         else Rose.Row.copy(alpha = (bgOpacity * 0.88f).coerceIn(0.18f, 1.0f)),
         Motion.ColorFast,
         label = "rowBg"
@@ -113,7 +114,7 @@ fun AddressRow(item: MemoryItem, mask: Int, index: Int) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             GgCheckBox(
-                checked = item.checked,
+                checked = checked,
                 onCheckedChange = { Session.toggle(currentItem) },
                 size = 21.dp,
                 accentColor = Rose.Primary

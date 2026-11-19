@@ -20,13 +20,21 @@ data class MemoryItem(
     /** 是否由用户手动修改（仅在手动修改时在数值后显示修改前的值） */
     val manuallyEdited: Boolean = false,
     /** 自定义备注（批量修改时可写入） */
-    val note: String = ""
+    val note: String = "",
+    /** 加密搜索元数据：静态异或密钥（非 0 时写回自动重编码） */
+    val xorKey: Long = 0L,
+    /** 加密搜索元数据：GG 偏移异或 (如 25X4 -> xorOffset=4，写回时读取 [addr+xorOffset] 并异或) */
+    val xorOffset: Int = 0,
+    /** 是否来自自动加密搜索（提示用户值处于加密态） */
+    val encryptedAuto: Boolean = false
 ) {
     val size: Int get() = ValueType.sizeOf(flags)
     val typeShort: String get() = ValueType.shortName(flags)
 
-    /** 预计算缓存的地址十六进制文本，避免 LazyColumn 滑动时每帧重复分配字符串 */
-    val cachedAddressHex: String = java.lang.Long.toHexString(address).uppercase().padStart(8, '0')
+    /** 懒加载缓存的地址十六进制文本，避免批量创建百万条目时立即分配字符串 */
+    val cachedAddressHex: String by lazy(LazyThreadSafetyMode.NONE) {
+        java.lang.Long.toHexString(address).uppercase().padStart(8, '0')
+    }
 
     fun addressHex(): String = cachedAddressHex
 }

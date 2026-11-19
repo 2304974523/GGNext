@@ -57,6 +57,7 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -80,6 +81,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.littlecodesauce.ggnext.core.FileBrowserTarget
+import com.littlecodesauce.ggnext.core.FileSheetMode
 import com.littlecodesauce.ggnext.core.NextTab
 import com.littlecodesauce.ggnext.core.Session
 import com.littlecodesauce.ggnext.core.Sheet
@@ -154,7 +156,29 @@ fun EditSheet(ui: Ui) {
     var activeFillIndex by remember { mutableIntStateOf(-1) }
     var addNotReplace by remember { mutableStateOf(false) }
     var freezeItems by remember(firstItem) { mutableStateOf(firstItem.freeze) }
+    var freezeType by remember(firstItem) { mutableIntStateOf(firstItem.freezeType) }
+    var freezeFromTf by remember(firstItem) {
+        val initFrom = if (firstItem.freezeType == 3) {
+            when (selectedType) {
+                ValueType.FLOAT -> Formatter.floatText(firstItem.freezeFrom)
+                ValueType.DOUBLE -> Formatter.doubleText(firstItem.freezeFrom)
+                else -> Formatter.signed(firstItem.freezeFrom, ValueType.sizeOf(selectedType)).toString()
+            }
+        } else ""
+        mutableStateOf(TextFieldValue(initFrom, TextRange(initFrom.length)))
+    }
+    var freezeToTf by remember(firstItem) {
+        val initTo = if (firstItem.freezeType == 3) {
+            when (selectedType) {
+                ValueType.FLOAT -> Formatter.floatText(firstItem.freezeTo)
+                ValueType.DOUBLE -> Formatter.doubleText(firstItem.freezeTo)
+                else -> Formatter.signed(firstItem.freezeTo, ValueType.sizeOf(selectedType)).toString()
+            }
+        } else ""
+        mutableStateOf(TextFieldValue(initTo, TextRange(initTo.length)))
+    }
 
+    // 0=备注(系统键盘), 1=主数值, 2=步进, 3=范围下限, 4=范围上限
     var keyboardTarget by remember { mutableIntStateOf(1) }
     var showBuiltInKeyboard by remember { mutableStateOf(true) }
 
@@ -361,6 +385,80 @@ fun EditSheet(ui: Ui) {
                 }
             }
 
+            // 4 种冻结模式：0=正常冻结, 1=递增(允许增大), 2=递减(允许减小), 3=范围钳制
+            AnimatedVisibility(freezeItems, enter = expandEnter(), exit = expandExit()) {
+                Column(Modifier.fillMaxWidth().padding(top = 6.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(
+                            0 to "正常冻结",
+                            1 to "允许增大",
+                            2 to "允许减小",
+                            3 to "范围限制"
+                        ).forEach { (mode, label) ->
+                            val on = freezeType == mode
+                            Box(
+                                Modifier
+                                    .weight(1f)
+                                    .height(34.dp)
+                                    .background(
+                                        if (on) Rose.ChipSelected else Rose.CardHigh,
+                                        RoundedCornerShape(8.dp)
+                                    )
+                                    .border(
+                                        width = if (on) 1.dp else 1.dp,
+                                        color = if (on) Rose.Primary.copy(alpha = 0.55f) else Rose.Divider,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableWithTooltip { freezeType = mode },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    tr(label),
+                                    color = if (on) Rose.Primary else Rose.TextSecond,
+                                    fontSize = fsp(11.5f),
+                                    fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                    AnimatedVisibility(freezeType == 3, enter = expandEnter(), exit = expandExit()) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(top = 6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(Modifier.weight(1f)) {
+                                FieldRow(
+                                    label = "从",
+                                    value = freezeFromTf,
+                                    suppressSystemKeyboard = showBuiltInKeyboard,
+                                    placeholder = "最小值",
+                                    onFocus = { keyboardTarget = 3 }
+                                ) {
+                                    keyboardTarget = 3
+                                    freezeFromTf = it
+                                }
+                            }
+                            Box(Modifier.weight(1f)) {
+                                FieldRow(
+                                    label = "到",
+                                    value = freezeToTf,
+                                    suppressSystemKeyboard = showBuiltInKeyboard,
+                                    placeholder = "最大值",
+                                    onFocus = { keyboardTarget = 4 }
+                                ) {
+                                    keyboardTarget = 4
+                                    freezeToTf = it
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // “更多”展开区域
             AnimatedVisibility(moreExpanded, enter = expandEnter(), exit = expandExit()) {
                 Column(Modifier.fillMaxWidth()) {
@@ -473,29 +571,44 @@ fun EditSheet(ui: Ui) {
                 }
                 Spacer(Modifier.width(8.dp))
                 RoseButton(
-                    label = "修改",
+                    label = if (ui.isBatchBusy) "处理中" else "修改",
                     modifier = Modifier.width(72.dp).height(38.dp),
-                    filled = true
+                    filled = true,
+                    enabled = !ui.isBatchBusy
                 ) {
-                    val ok = Session.batchEdit(
+                    Session.batchEdit(
                         targets = if (isSingleEdit) listOf(firstItem) else targets,
                         rawInput = valueTf.text,
                         targetType = selectedType,
                         rawStep = if (moreExpanded && !isSingleEdit) stepTf.text else "",
                         addNotReplace = addNotReplace,
                         freeze = freezeItems,
-                        customNote = if (isSingleEdit) noteTf.text.trim() else null
+                        freezeType = freezeType,
+                        freezeFromRaw = if (freezeItems && freezeType == 3) freezeFromTf.text else "",
+                        freezeToRaw = if (freezeItems && freezeType == 3) freezeToTf.text else "",
+                        customNote = if (isSingleEdit) noteTf.text.trim() else null,
+                        onComplete = { ok -> if (ok) Session.popSheet() }
                     )
-                    if (ok) Session.closeSheet()
                 }
             }
 
             AnimatedVisibility(showBuiltInKeyboard && keyboardTarget != 0, enter = expandEnter(), exit = expandExit()) {
+                val activeKeyboardTf = when (keyboardTarget) {
+                    2 -> stepTf
+                    3 -> freezeFromTf
+                    4 -> freezeToTf
+                    else -> valueTf
+                }
                 Column(Modifier.padding(top = 10.dp)) {
                     BuiltInKeyboard(
-                        value = if (keyboardTarget == 2) stepTf else valueTf,
+                        value = activeKeyboardTf,
                         onValueChange = { next ->
-                            if (keyboardTarget == 2) stepTf = next else valueTf = next
+                            when (keyboardTarget) {
+                                2 -> stepTf = next
+                                3 -> freezeFromTf = next
+                                4 -> freezeToTf = next
+                                else -> valueTf = next
+                            }
                         },
                         onHistory = { Session.openSheet(Sheet.HISTORY) },
                         onDismiss = { showBuiltInKeyboard = false }
@@ -667,21 +780,44 @@ fun MenuAction(icon: ImageVector, label: String, onClick: () -> Unit) {
 // ============================================================
 @Composable
 fun TypePickSheet(ui: Ui) {
+    val checked = remember(ui.tab, ui.results, ui.saved, ui.memoryRows, ui.selectedCount) {
+        Session.checkedItems()
+    }
     val item = ui.editing ?: ui.contextItem
-    NextSheetCard(title = "选择数据类型", onDismiss = Session::closeSheet) {
+    val isBatch = ui.editing == null && ui.contextItem == null && checked.size > 1
+    val targets = when {
+        isBatch -> checked
+        item != null -> listOf(item)
+        checked.isNotEmpty() -> checked
+        else -> emptyList()
+    }
+    val commonType = targets.firstOrNull()?.let { first ->
+        val ft = first.flags and 0x7F
+        if (targets.all { (it.flags and 0x7F) == ft }) ft else 0
+    } ?: 0
+
+    NextSheetCard(
+        title = if (targets.size > 1) "批量更改类型（已选 ${targets.size} 项）" else "选择数据类型",
+        subtitle = if (targets.size > 1) "将按新类型重读数值并同步已冻结锁值" else null,
+        onDismiss = Session::popSheet
+    ) {
         Column(
             Modifier.verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             ValueType.order.forEach { t ->
-                val on = item != null && (item.flags and 0x7F) == t
+                val on = commonType == t
                 Row(
                     Modifier
                         .fillMaxWidth()
                         .height(44.dp)
                         .background(if (on) Rose.ChipSelected else Rose.CardHigh, RoundedCornerShape(9.dp))
                         .clickableWithTooltip {
-                            if (item != null) Session.changeType(item, t)
+                            if (targets.size > 1) {
+                                Session.batchChangeType(targets, t)
+                            } else if (targets.size == 1) {
+                                Session.changeType(targets.first(), t)
+                            }
                         }
                         .padding(horizontal = 16.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -701,27 +837,41 @@ fun TypePickSheet(ui: Ui) {
 }
 
 // ============================================================
-// 更改地址 / 类型
+// 更改地址 / 类型（支持单选改地址+类型，或多选批量改类型）
 // ============================================================
 @Composable
 fun AddressEditSheet(ui: Ui) {
-    val item = ui.editing ?: ui.contextItem
+    val checked = remember(ui.tab, ui.results, ui.saved, ui.memoryRows, ui.selectedCount) {
+        Session.checkedItems()
+    }
+    val item = ui.editing ?: ui.contextItem ?: checked.firstOrNull()
+    val isBatchTypeMode = checked.size > 1 && ui.contextItem == null && ui.editing == null
     val initAddr = item?.cachedAddressHex
         ?: java.lang.Long.toHexString(ui.memoryHighlightAddress ?: ui.memoryBase).uppercase()
     var addr by remember {
         mutableStateOf(TextFieldValue(initAddr, TextRange(0, initAddr.length)))
     }
-    var showKeyboard by remember { mutableStateOf(true) }
-    NextSheetCard(title = "更改地址 / 类型", onDismiss = Session::closeSheet) {
+    var showKeyboard by remember { mutableStateOf(!isBatchTypeMode) }
+    NextSheetCard(
+        title = if (isBatchTypeMode) "批量更改类型（已选 ${checked.size} 项）" else "更改地址 / 类型",
+        subtitle = if (isBatchTypeMode) "多选状态下可一键统一变更所有已选地址的数据类型" else null,
+        onDismiss = Session::popSheet
+    ) {
         Column(Modifier.verticalScroll(rememberScrollState())) {
-            FieldRow("地址", addr, suppressSystemKeyboard = showKeyboard) { addr = it }
-            Spacer(Modifier.height(10.dp))
+            if (!isBatchTypeMode) {
+                FieldRow("地址", addr, suppressSystemKeyboard = showKeyboard) { addr = it }
+                Spacer(Modifier.height(10.dp))
+            }
             Text(tr("选择新类型"), color = Rose.TextSecond, fontSize = fsp(12f))
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 ValueType.order.take(4).forEach { t ->
                     MiniChip(ValueType.shortName(t), typeColor(t)) {
-                        if (item != null) Session.changeType(item, t)
+                        if (isBatchTypeMode) {
+                            Session.batchChangeType(checked, t)
+                        } else if (item != null) {
+                            Session.changeType(item, t)
+                        }
                     }
                 }
             }
@@ -729,29 +879,37 @@ fun AddressEditSheet(ui: Ui) {
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 ValueType.order.drop(4).forEach { t ->
                     MiniChip(ValueType.shortName(t), typeColor(t)) {
-                        if (item != null) Session.changeType(item, t)
+                        if (isBatchTypeMode) {
+                            Session.batchChangeType(checked, t)
+                        } else if (item != null) {
+                            Session.changeType(item, t)
+                        }
                     }
                 }
             }
             Spacer(Modifier.height(10.dp))
-            AnimatedVisibility(showKeyboard, enter = expandEnter(), exit = expandExit()) {
-                Column {
-                    BuiltInKeyboard(
-                        value = addr,
-                        onValueChange = { addr = it },
-                        onHistory = { Session.openSheet(Sheet.HISTORY) },
-                        onDismiss = { showKeyboard = false }
-                    )
-                    Spacer(Modifier.height(10.dp))
+            if (!isBatchTypeMode) {
+                AnimatedVisibility(showKeyboard, enter = expandEnter(), exit = expandExit()) {
+                    Column {
+                        BuiltInKeyboard(
+                            value = addr,
+                            onValueChange = { addr = it },
+                            onHistory = { Session.openSheet(Sheet.HISTORY) },
+                            onDismiss = { showKeyboard = false }
+                        )
+                        Spacer(Modifier.height(10.dp))
+                    }
                 }
-            }
-            RoseButton("确定", Modifier.fillMaxWidth(), filled = true) {
-                val parsedAddr = addr.text.trim().removePrefix("0x").removeSuffix("h").toULongOrNull(16)?.toLong()
-                if (item != null && parsedAddr != null && parsedAddr != item.address) {
-                    Session.changeAddress(item, parsedAddr, item.flags)
-                } else {
-                    Session.closeSheet()
+                RoseButton("确定", Modifier.fillMaxWidth(), filled = true) {
+                    val parsedAddr = addr.text.trim().removePrefix("0x").removeSuffix("h").toULongOrNull(16)?.toLong()
+                    if (item != null && parsedAddr != null && parsedAddr != item.address) {
+                        Session.changeAddress(item, parsedAddr, item.flags)
+                    } else {
+                        Session.popSheet()
+                    }
                 }
+            } else {
+                RoseButton("取消", Modifier.fillMaxWidth()) { Session.popSheet() }
             }
         }
     }
@@ -880,9 +1038,10 @@ fun OffsetSheet(ui: Ui) {
     val targetAddr = baseAddr + offVal
     val targetHex = java.lang.Long.toHexString(targetAddr).uppercase()
 
-    // 实时读取目标地址的多类型内存预览 (参考图 5)
-    val rawBytes = remember(targetAddr) {
-        Session.engine.readBlock(targetAddr, 8)
+    // 异步读取目标地址的多类型内存预览（杜绝主线程 I/O 阻塞）
+    var rawBytes by remember { mutableStateOf(ByteArray(0)) }
+    LaunchedEffect(targetAddr) {
+        rawBytes = Session.readMemoryPreview(targetAddr, 8)
     }
     var qwordVal = 0L
     for (i in 0 until minOf(8, rawBytes.size)) {
@@ -893,7 +1052,8 @@ fun OffsetSheet(ui: Ui) {
     val doubleVal = java.lang.Double.longBitsToDouble(qwordVal)
     val wordVal = (qwordVal and 0xFFFFL).toShort()
     val byteVal = (qwordVal and 0xFFL).toByte()
-    val xorVal = (dwordVal xor 0x55555555)
+    // 真实地址低 32 位异或（与 GGNext 引擎 XOR 语义一致）
+    val xorVal = dwordVal xor (targetAddr and 0xFFFFFFFFL).toInt()
 
     val hexDisplay = String.format(java.util.Locale.US, "%016Xh", qwordVal)
     val revHexDisplay = Formatter.reverseHex(qwordVal, 8) + "r"
@@ -1623,8 +1783,9 @@ fun ModuleListSheet() {
     var selectedTab by remember { mutableStateOf("权限") }
     var searchQuery by remember { mutableStateOf(TextFieldValue("")) }
 
-    val liveModules = remember {
-        Session.currentProcessRegions()
+    var liveModules by remember { mutableStateOf<List<MemoryModuleItem>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        liveModules = Session.loadProcessRegions()
             .filter { it.path.isNotBlank() && !it.path.startsWith("[anon:") }
             .map { r ->
                 MemoryModuleItem(
@@ -1803,18 +1964,24 @@ fun ScriptSheet(ui: Ui) {
             }
 
             Spacer(Modifier.height(8.dp))
-            Text(
-                text = tr("输入可读取的本地脚本路径。"),
-                color = Rose.TextSecond,
-                fontSize = fsp(12.5f),
-                modifier = Modifier.padding(start = 2.dp)
-            )
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Rose.Orange.copy(alpha = if (Rose.IsDark) 0.14f else 0.12f), RoundedCornerShape(9.dp))
+                    .border(1.dp, Rose.Orange.copy(alpha = 0.45f), RoundedCornerShape(9.dp))
+                    .padding(horizontal = 10.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = tr("提示：当前版本尚未内置 Lua 虚拟机与 gg.* 运行时接口，脚本历史与路径管理已持久化，暂不支持直接执行脚本。"),
+                    color = Rose.Orange,
+                    fontSize = fsp(11.5f),
+                    lineHeight = fsp(16f)
+                )
+            }
 
-            var pinnedSet by remember { mutableStateOf(setOf<String>()) }
             var editScriptDialogTarget by remember { mutableStateOf<String?>(null) }
             var editScriptTf by remember { mutableStateOf(TextFieldValue("")) }
             var editScriptNoteTf by remember { mutableStateOf(TextFieldValue("")) }
-            var scriptNotesMap by remember { mutableStateOf(mapOf<String, String>()) }
 
             AnimatedVisibility(showRecent, enter = expandEnter(), exit = expandExit()) {
                 Column(
@@ -1830,16 +1997,17 @@ fun ScriptSheet(ui: Ui) {
                         Text(tr("最近执行的脚本:"), color = Rose.TextSecond, fontSize = fsp(12.5f), fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                     }
 
-                    val sortedHistory = remember(ui.scriptHistory, pinnedSet) {
-                        ui.scriptHistory.sortedByDescending { it in pinnedSet }
+                    val sortedHistory = remember(ui.scriptHistory) {
+                        ui.scriptHistory.sortedByDescending { it.pinned }
                     }
 
-                    sortedHistory.forEach { path ->
+                    sortedHistory.forEach { entry ->
+                        val path = entry.path
+                        val isPinned = entry.pinned
+                        val note = entry.note
                         key(path) {
                             var swipeOffsetX by remember { mutableFloatStateOf(0f) }
                             val animatedSwipe by animateFloatAsState(targetValue = swipeOffsetX, animationSpec = tween(140), label = "swipe")
-                            val isPinned = path in pinnedSet
-                            val note = scriptNotesMap[path]
                             val actionWidthPx = with(LocalDensity.current) { 156.dp.toPx() } // 3 actions * 52dp
 
                             Box(
@@ -1848,7 +2016,7 @@ fun ScriptSheet(ui: Ui) {
                                     .height(44.dp)
                                     .clip(RoundedCornerShape(9.dp))
                             ) {
-                                // 界面调整 2：左滑展示快捷操作按钮（固定、编辑、删除，参考图6）
+                                // 左滑展示快捷操作按钮（固定、编辑、删除）
                                 Row(
                                     Modifier
                                         .fillMaxSize()
@@ -1856,7 +2024,7 @@ fun ScriptSheet(ui: Ui) {
                                     horizontalArrangement = Arrangement.End,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    // 1. 固定 (Pin) - 去除背景色块，保留彩色图标与文字 (需求 4)
+                                    // 1. 固定 (Pin) - 持久化到 DataStore
                                     val pinCol = if (isPinned) Rose.Primary else Rose.Blue
                                     Box(
                                         Modifier
@@ -1865,8 +2033,7 @@ fun ScriptSheet(ui: Ui) {
                                             .background(Rose.CardHigh)
                                             .clickable {
                                                 swipeOffsetX = 0f
-                                                pinnedSet = if (isPinned) pinnedSet - path else pinnedSet + path
-                                                if (!isPinned) Session.pinScriptHistory(path)
+                                                Session.toggleScriptPin(path)
                                                 Session.toast(if (isPinned) "已取消固定" else "已固定置顶")
                                             },
                                         contentAlignment = Alignment.Center
@@ -1886,7 +2053,7 @@ fun ScriptSheet(ui: Ui) {
                                                 swipeOffsetX = 0f
                                                 editScriptDialogTarget = path
                                                 editScriptTf = TextFieldValue(path, TextRange(path.length))
-                                                editScriptNoteTf = TextFieldValue(scriptNotesMap[path].orEmpty())
+                                                editScriptNoteTf = TextFieldValue(note)
                                             },
                                         contentAlignment = Alignment.Center
                                     ) {
@@ -1903,7 +2070,6 @@ fun ScriptSheet(ui: Ui) {
                                             .background(Rose.CardHigh)
                                             .clickable {
                                                 swipeOffsetX = 0f
-                                                pinnedSet = pinnedSet - path
                                                 Session.removeScriptHistory(path)
                                                 Session.toast("已删除脚本记录")
                                             },
@@ -1961,7 +2127,7 @@ fun ScriptSheet(ui: Ui) {
                                                 overflow = TextOverflow.Ellipsis
                                             )
                                         }
-                                        if (!note.isNullOrBlank()) {
+                                        if (note.isNotBlank()) {
                                             Text(
                                                 text = note,
                                                 color = Rose.TextSecond,
@@ -1998,10 +2164,7 @@ fun ScriptSheet(ui: Ui) {
                                 RoseButton("保存", Modifier.weight(1f), filled = true) {
                                     val newP = editScriptTf.text.trim()
                                     if (newP.isNotEmpty()) {
-                                        Session.updateScriptHistory(targetOldPath, newP)
-                                        if (editScriptNoteTf.text.isNotBlank()) {
-                                            scriptNotesMap = scriptNotesMap + (newP to editScriptNoteTf.text.trim())
-                                        }
+                                        Session.updateScriptEntry(targetOldPath, newP, editScriptNoteTf.text.trim())
                                         Session.toast("已更新脚本记录")
                                     }
                                     editScriptDialogTarget = null
@@ -2055,9 +2218,10 @@ fun ScriptSheet(ui: Ui) {
                 }
                 Spacer(Modifier.width(8.dp))
                 RoseButton(
-                    label = "运行",
-                    modifier = Modifier.width(68.dp).height(38.dp),
-                    filled = true
+                    label = "暂不可用",
+                    modifier = Modifier.width(84.dp).height(38.dp),
+                    filled = false,
+                    enabled = false
                 ) {
                     Session.runScript(scriptTf.text)
                 }
@@ -2276,7 +2440,8 @@ private fun BrowserEntryRow(
     )
     val borderColor = if (entry.isDirectory) Rose.Primary.copy(alpha = 0.38f) else Rose.Divider
 
-    val (icon, iconColor, badgeLabel) = remember(entry.isDirectory, entry.ext) {
+    val isDark = Rose.IsDark
+    val (icon, iconColor, badgeLabel) = remember(entry.isDirectory, entry.ext, isDark) {
         if (entry.isDirectory) {
             Triple(GgIcons.FolderIcon, Rose.Yellow, "DIR")
         } else {
@@ -2745,10 +2910,25 @@ fun AllocateSheet(ui: Ui) {
 
     NextSheetCard(
         title = "分配内存页",
-        onDismiss = Session::closeSheet,
+        onDismiss = Session::popSheet,
         maxBodyHeight = 760
     ) {
         Column(Modifier.verticalScroll(rememberScrollState())) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Rose.Orange.copy(alpha = if (Rose.IsDark) 0.14f else 0.12f), RoundedCornerShape(9.dp))
+                    .border(1.dp, Rose.Orange.copy(alpha = 0.45f), RoundedCornerShape(9.dp))
+                    .padding(horizontal = 10.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = tr("提示：当前版本未集成远程 ptrace mmap 注入，暂不支持在目标进程内分配新内存页。"),
+                    color = Rose.Orange,
+                    fontSize = fsp(11.5f),
+                    lineHeight = fsp(16f)
+                )
+            }
+            Spacer(Modifier.height(8.dp))
             AllocPermRow("也许可读", allowRead) { allowRead = it }
             AllocPermRow("也许可写", allowWrite) { allowWrite = it }
             AllocPermRow("也许可执行", allowExec) { allowExec = it }
@@ -2807,18 +2987,22 @@ fun AllocateSheet(ui: Ui) {
             }
 
             AnimatedVisibility(showRegionPicker, enter = expandEnter(), exit = expandExit()) {
-                val regionSamples = remember(ui.target?.pid) {
-                    buildList {
-                        add("0 (系统自动分配)" to "0")
-                        listOf(
-                            "Ca" to "C++ alloc",
-                            "A" to "Anonymous",
-                            "Xa" to "Code app"
-                        ).forEach { (code, desc) ->
-                            val base = Session.firstRegionBase(code)
-                            if (base != null && base != 0L) {
-                                val hex = java.lang.Long.toHexString(base).uppercase()
-                                add("$code: $desc (0x$hex)" to hex)
+                var regionSamples by remember { mutableStateOf(listOf("0 (系统自动分配)" to "0")) }
+                LaunchedEffect(showRegionPicker, ui.target?.pid) {
+                    if (showRegionPicker) {
+                        val regions = Session.loadProcessRegions()
+                        regionSamples = buildList {
+                            add("0 (系统自动分配)" to "0")
+                            listOf(
+                                "Ca" to "C++ alloc",
+                                "A" to "Anonymous",
+                                "Xa" to "Code app"
+                            ).forEach { (code, desc) ->
+                                val base = regions.firstOrNull { it.code == code }?.start
+                                if (base != null && base != 0L) {
+                                    val hex = java.lang.Long.toHexString(base).uppercase()
+                                    add("$code: $desc (0x$hex)" to hex)
+                                }
                             }
                         }
                     }
@@ -2869,13 +3053,14 @@ fun AllocateSheet(ui: Ui) {
                     label = "取消",
                     modifier = Modifier.width(74.dp).height(38.dp)
                 ) {
-                    Session.closeSheet()
+                    Session.popSheet()
                 }
                 Spacer(Modifier.width(10.dp))
                 RoseButton(
-                    label = "确定",
-                    filled = true,
-                    modifier = Modifier.width(74.dp).height(38.dp)
+                    label = "暂不可用",
+                    filled = false,
+                    enabled = false,
+                    modifier = Modifier.width(88.dp).height(38.dp)
                 ) {
                     val clean = addrTf.text.trim().removePrefix("0x").removeSuffix("h")
                     val addr = if (clean.isEmpty() || clean == "0") 0L else (clean.toULongOrNull(16)?.toLong() ?: 0L)
@@ -2911,17 +3096,23 @@ private fun AllocPermRow(
 }
 
 // ============================================================
-// 保存/载入列表文件界面
+// 保存/载入列表文件界面（显式区分载入与保存/导出，杜绝误覆盖）
 // ============================================================
 @Composable
 fun FileSheet(ui: Ui) {
     var tf by remember(ui.fileManagerPath) {
         mutableStateOf(TextFieldValue(ui.fileManagerPath, TextRange(0, ui.fileManagerPath.length)))
     }
+    val mode = ui.fileSheetMode
+    val sheetTitle = when (mode) {
+        FileSheetMode.LOAD -> "从文件载入列表"
+        FileSheetMode.SAVE -> "保存列表到文件"
+        FileSheetMode.EXPORT -> "导出选定项到文件"
+    }
     NextSheetCard(
-        title = if (ui.tab == NextTab.SAVED_LIST) "保存/载入列表文件" else "导出选定项到文件",
-        subtitle = "输入文件路径或点击右侧「浏览」从文件浏览器中选择",
-        onDismiss = Session::closeSheet
+        title = sheetTitle,
+        subtitle = "输入文件路径或点击右侧「浏览」选择，点击下方按钮执行对应读写操作",
+        onDismiss = Session::popSheet
     ) {
         Column(Modifier.verticalScroll(rememberScrollState())) {
             Row(
@@ -2949,9 +3140,24 @@ fun FileSheet(ui: Ui) {
             }
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                RoseButton("取消", Modifier.weight(1f)) { Session.closeSheet() }
-                RoseButton("确定", Modifier.weight(1f), filled = true) {
-                    Session.saveOrLoadListFile(tf.text)
+                RoseButton("取消", Modifier.weight(0.8f)) { Session.popSheet() }
+                if (mode != FileSheetMode.EXPORT) {
+                    RoseButton(
+                        label = "载入",
+                        modifier = Modifier.weight(1f),
+                        filled = mode == FileSheetMode.LOAD,
+                        enabled = !ui.isBatchBusy
+                    ) {
+                        Session.loadListFromFile(tf.text)
+                    }
+                }
+                RoseButton(
+                    label = if (mode == FileSheetMode.EXPORT) "导出选中" else "保存",
+                    modifier = Modifier.weight(1f),
+                    filled = mode != FileSheetMode.LOAD,
+                    enabled = !ui.isBatchBusy
+                ) {
+                    Session.saveListToFile(tf.text, onlyChecked = mode == FileSheetMode.EXPORT)
                 }
             }
         }
@@ -2959,18 +3165,33 @@ fun FileSheet(ui: Ui) {
 }
 
 // ============================================================
-// 变速
+// 变速（诚实提示：当前未集成目标进程时钟 Hook）
 // ============================================================
 @Composable
 fun SpeedSheet(ui: Ui) {
     var speed by remember(ui.speedMultiplier) { mutableStateOf(ui.speedMultiplier) }
-    NextSheetCard(title = "游戏变速", subtitle = "长按悬浮球也可随时呼出左右加减速控制栏", onDismiss = Session::closeSheet) {
+    NextSheetCard(title = "游戏变速", subtitle = "变速控制需要底层时间函数 Hook 支持", onDismiss = Session::popSheet) {
         Column(Modifier.verticalScroll(rememberScrollState())) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Rose.Orange.copy(alpha = if (Rose.IsDark) 0.14f else 0.12f), RoundedCornerShape(9.dp))
+                    .border(1.dp, Rose.Orange.copy(alpha = 0.45f), RoundedCornerShape(9.dp))
+                    .padding(horizontal = 10.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = tr("提示：当前版本未注入目标进程时钟 Hook（clock_gettime / gettimeofday），变速调节暂不可用。"),
+                    color = Rose.Orange,
+                    fontSize = fsp(11.5f),
+                    lineHeight = fsp(16f)
+                )
+            }
+            Spacer(Modifier.height(10.dp))
             Text(
                 text = String.format(java.util.Locale.US, "%.2fx", speed).trimEnd('0').let {
                     if (it.endsWith(".")) "${it}0x" else if (!it.endsWith("x")) "${it}x" else it
                 },
-                color = Rose.Primary,
+                color = Rose.TextDim,
                 fontSize = fsp(36f),
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.fillMaxWidth(),
@@ -2979,23 +3200,20 @@ fun SpeedSheet(ui: Ui) {
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf(0.25f, 0.5f, 1.0f, 1.5f).forEach { v ->
-                    RoseButton("${v}x", Modifier.weight(1f)) { speed = v }
+                    RoseButton("${v}x", Modifier.weight(1f), enabled = false) { speed = v }
                 }
             }
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf(2.0f, 5.0f, 10.0f, 50.0f).forEach { v ->
-                    RoseButton("${v.toInt()}x", Modifier.weight(1f)) { speed = v }
+                    RoseButton("${v.toInt()}x", Modifier.weight(1f), enabled = false) { speed = v }
                 }
             }
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                RoseButton("÷2", Modifier.weight(1f)) { speed = (speed / 2f).coerceAtLeast(0.05f) }
-                RoseButton("×2", Modifier.weight(1f)) { speed = (speed * 2f).coerceAtMost(100f) }
-                RoseButton("应用", Modifier.weight(1f), filled = true) {
+                RoseButton("关闭", Modifier.weight(1f)) { Session.popSheet() }
+                RoseButton("暂不可用", Modifier.weight(1f), filled = false, enabled = false) {
                     Session.setSpeedMultiplier(speed)
-                    Session.setSetting("speed_value", speed.toString())
-                    Session.closeSheet()
                 }
             }
         }
@@ -3048,10 +3266,11 @@ fun LanguageSheet() {
 // ============================================================
 @Composable
 fun HistorySheet(ui: Ui) {
-    NextSheetCard(title = "输入历史", onDismiss = Session::closeSheet, maxBodyHeight = 560) {
+    NextSheetCard(title = "输入历史", onDismiss = Session::popSheet, maxBodyHeight = 560) {
         Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(5.dp)) {
             if (ui.history.isEmpty()) Text(tr("无历史记录"), color = Rose.TextDim, fontSize = fsp(13f))
             ui.history.forEach { h ->
+                val pinned = Session.isHistoryPinned(h)
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -3061,7 +3280,29 @@ fun HistorySheet(ui: Ui) {
                         .padding(horizontal = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    if (pinned) {
+                        Icon(
+                            Icons.Rounded.PushPin,
+                            contentDescription = "已置顶",
+                            tint = Rose.Primary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                    }
                     Text(h, style = monoStyle(13, Rose.Text), modifier = Modifier.weight(1f))
+                    Box(
+                        Modifier
+                            .size(28.dp)
+                            .clickableWithTooltip { Session.toggleHistoryPin(h) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Rounded.PushPin,
+                            contentDescription = if (pinned) "取消置顶" else "置顶",
+                            tint = if (pinned) Rose.Primary else Rose.TextDim,
+                            modifier = Modifier.size(15.dp)
+                        )
+                    }
                     Box(
                         Modifier
                             .size(28.dp)

@@ -44,9 +44,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.littlecodesauce.ggnext.core.FileSheetMode
 import com.littlecodesauce.ggnext.core.NextTab
 import com.littlecodesauce.ggnext.core.Session
 import com.littlecodesauce.ggnext.core.Sheet
@@ -56,6 +59,7 @@ import com.littlecodesauce.ggnext.ui.components.NavBar
 import com.littlecodesauce.ggnext.ui.components.ProcessBar
 import com.littlecodesauce.ggnext.ui.components.RegionSummaryBar
 import com.littlecodesauce.ggnext.ui.components.ToolBar
+import com.littlecodesauce.ggnext.ui.components.VerticalNavRail
 import com.littlecodesauce.ggnext.ui.components.clickableNoRipple
 import com.littlecodesauce.ggnext.ui.components.fsp
 import com.littlecodesauce.ggnext.ui.components.monoStyle
@@ -85,11 +89,14 @@ fun PanelScreen(
     onMinimize: () -> Unit,
     compact: Boolean = false
 ) {
-    BackHandler(enabled = ui.sheet != Sheet.NONE) { Session.closeSheet() }
+    BackHandler(enabled = ui.sheet != Sheet.NONE) { Session.popSheet() }
 
     val sheetOpen = ui.sheet != Sheet.NONE
     val app = LocalContext.current.applicationContext as android.app.Application
     val clipboard = LocalClipboardManager.current
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE ||
+        configuration.screenWidthDp > configuration.screenHeightDp
     var refreshRequested by remember { mutableStateOf(false) }
 
     LaunchedEffect(refreshRequested) {
@@ -102,13 +109,7 @@ fun PanelScreen(
     val contentScale by animateFloatAsState(if (sheetOpen) 0.975f else 1f, Motion.Normal, label = "cs")
     val contentAlpha by animateFloatAsState(if (sheetOpen) 0.55f else 1f, Motion.Normal, label = "ca")
 
-    val checkedCount = remember(ui.tab, ui.results, ui.saved, ui.memoryRows) {
-        when (ui.tab) {
-            NextTab.SAVED_LIST -> ui.saved.count { it.checked }
-            NextTab.MEMORY -> ui.memoryRows.count { it.checked }
-            else -> ui.results.count { it.checked }
-        }
-    }
+    val checkedCount = ui.selectedCount
 
     val orderedSelectedRegions = remember(ui.selectedRegions) {
         RegionCatalog.ALL.map { it.code }.filter { ui.selectedRegions.contains(it) }
@@ -119,10 +120,89 @@ fun PanelScreen(
     val isPartialScreen = panelScale < 0.99f
     val panelCorner = if (isPartialScreen) 16.dp else 0.dp
 
+    val workArea: @Composable (Modifier) -> Unit = { mod ->
+        Column(modifier = mod) {
+            if (ui.tab != NextTab.SETTINGS) {
+                ToolBar(
+                    flowingTools = ui.flowingTools,
+                    pinnedTools = ui.currentPinnedTools,
+                    ui = ui,
+                    onTool = { id ->
+                        handleTool(id, ui) { text ->
+                            clipboard.setText(AnnotatedString(text))
+                        }
+                    },
+                    onScript = { Session.openSheet(Sheet.SCRIPT) },
+                    onMoreMenu = onMenu,
+                    onMoveFlowingTool = { from, to ->
+                        val fullList = Session.toolList(ui.tab).toMutableList()
+                        val flowing = ui.flowingTools
+                        if (from in flowing.indices && to in flowing.indices) {
+                            val fromItem = flowing[from]
+                            val toItem = flowing[to]
+                            val idxFrom = fullList.indexOf(fromItem)
+                            val idxTo = fullList.indexOf(toItem)
+                            if (idxFrom != -1 && idxTo != -1) {
+                                Session.moveTool(ui.tab, idxFrom, idxTo)
+                            }
+                        }
+                    },
+                    onMovePinnedTool = { from, to ->
+                        Session.movePinnedTool(ui.tab, from, to)
+                    },
+                    onMinimize = if (isLandscape) onMinimize else null
+                )
+            }
+            Hairline()
+            ProcessBar(
+                target = ui.target,
+                paused = ui.processPaused,
+                countText = ui.countButtonText,
+                busy = ui.busy,
+                onPick = { Session.openSheet(Sheet.PROCESS) },
+                onCountClick = { Session.openSheet(Sheet.FILTER) },
+                onRefresh = {
+                    Session.refreshLiveValues(manual = true)
+                },
+                onPause = { Session.toggleProcessPause() },
+                onMinimize = if (isLandscape && ui.tab == NextTab.SETTINGS) onMinimize else null
+            )
+            Hairline()
+            AnimatedVisibility(visible = ui.busy) {
+                com.littlecodesauce.ggnext.ui.components.InlineSearchProgressBar(ui = ui)
+            }
+
+            AnimatedContent(
+                targetState = ui.tab,
+                transitionSpec = {
+                    val forward = targetState.ordinal > initialState.ordinal
+                    (fadeIn(tween(160)) + slideInVertically(tween(180)) { h -> if (forward) h / 14 else -h / 14 })
+                        .togetherWith(fadeOut(tween(110)))
+                },
+                label = "panelTab",
+                modifier = Modifier.weight(1f)
+            ) { tab ->
+                when (tab) {
+                    NextTab.SEARCH_LIST -> SearchListScreen(ui)
+                    NextTab.SAVED_LIST -> SavedListScreen(ui)
+                    NextTab.MEMORY -> MemoryScreen(ui)
+                    NextTab.SETTINGS -> SettingsScreen(ui, embedded = true)
+                }
+            }
+
+            RegionSummaryBar(
+                codes = orderedSelectedRegions,
+                checkedItemCount = checkedCount,
+                onLongPress = { Session.openSheet(Sheet.REGION) },
+                onClick = { Session.openSheet(Sheet.REGION) }
+            )
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(if (isPartialScreen) Color.Black.copy(alpha = 0.25f) else Color.Transparent),
+            .background(Color.Transparent),
         contentAlignment = Alignment.Center
     ) {
         if (isPartialScreen) {
@@ -130,10 +210,8 @@ fun PanelScreen(
                 Modifier
                     .fillMaxSize()
                     .clickableNoRipple(remember { MutableInteractionSource() }) {
-                        // Bug 2.2 修复：屏幕占比 < 100% 时，点击修改器面板外空白处不将修改器最小化；
-                        // 仅当存在弹窗界面 (ui.sheet != Sheet.NONE) 时，点击空白处关闭当前弹窗。
                         if (ui.sheet != Sheet.NONE) {
-                            Session.closeSheet()
+                            Session.popSheet()
                         }
                     }
             )
@@ -151,102 +229,53 @@ fun PanelScreen(
                 )
                 .clickableNoRipple(remember { MutableInteractionSource() }) {}
         ) {
-            Column(
-                Modifier
-                    .fillMaxSize()
-                    .then(if (compact || isPartialScreen) Modifier else Modifier.statusBarsPadding())
-                    .graphicsLayer {
-                        scaleX = contentScale
-                        scaleY = contentScale
-                        alpha = contentAlpha
-                    }
-            ) {
-                NavBar(
-                    tab = ui.tab,
-                    target = ui.target,
-                    searchCount = ui.results.size,
-                    savedCount = ui.saved.size,
-                    onPickProcess = { Session.openSheet(Sheet.PROCESS) },
-                    onTab = onNav,
-                    onMinimize = onMinimize
-                )
-                if (ui.tab != NextTab.SETTINGS) {
-                    ToolBar(
-                        flowingTools = ui.flowingTools,
-                        pinnedTools = ui.currentPinnedTools,
-                        ui = ui,
-                        onTool = { id ->
-                            handleTool(id, ui) { text ->
-                                clipboard.setText(AnnotatedString(text))
-                            }
-                        },
-                        onScript = { Session.openSheet(Sheet.SCRIPT) },
-                        onMoreMenu = onMenu,
-                        onMoveFlowingTool = { from, to ->
-                            val fullList = Session.toolList(ui.tab).toMutableList()
-                            val flowing = ui.flowingTools
-                            if (from in flowing.indices && to in flowing.indices) {
-                                val fromItem = flowing[from]
-                                val toItem = flowing[to]
-                                val idxFrom = fullList.indexOf(fromItem)
-                                val idxTo = fullList.indexOf(toItem)
-                                if (idxFrom != -1 && idxTo != -1) {
-                                    Session.moveTool(ui.tab, idxFrom, idxTo)
-                                }
-                            }
-                        },
-                        onMovePinnedTool = { from, to ->
-                            Session.movePinnedTool(ui.tab, from, to)
-                        }
+            val contentMod = Modifier
+                .fillMaxSize()
+                .then(if (compact || isPartialScreen) Modifier else Modifier.statusBarsPadding())
+                .graphicsLayer {
+                    scaleX = contentScale
+                    scaleY = contentScale
+                    alpha = contentAlpha
+                }
+
+            if (isLandscape) {
+                Row(modifier = contentMod) {
+                    VerticalNavRail(
+                        tab = ui.tab,
+                        target = ui.target,
+                        searchCount = ui.results.size,
+                        savedCount = ui.saved.size,
+                        onPickProcess = { Session.openSheet(Sheet.PROCESS) },
+                        onTab = onNav
                     )
+                    workArea(Modifier.weight(1f).fillMaxHeight())
                 }
-                Hairline()
-                ProcessBar(
-                    target = ui.target,
-                    paused = ui.processPaused,
-                    countText = ui.countButtonText,
-                    busy = ui.busy,
-                    onPick = { Session.openSheet(Sheet.PROCESS) },
-                    onCountClick = { Session.openSheet(Sheet.FILTER) },
-                    onRefresh = {
-                        Session.refreshLiveValues(manual = true)
-                    },
-                    onPause = { Session.toggleProcessPause() }
-                )
-                Hairline()
-                AnimatedVisibility(visible = ui.busy) {
-                    com.littlecodesauce.ggnext.ui.components.InlineSearchProgressBar(ui = ui)
+            } else {
+                Column(modifier = contentMod) {
+                    NavBar(
+                        tab = ui.tab,
+                        target = ui.target,
+                        searchCount = ui.results.size,
+                        savedCount = ui.saved.size,
+                        onPickProcess = { Session.openSheet(Sheet.PROCESS) },
+                        onTab = onNav,
+                        onMinimize = onMinimize
+                    )
+                    workArea(Modifier.weight(1f).fillMaxWidth())
                 }
-
-                AnimatedContent(
-                    targetState = ui.tab,
-                    transitionSpec = {
-                        val forward = targetState.ordinal > initialState.ordinal
-                        (fadeIn(tween(160)) + slideInVertically(tween(180)) { h -> if (forward) h / 14 else -h / 14 })
-                            .togetherWith(fadeOut(tween(110)))
-                    },
-                    label = "panelTab",
-                    modifier = Modifier.weight(1f)
-                ) { tab ->
-                    when (tab) {
-                        NextTab.SEARCH_LIST -> SearchListScreen(ui)
-                        NextTab.SAVED_LIST -> SavedListScreen(ui)
-                        NextTab.MEMORY -> MemoryScreen(ui)
-                        NextTab.SETTINGS -> SettingsScreen(ui, embedded = true)
-                    }
-                }
-
-                RegionSummaryBar(
-                    codes = orderedSelectedRegions,
-                    checkedItemCount = checkedCount,
-                    onLongPress = { Session.openSheet(Sheet.REGION) },
-                    onClick = { Session.openSheet(Sheet.REGION) }
-                )
             }
         }
 
         SheetHost(ui)
-        ui.toast?.let { ToastBubble(it) { Session.consumeToast() } }
+        PanelToastHost()
+    }
+}
+
+@Composable
+private fun PanelToastHost() {
+    val toast by Session.toastState.collectAsStateWithLifecycle()
+    toast?.let { msg ->
+        ToastBubble(msg) { Session.consumeToast() }
     }
 }
 
@@ -353,10 +382,13 @@ private fun handleTool(
         ToolId.OFFSET -> Session.openSheet(Sheet.OFFSET)
         ToolId.CALC_OFFSET -> Session.openSheet(Sheet.CALC_OFFSET)
         ToolId.ADDRESS -> {
-            val first = Session.checkedItems().firstOrNull() ?: ui.results.firstOrNull() ?: ui.saved.firstOrNull()
+            val checked = Session.checkedItems()
+            val first = checked.firstOrNull() ?: ui.results.firstOrNull() ?: ui.saved.firstOrNull() ?: ui.memoryRows.firstOrNull()
             Session.openSheet(Sheet.ADDRESS_EDIT, first)
         }
-        ToolId.LOAD, ToolId.SAVE_FILE, ToolId.EXPORT -> Session.openSheet(Sheet.FILE_MANAGER)
+        ToolId.LOAD -> Session.openFileSheet(FileSheetMode.LOAD)
+        ToolId.SAVE_FILE -> Session.openFileSheet(FileSheetMode.SAVE)
+        ToolId.EXPORT -> Session.openFileSheet(FileSheetMode.EXPORT)
         ToolId.GOTO -> Session.openSheet(Sheet.GOTO)
         ToolId.COPY_MEM -> Session.openSheet(Sheet.COPY_MEMORY)
         ToolId.DUMP -> Session.openSheet(Sheet.DUMP)

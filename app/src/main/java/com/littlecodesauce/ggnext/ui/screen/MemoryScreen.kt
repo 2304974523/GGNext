@@ -133,6 +133,7 @@ fun MemoryScreen(ui: Ui) {
                     ) { _, item ->
                         MemoryRow(
                             item = item,
+                            checked = ui.isMemoryRowSelected(item),
                             mask = ui.valueMask,
                             isJumpTarget = (item.address == ui.memoryHighlightAddress)
                         )
@@ -233,13 +234,15 @@ private fun MemoryMiniBar(
 @Composable
 private fun MemoryRow(
     item: MemoryItem,
+    checked: Boolean,
     mask: Int,
     isJumpTarget: Boolean
 ) {
     val currentItem by rememberUpdatedState(item)
     val bgOpacity = com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics.current.bgOpacity.coerceIn(0.25f, 1.0f)
-    val accent = remember(item.flags) { typeColor(item.flags) }
-    val hexColor = remember(item.pointer) { pointerColor(item.pointer) }
+    val isDark = Rose.IsDark
+    val accent = remember(item.flags, isDark) { typeColor(item.flags) }
+    val hexColor = remember(item.pointer, isDark) { pointerColor(item.pointer) }
     val ptrLabel = remember(item.pointer) { pointerTypeLabel(item.pointer) }
     val shortType = remember(item.flags) { com.littlecodesauce.ggnext.model.ValueType.shortName(item.flags) }
     val formattedVal = remember(item.value, item.flags) { valueText(item) }
@@ -249,9 +252,9 @@ private fun MemoryRow(
     }
 
     val rowBgColor = when {
-        isJumpTarget && item.checked -> Rose.JumpHighlight.copy(alpha = 0.42f)
+        isJumpTarget && checked -> Rose.JumpHighlight.copy(alpha = 0.42f)
         isJumpTarget -> Rose.JumpHighlight
-        item.checked -> Rose.Primary.copy(alpha = if (Rose.IsDark) 0.18f else 0.22f)
+        checked -> Rose.Primary.copy(alpha = if (isDark) 0.18f else 0.20f)
         else -> Rose.Row.copy(alpha = (bgOpacity * 0.88f).coerceIn(0.18f, 1.0f))
     }
 
@@ -271,7 +274,7 @@ private fun MemoryRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         GgCheckBox(
-            checked = item.checked,
+            checked = checked,
             onCheckedChange = { Session.toggle(currentItem) },
             size = 19.dp,
             accentColor = Rose.Primary
@@ -319,7 +322,7 @@ private fun MemoryRow(
             )
         } else {
             // 内存区域代码采用专属高亮色彩
-            val regColor = remember(item.region) { com.littlecodesauce.ggnext.ui.theme.regionColor(item.region) }
+            val regColor = remember(item.region, isDark) { com.littlecodesauce.ggnext.ui.theme.regionColor(item.region) }
             Text(
                 text = item.region,
                 style = monoStyle(11, regColor, weight = FontWeight.SemiBold)

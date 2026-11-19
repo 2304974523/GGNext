@@ -8,8 +8,8 @@
 #include <cstring>
 #include <fstream>
 #include <algorithm>
+#include <unistd.h>
 
-// Support compilation under both Android NDK (<jni.h>) and host Linux CI builds without JDK headers
 #if __has_include(<jni.h>)
 #include <jni.h>
 #else
@@ -101,13 +101,13 @@ constexpr uint32_t kGGNextRegionOrder[15] = {
 extern "C" {
 
 // ============================================================================
-// 1. Standard QA MemDiagnosticEngine JNI Endpoints
+// GGNext Native JNI Bridge (com.littlecodesauce.ggnext.engine.NativeMemBridge)
 // ============================================================================
 
 JNIEXPORT jlong JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeCreate(
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeCreate(
     JNIEnv* env,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jint workerThreads,
     jstring spillDirJstr
 ) {
@@ -122,9 +122,9 @@ Java_com_qa_memengine_MemDiagnosticEngine_nativeCreate(
 }
 
 JNIEXPORT void JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeDestroy(
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeDestroy(
     JNIEnv* /*env*/,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle
 ) {
     auto* session = reinterpret_cast<NativeEngineSession*>(handle);
@@ -135,9 +135,9 @@ Java_com_qa_memengine_MemDiagnosticEngine_nativeDestroy(
 }
 
 JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeAttachProcess(
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeAttach(
     JNIEnv* /*env*/,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
     jlong handle,
     jint pid
 ) {
@@ -153,10 +153,25 @@ Java_com_qa_memengine_MemDiagnosticEngine_nativeAttachProcess(
     return static_cast<jint>(rc);
 }
 
-JNIEXPORT void JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeSetRegionMask(
+JNIEXPORT jboolean JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeIsProcessAlive(
     JNIEnv* /*env*/,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
+    jlong handle
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return JNI_FALSE;
+    int pid = session->io.pid();
+    if (pid <= 0) return JNI_FALSE;
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    return ::access(path, F_OK) == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSetRegionMask(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint regionMask
 ) {
@@ -170,363 +185,36 @@ Java_com_qa_memengine_MemDiagnosticEngine_nativeSetRegionMask(
 }
 
 JNIEXPORT void JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeCancelScan(
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSetAddressFilter(
     JNIEnv* /*env*/,
-    jobject /*thiz*/,
+    jclass /*clazz*/,
+    jlong handle,
+    jlong minAddr,
+    jlong maxAddr,
+    jlong addrMask,
+    jlong addrPattern
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return;
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->scanner->setAddressFilter(
+        static_cast<uint64_t>(minAddr),
+        static_cast<uint64_t>(maxAddr),
+        static_cast<uint64_t>(addrMask),
+        static_cast<uint64_t>(addrPattern)
+    );
+}
+
+JNIEXPORT void JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeCancelScan(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle
 ) {
     auto* session = reinterpret_cast<NativeEngineSession*>(handle);
     if (session) {
         session->cancelToken.cancel();
     }
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchExact(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jint dataType,
-    jlong intTarget,
-    jdouble floatTarget,
-    jdouble epsilon,
-    jboolean aligned
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->cancelToken.reset();
-    auto rc = session->scanner->searchExact(
-        static_cast<mem_engine::DataType>(dataType),
-        static_cast<int64_t>(intTarget),
-        static_cast<double>(floatTarget),
-        static_cast<double>(epsilon),
-        aligned == JNI_TRUE,
-        &session->cancelToken
-    );
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineExact(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jint dataType,
-    jlong intTarget,
-    jdouble floatTarget,
-    jdouble epsilon
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->cancelToken.reset();
-    auto rc = session->scanner->refineExact(
-        static_cast<mem_engine::DataType>(dataType),
-        static_cast<int64_t>(intTarget),
-        static_cast<double>(floatTarget),
-        static_cast<double>(epsilon),
-        &session->cancelToken
-    );
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchRange(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jint dataType,
-    jlong intMin,
-    jlong intMax,
-    jdouble floatMin,
-    jdouble floatMax,
-    jboolean inclusive,
-    jboolean aligned
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->cancelToken.reset();
-    auto rc = session->scanner->searchRange(
-        static_cast<mem_engine::DataType>(dataType),
-        static_cast<int64_t>(intMin),
-        static_cast<int64_t>(intMax),
-        static_cast<double>(floatMin),
-        static_cast<double>(floatMax),
-        inclusive == JNI_TRUE,
-        aligned == JNI_TRUE,
-        &session->cancelToken
-    );
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineRange(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jint dataType,
-    jlong intMin,
-    jlong intMax,
-    jdouble floatMin,
-    jdouble floatMax,
-    jboolean inclusive
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->cancelToken.reset();
-    auto rc = session->scanner->refineRange(
-        static_cast<mem_engine::DataType>(dataType),
-        static_cast<int64_t>(intMin),
-        static_cast<int64_t>(intMax),
-        static_cast<double>(floatMin),
-        static_cast<double>(floatMax),
-        inclusive == JNI_TRUE,
-        &session->cancelToken
-    );
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeStartUnknownSnapshot(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jint dataType
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->cancelToken.reset();
-    auto rc = session->scanner->startUnknownSnapshot(
-        static_cast<mem_engine::DataType>(dataType),
-        &session->cancelToken
-    );
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineFuzzy(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jint deltaOp,
-    jlong intDelta,
-    jdouble floatDelta,
-    jdouble epsilon
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->cancelToken.reset();
-    auto rc = session->scanner->refineFuzzy(
-        static_cast<mem_engine::SearchOp>(deltaOp),
-        static_cast<int64_t>(intDelta),
-        static_cast<double>(floatDelta),
-        static_cast<double>(epsilon),
-        &session->cancelToken
-    );
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchEncoded(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jint dataType,
-    jint encodedMode,
-    jlong logicalInt,
-    jdouble logicalFloat,
-    jlong keyOrMask,
-    jboolean aligned
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->cancelToken.reset();
-    auto rc = session->scanner->searchEncoded(
-        static_cast<mem_engine::DataType>(dataType),
-        static_cast<mem_engine::EncodedMode>(encodedMode),
-        static_cast<int64_t>(logicalInt),
-        static_cast<double>(logicalFloat),
-        static_cast<uint64_t>(keyOrMask),
-        aligned == JNI_TRUE,
-        &session->cancelToken
-    );
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineEncoded(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jint dataType,
-    jint encodedMode,
-    jlong logicalInt,
-    jdouble logicalFloat,
-    jlong keyOrMask
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->cancelToken.reset();
-    auto rc = session->scanner->refineEncoded(
-        static_cast<mem_engine::DataType>(dataType),
-        static_cast<mem_engine::EncodedMode>(encodedMode),
-        static_cast<int64_t>(logicalInt),
-        static_cast<double>(logicalFloat),
-        static_cast<uint64_t>(keyOrMask),
-        &session->cancelToken
-    );
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT jlong JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeGetCandidateCount(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return 0;
-    std::lock_guard<std::mutex> lk(session->mtx);
-    return static_cast<jlong>(session->scanner->totalMatchedCount());
-}
-
-JNIEXPORT jlongArray JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeGetCandidateAddresses(
-    JNIEnv* env,
-    jobject /*thiz*/,
-    jlong handle,
-    jint offset,
-    jint limit
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session || offset < 0 || limit <= 0) return nullptr;
-    std::lock_guard<std::mutex> lk(session->mtx);
-
-    std::vector<mem_engine::CandidateEntry> slice;
-    session->scanner->fetchCandidates(static_cast<size_t>(offset), static_cast<size_t>(limit), slice);
-    if (slice.empty()) return env->NewLongArray(0);
-
-    size_t count = slice.size();
-    std::vector<jlong> addrs(count);
-    for (size_t i = 0; i < count; ++i) {
-        addrs[i] = static_cast<jlong>(slice[i].address);
-    }
-
-    jlongArray arr = env->NewLongArray(static_cast<jsize>(count));
-    if (arr) {
-        env->SetLongArrayRegion(arr, 0, static_cast<jsize>(count), addrs.data());
-    }
-    return arr;
-}
-
-JNIEXPORT jint JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeWriteMemory(
-    JNIEnv* env,
-    jobject /*thiz*/,
-    jlong handle,
-    jlong address,
-    jbyteArray bytesJarr
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session || !bytesJarr) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-    std::lock_guard<std::mutex> lk(session->mtx);
-
-    jsize len = env->GetArrayLength(bytesJarr);
-    jbyte* ptr = env->GetByteArrayElements(bytesJarr, nullptr);
-    if (!ptr) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
-
-    auto rc = session->io.writeMemory(static_cast<uintptr_t>(address), ptr, static_cast<size_t>(len));
-    env->ReleaseByteArrayElements(bytesJarr, ptr, 0);
-    return static_cast<jint>(rc);
-}
-
-JNIEXPORT void JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeLockAddress(
-    JNIEnv* env,
-    jobject /*thiz*/,
-    jlong handle,
-    jlong address,
-    jbyteArray bytesJarr
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session || !bytesJarr) return;
-    std::lock_guard<std::mutex> lk(session->mtx);
-
-    jsize len = env->GetArrayLength(bytesJarr);
-    jbyte* ptr = env->GetByteArrayElements(bytesJarr, nullptr);
-    if (!ptr) return;
-
-    session->locker->lockAddress(static_cast<uintptr_t>(address), ptr, static_cast<size_t>(len));
-    env->ReleaseByteArrayElements(bytesJarr, ptr, 0);
-}
-
-JNIEXPORT void JNICALL
-Java_com_qa_memengine_MemDiagnosticEngine_nativeUnlockAddress(
-    JNIEnv* /*env*/,
-    jobject /*thiz*/,
-    jlong handle,
-    jlong address
-) {
-    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
-    if (!session) return;
-    std::lock_guard<std::mutex> lk(session->mtx);
-    session->locker->unlockAddress(static_cast<uintptr_t>(address));
-}
-
-// ============================================================================
-// 2. GGNext Deep Integration JNI Bridge (com.littlecodesauce.ggnext.engine.NativeMemBridge)
-// ============================================================================
-
-JNIEXPORT jlong JNICALL
-Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeCreate(
-    JNIEnv* env,
-    jclass clazz,
-    jint workerThreads,
-    jstring spillDirJstr
-) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeCreate(
-        env, reinterpret_cast<jobject>(clazz), workerThreads, spillDirJstr
-    );
-}
-
-JNIEXPORT void JNICALL
-Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeDestroy(
-    JNIEnv* env,
-    jclass clazz,
-    jlong handle
-) {
-    Java_com_qa_memengine_MemDiagnosticEngine_nativeDestroy(env, reinterpret_cast<jobject>(clazz), handle);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeAttach(
-    JNIEnv* env,
-    jclass clazz,
-    jlong handle,
-    jint pid
-) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeAttachProcess(
-        env, reinterpret_cast<jobject>(clazz), handle, pid
-    );
-}
-
-JNIEXPORT void JNICALL
-Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSetRegionMask(
-    JNIEnv* env,
-    jclass clazz,
-    jlong handle,
-    jint regionMask
-) {
-    Java_com_qa_memengine_MemDiagnosticEngine_nativeSetRegionMask(
-        env, reinterpret_cast<jobject>(clazz), handle, regionMask
-    );
 }
 
 JNIEXPORT jlongArray JNICALL
@@ -547,7 +235,6 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetRegionTotals(
         session->vmaIndex.rebuild(session->cachedAllRegions);
     }
 
-    // 45 longs: [size_0..size_14, base_0..base_14, count_0..count_14] in GGNext RegionCatalog.ALL order
     jlong out[45];
     std::memset(out, 0, sizeof(out));
 
@@ -633,15 +320,22 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeReadBlock(
 JNIEXPORT jboolean JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeWriteBlock(
     JNIEnv* env,
-    jclass clazz,
+    jclass /*clazz*/,
     jlong handle,
     jlong address,
     jbyteArray bytesJarr
 ) {
-    jint rc = Java_com_qa_memengine_MemDiagnosticEngine_nativeWriteMemory(
-        env, reinterpret_cast<jobject>(clazz), handle, address, bytesJarr
-    );
-    return rc == static_cast<jint>(mem_engine::EngineErrc::OK) ? JNI_TRUE : JNI_FALSE;
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session || !bytesJarr) return JNI_FALSE;
+    std::lock_guard<std::mutex> lk(session->mtx);
+
+    jsize len = env->GetArrayLength(bytesJarr);
+    jbyte* ptr = env->GetByteArrayElements(bytesJarr, nullptr);
+    if (!ptr) return JNI_FALSE;
+
+    auto rc = session->io.writeMemory(static_cast<uintptr_t>(address), ptr, static_cast<size_t>(len));
+    env->ReleaseByteArrayElements(bytesJarr, ptr, 0);
+    return rc == mem_engine::EngineErrc::OK ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jlong JNICALL
@@ -728,8 +422,8 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeDumpMemory(
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchExact(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint dataType,
     jlong intTarget,
@@ -737,30 +431,99 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchExact(
     jdouble epsilon,
     jboolean aligned
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchExact(
-        env, reinterpret_cast<jobject>(clazz), handle, dataType, intTarget, floatTarget, epsilon, aligned
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->searchExact(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<int64_t>(intTarget),
+        static_cast<double>(floatTarget),
+        static_cast<double>(epsilon),
+        aligned == JNI_TRUE,
+        &session->cancelToken
     );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineExact(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint dataType,
     jlong intTarget,
     jdouble floatTarget,
     jdouble epsilon
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineExact(
-        env, reinterpret_cast<jobject>(clazz), handle, dataType, intTarget, floatTarget, epsilon
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->refineExact(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<int64_t>(intTarget),
+        static_cast<double>(floatTarget),
+        static_cast<double>(epsilon),
+        &session->cancelToken
     );
+    return static_cast<jint>(rc);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchNotEqual(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
+    jlong handle,
+    jint dataType,
+    jlong intTarget,
+    jdouble floatTarget,
+    jdouble epsilon,
+    jboolean aligned
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->searchNotEqual(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<int64_t>(intTarget),
+        static_cast<double>(floatTarget),
+        static_cast<double>(epsilon),
+        aligned == JNI_TRUE,
+        &session->cancelToken
+    );
+    return static_cast<jint>(rc);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineNotEqual(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
+    jlong handle,
+    jint dataType,
+    jlong intTarget,
+    jdouble floatTarget,
+    jdouble epsilon
+) {
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->refineNotEqual(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<int64_t>(intTarget),
+        static_cast<double>(floatTarget),
+        static_cast<double>(epsilon),
+        &session->cancelToken
+    );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchRange(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint dataType,
     jlong intMin,
@@ -768,28 +531,57 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchRange(
     jdouble floatMin,
     jdouble floatMax,
     jboolean inclusive,
-    jboolean aligned
+    jboolean aligned,
+    jboolean excludeRange
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchRange(
-        env, reinterpret_cast<jobject>(clazz), handle, dataType, intMin, intMax, floatMin, floatMax, inclusive, aligned
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->searchRange(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<int64_t>(intMin),
+        static_cast<int64_t>(intMax),
+        static_cast<double>(floatMin),
+        static_cast<double>(floatMax),
+        inclusive == JNI_TRUE,
+        aligned == JNI_TRUE,
+        &session->cancelToken,
+        nullptr,
+        excludeRange == JNI_TRUE
     );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineRange(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint dataType,
     jlong intMin,
     jlong intMax,
     jdouble floatMin,
     jdouble floatMax,
-    jboolean inclusive
+    jboolean inclusive,
+    jboolean excludeRange
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineRange(
-        env, reinterpret_cast<jobject>(clazz), handle, dataType, intMin, intMax, floatMin, floatMax, inclusive
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->refineRange(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<int64_t>(intMin),
+        static_cast<int64_t>(intMax),
+        static_cast<double>(floatMin),
+        static_cast<double>(floatMax),
+        inclusive == JNI_TRUE,
+        &session->cancelToken,
+        nullptr,
+        excludeRange == JNI_TRUE
     );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jint JNICALL
@@ -997,8 +789,8 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchPattern(
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchEncoded(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint dataType,
     jint encodedMode,
@@ -1007,15 +799,26 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSearchEncoded(
     jlong keyOrMask,
     jboolean aligned
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeSearchEncoded(
-        env, reinterpret_cast<jobject>(clazz), handle, dataType, encodedMode, logicalInt, logicalFloat, keyOrMask, aligned
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->searchEncoded(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<mem_engine::EncodedMode>(encodedMode),
+        static_cast<int64_t>(logicalInt),
+        static_cast<double>(logicalFloat),
+        static_cast<uint64_t>(keyOrMask),
+        aligned == JNI_TRUE,
+        &session->cancelToken
     );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineEncoded(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint dataType,
     jint encodedMode,
@@ -1023,47 +826,76 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineEncoded(
     jdouble logicalFloat,
     jlong keyOrMask
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineEncoded(
-        env, reinterpret_cast<jobject>(clazz), handle, dataType, encodedMode, logicalInt, logicalFloat, keyOrMask
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->refineEncoded(
+        static_cast<mem_engine::DataType>(dataType),
+        static_cast<mem_engine::EncodedMode>(encodedMode),
+        static_cast<int64_t>(logicalInt),
+        static_cast<double>(logicalFloat),
+        static_cast<uint64_t>(keyOrMask),
+        &session->cancelToken
     );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeStartUnknownSnapshot(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint dataType
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeStartUnknownSnapshot(
-        env, reinterpret_cast<jobject>(clazz), handle, dataType
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->startUnknownSnapshot(
+        static_cast<mem_engine::DataType>(dataType),
+        &session->cancelToken
     );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeRefineFuzzy(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jint deltaOp,
     jlong intDelta,
     jdouble floatDelta,
-    jdouble epsilon
+    jdouble epsilon,
+    jint onlyNth
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeRefineFuzzy(
-        env, reinterpret_cast<jobject>(clazz), handle, deltaOp, intDelta, floatDelta, epsilon
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return static_cast<jint>(mem_engine::EngineErrc::ERR_INVAL);
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->cancelToken.reset();
+    auto rc = session->scanner->refineFuzzy(
+        static_cast<mem_engine::SearchOp>(deltaOp),
+        static_cast<int64_t>(intDelta),
+        static_cast<double>(floatDelta),
+        static_cast<double>(epsilon),
+        &session->cancelToken,
+        nullptr,
+        static_cast<uint32_t>(onlyNth > 0 ? onlyNth : 0)
     );
+    return static_cast<jint>(rc);
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetCandidateCount(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle
 ) {
-    return Java_com_qa_memengine_MemDiagnosticEngine_nativeGetCandidateCount(
-        env, reinterpret_cast<jobject>(clazz), handle
-    );
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return 0;
+    std::lock_guard<std::mutex> lk(session->mtx);
+    return static_cast<jlong>(session->scanner->totalMatchedCount());
 }
 
 JNIEXPORT jlongArray JNICALL
@@ -1083,7 +915,6 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeGetCandidatesPacked
     if (slice.empty()) return env->NewLongArray(0);
 
     size_t count = slice.size();
-    // Pack 3 longs per candidate: [address, rawValue, (type | (regionTag << 8) | (flags << 16))]
     std::vector<jlong> packed(count * 3);
     for (size_t i = 0; i < count; ++i) {
         const auto& c = slice[i];
@@ -1138,14 +969,21 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeClearSession(
 JNIEXPORT void JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeLockAddress(
     JNIEnv* env,
-    jclass clazz,
+    jclass /*clazz*/,
     jlong handle,
     jlong address,
     jbyteArray bytesJarr
 ) {
-    Java_com_qa_memengine_MemDiagnosticEngine_nativeLockAddress(
-        env, reinterpret_cast<jobject>(clazz), handle, address, bytesJarr
-    );
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session || !bytesJarr) return;
+    std::lock_guard<std::mutex> lk(session->mtx);
+
+    jsize len = env->GetArrayLength(bytesJarr);
+    jbyte* ptr = env->GetByteArrayElements(bytesJarr, nullptr);
+    if (!ptr) return;
+
+    session->locker->lockAddress(static_cast<uintptr_t>(address), ptr, static_cast<size_t>(len));
+    env->ReleaseByteArrayElements(bytesJarr, ptr, 0);
 }
 
 JNIEXPORT void JNICALL
@@ -1208,14 +1046,15 @@ Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeSetFreezeIntervalMs
 
 JNIEXPORT void JNICALL
 Java_com_littlecodesauce_ggnext_engine_NativeMemBridge_nativeUnlockAddress(
-    JNIEnv* env,
-    jclass clazz,
+    JNIEnv* /*env*/,
+    jclass /*clazz*/,
     jlong handle,
     jlong address
 ) {
-    Java_com_qa_memengine_MemDiagnosticEngine_nativeUnlockAddress(
-        env, reinterpret_cast<jobject>(clazz), handle, address
-    );
+    auto* session = reinterpret_cast<NativeEngineSession*>(handle);
+    if (!session) return;
+    std::lock_guard<std::mutex> lk(session->mtx);
+    session->locker->unlockAddress(static_cast<uintptr_t>(address));
 }
 
 JNIEXPORT void JNICALL

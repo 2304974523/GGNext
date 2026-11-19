@@ -10,50 +10,229 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.zip.ZipFile
 
 /**
  * 持久化 Root C++20 内存引擎守护客户端 (`libmem_engine_root.so`)
  *
- * 解决 Android 普通应用进程 (`u0_aXXX`) 即便在获得 Root 授权后，其自身 JVM/JNI 进程仍因内核 `ptrace_may_access`
- * 与 SELinux 限制无法直接打开其他 UID 进程的 `/proc/<pid>/mem` 或调用 `process_vm_readv` 的核心问题。
- *
- * 通过在持久化的 `su` (`uid=0`) 进程中运行原生编译的 `libmem_engine_root.so`，
- * 实现 100% 真实的跨进程 VMA 区域解析、ARM64 NEON SIMD 搜索、原生指针链扫描、内存读写、内存复制/导出与高频锁值。
+ * - 支持控制通道超时代管（Watchdog 超时自动熔断并重启恢复）
+ * - 支持扫描中无阻塞发送 `CANCEL` 立即中断 C++ 扫描线程
+ * - 支持 `ESRCH` (`ERR -2`) 目标进程存活监测回调
  */
 object RootMemDaemon {
 
+    const val CANCELLED_RESULT = -1L
+    private const val CONTROL_TIMEOUT_MS = 10_000L
+    private const val BULK_READ_TIMEOUT_MS = 25_000L
+    private const val SCAN_IDLE_TIMEOUT_MS = 35_000L
+
     private var process: Process? = null
+    @Volatile
     private var writer: BufferedWriter? = null
     private var reader: BufferedReader? = null
     private var stderrThread: Thread? = null
     private var lastAppContext: Context? = null
     private var lastAttachedPid: Int = 0
     private var lastRegionMask: Int = 0x3FFF
+    private var lastAddrMin: Long = 0L
+    private var lastAddrMax: Long = 0L
+    private var lastAddrMask: Long = 0L
+    private var lastAddrPattern: Long = 0L
     private var isRecovering: Boolean = false
+
+    private val writeLock = Any()
+    private val ioWatchdog = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "RootMemDaemon-read").apply { isDaemon = true }
+    }
+
+    @Volatile
+    var onTargetProcessDead: (() -> Unit)? = null
 
     @Volatile
     var lastStartError: String = ""
         private set
 
-    data class RawCandidate(
-        val address: Long,
-        val rawValue: Long,
-        val meta: Int
-    )
+    typealias RawCandidate = MemoryBackend.RawCandidate
 
     private fun shellQuote(s: String): String =
         "'" + s.replace("'", "'\"'\"'") + "'"
 
-    /**
-     * 无损格式化 IEEE-754 双精度浮点数供 C++ `std::istringstream` 解析，
-     * 避免 `String.format("%.8f")` 截断极小浮点数 (`1e-9` -> `0.00000000`) 或科学计数法精度丢失。
-     */
     private fun formatDouble(v: Double): String = when {
         v.isNaN() -> "0.0"
         v == Double.POSITIVE_INFINITY -> "1.7976931348623157E308"
         v == Double.NEGATIVE_INFINITY -> "-1.7976931348623157E308"
         else -> java.lang.Double.toString(v)
+    }
+
+    private fun writeLineOutOfBand(line: String): Boolean {
+        synchronized(writeLock) {
+            val w = writer ?: return false
+            return try {
+                w.write(line)
+                w.write("\n")
+                w.flush()
+                true
+            } catch (_: Throwable) {
+                false
+            }
+        }
+    }
+
+    /**
+     * 非阻塞向 C++ 守护进程发送 CANCEL 信号：
+     * 不等待当前扫描持有的对象锁，直接通过写锁下发 `CANCEL\n`，
+     * 守护进程主线程立即置位 CancellationToken 中断工作线程。
+     */
+    fun cancelScan() {
+        writeLineOutOfBand("CANCEL")
+    }
+
+    private fun readLineWithTimeout(r: BufferedReader, timeoutMs: Long): String? {
+        val future = ioWatchdog.submit<String?> { r.readLine() }
+        return try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            future.cancel(true)
+            AppLog.w("RootMemDaemon", "Daemon read timed out after ${timeoutMs}ms; resetting daemon")
+            forceKillProcess()
+            null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 批量读取多行响应：整个批量读取只向 Watchdog 提交一次任务，
+     * 彻底消除逐行 `submit + future.get` 带来的数万次线程上下文切换与 FutureTask 分配。
+     */
+    private fun <T> readBulkWithTimeout(
+        r: BufferedReader,
+        timeoutMs: Long,
+        block: (BufferedReader) -> T
+    ): T? {
+        val future = ioWatchdog.submit<T> { block(r) }
+        return try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            future.cancel(true)
+            AppLog.w("RootMemDaemon", "Daemon bulk read timed out after ${timeoutMs}ms; resetting daemon")
+            forceKillProcess()
+            null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    internal fun parseHexLong(s: String, start: Int, end: Int): Long? {
+        var i = start
+        var e = end
+        while (i < e && s[i] <= ' ') i++
+        while (e > i && s[e - 1] <= ' ') e--
+        if (i >= e) return null
+        var acc = 0L
+        while (i < e) {
+            val ch = s[i]
+            val d = when (ch) {
+                in '0'..'9' -> ch.code - '0'.code
+                in 'a'..'f' -> ch.code - 'a'.code + 10
+                in 'A'..'F' -> ch.code - 'A'.code + 10
+                else -> return null
+            }
+            acc = (acc shl 4) or d.toLong()
+            i++
+        }
+        return acc
+    }
+
+    internal fun parseSignedLong(s: String, start: Int, end: Int): Long? {
+        var i = start
+        var e = end
+        while (i < e && s[i] <= ' ') i++
+        while (e > i && s[e - 1] <= ' ') e--
+        if (i >= e) return null
+        var negative = false
+        val first = s[i]
+        if (first == '-') {
+            negative = true
+            i++
+        } else if (first == '+') {
+            i++
+        }
+        if (i >= e) return null
+        var acc = 0L
+        while (i < e) {
+            val ch = s[i]
+            if (ch !in '0'..'9') return null
+            acc = acc * 10L - (ch.code - '0'.code).toLong()
+            i++
+        }
+        return if (negative) acc else -acc
+    }
+
+    internal fun parseUnsignedInt(s: String, start: Int, end: Int): Int? {
+        var i = start
+        var e = end
+        while (i < e && s[i] <= ' ') i++
+        while (e > i && s[e - 1] <= ' ') e--
+        if (i >= e) return null
+        var acc = 0L
+        while (i < e) {
+            val ch = s[i]
+            if (ch !in '0'..'9') return null
+            acc = acc * 10L + (ch.code - '0'.code).toLong()
+            i++
+        }
+        return acc.toInt()
+    }
+
+    internal fun parseCandidateLine(line: String): MemoryBackend.RawCandidate? {
+        val len = line.length
+        if (len < 5) return null
+        val sp1 = line.indexOf(' ')
+        if (sp1 <= 0) return null
+        val sp2 = line.indexOf(' ', sp1 + 1)
+        if (sp2 <= sp1 + 1 || sp2 >= len - 1) return null
+        val addr = parseHexLong(line, 0, sp1) ?: return null
+        val rawVal = parseSignedLong(line, sp1 + 1, sp2) ?: 0L
+        val meta = parseUnsignedInt(line, sp2 + 1, len) ?: 0
+        return MemoryBackend.RawCandidate(addr, rawVal, meta)
+    }
+
+    internal fun parseBatchReadLine(line: String, out: MutableMap<Long, Long>) {
+        val len = line.length
+        if (len < 5) return
+        val sp1 = line.indexOf(' ')
+        if (sp1 <= 0) return
+        val sp2 = line.indexOf(' ', sp1 + 1)
+        if (sp2 <= sp1 + 1 || sp2 >= len - 1) return
+        if (sp2 - (sp1 + 1) != 1 || line[sp1 + 1] != '1') return
+        val addr = parseHexLong(line, 0, sp1) ?: return
+        val rawVal = parseSignedLong(line, sp2 + 1, len) ?: 0L
+        out[addr] = rawVal
+    }
+
+    private fun forceKillProcess() {
+        try {
+            process?.destroyForcibly()
+        } catch (_: Throwable) {
+        }
+        try {
+            reader?.close()
+        } catch (_: Throwable) {
+        }
+        synchronized(writeLock) {
+            try {
+                writer?.close()
+            } catch (_: Throwable) {
+            }
+            writer = null
+        }
+        process = null
+        reader = null
+        stderrThread = null
     }
 
     @Synchronized
@@ -79,8 +258,6 @@ object RootMemDaemon {
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
         val nativeDir = ctx?.applicationInfo?.nativeLibraryDir
 
-        // 依次尝试全局挂载命名空间 (--mount-master / -mm) 与标准 su，
-        // 统一通过 `su -c <script>` 传递启动脚本，彻底避免 mksh 读取缓冲吞掉 stdin 中的首条 `PING` 指令
         val variants = listOf(
             listOf("su", "--mount-master", "-c"),
             listOf("su", "-mm", "-c"),
@@ -104,8 +281,6 @@ object RootMemDaemon {
     ): Boolean {
         return try {
             val binDir = File(binPath).parent ?: "/data/local/tmp"
-            // 绝不可将 /system/lib64 或 /system/lib 注入 LD_LIBRARY_PATH，
-            // 否则在 Android 10~15 APEX Bionic 环境下会覆盖 runtime bionic 导致 linker 崩溃
             val appLibDirs = listOfNotNull(nativeDir, binDir).distinct().joinToString(":")
 
             val stageTmp = "/data/local/tmp/.ggnext_root_daemon"
@@ -115,9 +290,6 @@ object RootMemDaemon {
             val qStageTmp = shellQuote(stageTmp)
             val qStageDev = shellQuote(stageDev)
 
-            // 所有前置准备工作严格重定向 >/dev/null 2>&1，确保不污染 stdout 握手协议；
-            // 先 rm -f 再 cp -f 消除重复启动时的 ETXTBSY (Text file busy)；
-            // 仅当 exit code 为 126/127 (无法 exec) 时才回退下一路径。
             val launchScript = buildString {
                 append("magiskpolicy --live \"allow su proc_mem file *\" \"allow magisk proc_mem file *\" >/dev/null 2>&1 || ")
                 append("ksud sepolicy patch \"allow su proc_mem file *\" >/dev/null 2>&1 || true; ")
@@ -148,7 +320,7 @@ object RootMemDaemon {
             pb.redirectErrorStream(false)
             val p = pb.start()
             val w = BufferedWriter(OutputStreamWriter(p.outputStream, Charsets.UTF_8))
-            val r = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
+            val r = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8), 65536)
 
             val stderrLines = java.util.Collections.synchronizedList(ArrayList<String>(8))
             val errThread = Thread({
@@ -170,11 +342,11 @@ object RootMemDaemon {
             }
 
             process = p
-            writer = w
+            synchronized(writeLock) { writer = w }
             reader = r
             stderrThread = errThread
 
-            val pong = sendRawLocked("PING")
+            val pong = sendRawLocked("PING", isScan = false)
             val ok = pong != null && pong.startsWith("OK")
             if (ok) {
                 AppLog.i("RootMemDaemon", "Started uid=0 C++20 MemEngine daemon (${suPrefix.joinToString(" ")}): $binPath")
@@ -199,27 +371,8 @@ object RootMemDaemon {
 
     @Synchronized
     fun stop() {
-        try {
-            writer?.write("EXIT\n")
-            writer?.flush()
-        } catch (_: Throwable) {
-        }
-        try {
-            reader?.close()
-        } catch (_: Throwable) {
-        }
-        try {
-            writer?.close()
-        } catch (_: Throwable) {
-        }
-        try {
-            process?.destroy()
-        } catch (_: Throwable) {
-        }
-        process = null
-        writer = null
-        reader = null
-        stderrThread = null
+        writeLineOutOfBand("EXIT")
+        forceKillProcess()
     }
 
     private fun isAlive(): Boolean {
@@ -281,18 +434,26 @@ object RootMemDaemon {
         }
     }
 
+    private fun checkEsrchAndNotify(resp: String?) {
+        if (resp != null && resp.trim() == "ERR -2") {
+            onTargetProcessDead?.invoke()
+        }
+    }
+
     private fun sendRawLocked(
         cmd: String,
-        onProgress: ((doneBytes: Long, totalBytes: Long, foundCount: Long) -> Unit)? = null
+        onProgress: ((doneBytes: Long, totalBytes: Long, foundCount: Long) -> Unit)? = null,
+        isScan: Boolean = onProgress != null
     ): String? {
-        val w = writer ?: return null
         val r = reader ?: return null
+        if (!writeLineOutOfBand(cmd)) {
+            forceKillProcess()
+            return null
+        }
+        val timeoutMs = if (isScan) SCAN_IDLE_TIMEOUT_MS else CONTROL_TIMEOUT_MS
         try {
-            w.write(cmd)
-            w.write("\n")
-            w.flush()
             while (true) {
-                val line = r.readLine() ?: return null
+                val line = readLineWithTimeout(r, timeoutMs) ?: return null
                 if (line.startsWith("PROGRESS ")) {
                     val parts = line.trim().split(' ')
                     if (parts.size >= 4) {
@@ -303,10 +464,11 @@ object RootMemDaemon {
                     }
                     continue
                 }
+                checkEsrchAndNotify(line)
                 return line
             }
         } catch (_: Throwable) {
-            stop()
+            forceKillProcess()
             return null
         }
     }
@@ -320,13 +482,20 @@ object RootMemDaemon {
                 false
             } else {
                 if (lastAttachedPid > 0) {
-                    val attachResp = sendRawLocked("ATTACH $lastAttachedPid")
+                    val attachResp = sendRawLocked("ATTACH $lastAttachedPid", isScan = false)
                     if (attachResp == null || !attachResp.startsWith("OK ")) {
                         lastStartError = "恢复附加 pid=$lastAttachedPid 失败 (${attachResp ?: "EOF"})"
                         return false
                     }
                     val uMask = lastRegionMask.toLong() and 0xFFFFFFFFL
-                    sendRawLocked("SET_MASK $uMask")
+                    sendRawLocked("SET_MASK $uMask", isScan = false)
+                    if (lastAddrMin != 0L || lastAddrMax != 0L || lastAddrMask != 0L) {
+                        val minH = java.lang.Long.toUnsignedString(lastAddrMin, 16)
+                        val maxH = java.lang.Long.toUnsignedString(lastAddrMax, 16)
+                        val maskH = java.lang.Long.toUnsignedString(lastAddrMask, 16)
+                        val patH = java.lang.Long.toUnsignedString(lastAddrPattern, 16)
+                        sendRawLocked("SET_ADDR_FILTER $minH $maxH $maskH $patH", isScan = false)
+                    }
                 }
                 true
             }
@@ -337,13 +506,20 @@ object RootMemDaemon {
 
     private fun sendCommandLocked(
         cmd: String,
-        onProgress: ((doneBytes: Long, totalBytes: Long, foundCount: Long) -> Unit)? = null
+        onProgress: ((doneBytes: Long, totalBytes: Long, foundCount: Long) -> Unit)? = null,
+        isScan: Boolean = onProgress != null
     ): String? {
         if (!ensureRecoveredAndAttached()) return null
-        val firstTry = sendRawLocked(cmd, onProgress)
+        val firstTry = sendRawLocked(cmd, onProgress, isScan)
         if (firstTry != null) return firstTry
         if (!ensureRecoveredAndAttached()) return null
-        return sendRawLocked(cmd, onProgress)
+        return sendRawLocked(cmd, onProgress, isScan)
+    }
+
+    private fun parseScanCount(resp: String?): Long {
+        if (resp == null) return 0L
+        if (resp.startsWith("CANCELLED")) return CANCELLED_RESULT
+        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
     }
 
     @Synchronized
@@ -353,7 +529,7 @@ object RootMemDaemon {
         }
         lastAttachedPid = pid
         if (ensureStarted(lastAppContext)) {
-            val resp = sendRawLocked("ATTACH $pid")
+            val resp = sendRawLocked("ATTACH $pid", isScan = false)
             if (resp != null && resp.startsWith("OK ")) {
                 lastStartError = ""
                 return true
@@ -362,10 +538,9 @@ object RootMemDaemon {
                 lastStartError = "守护进程 ATTACH $pid 失败 ($resp)"
             }
         }
-        // 若首次 ATTACH 因管道断开或守护进程异常退出失败，重启守护进程并重试一次
         stop()
         if (!ensureStarted(lastAppContext)) return false
-        val retryResp = sendRawLocked("ATTACH $pid")
+        val retryResp = sendRawLocked("ATTACH $pid", isScan = false)
         if (retryResp != null && retryResp.startsWith("OK ")) {
             lastStartError = ""
             return true
@@ -375,58 +550,78 @@ object RootMemDaemon {
     }
 
     @Synchronized
+    fun isTargetProcessAlive(): Boolean {
+        if (lastAttachedPid <= 0 || !isAlive()) return false
+        val resp = sendRawLocked("ALIVE", isScan = false) ?: return false
+        return resp.trim() == "OK 1"
+    }
+
+    @Synchronized
     fun setRegionMask(mask: Int): Boolean {
         lastRegionMask = mask
         val uMask = mask.toLong() and 0xFFFFFFFFL
-        val resp = sendCommandLocked("SET_MASK $uMask") ?: return false
+        val resp = sendCommandLocked("SET_MASK $uMask", isScan = false) ?: return false
+        return resp.startsWith("OK")
+    }
+
+    @Synchronized
+    fun setAddressFilter(minAddr: Long, maxAddr: Long, addrMask: Long = 0L, addrPattern: Long = 0L): Boolean {
+        lastAddrMin = minAddr
+        lastAddrMax = maxAddr
+        lastAddrMask = addrMask
+        lastAddrPattern = addrPattern
+        val minH = java.lang.Long.toUnsignedString(minAddr, 16)
+        val maxH = java.lang.Long.toUnsignedString(maxAddr, 16)
+        val maskH = java.lang.Long.toUnsignedString(addrMask, 16)
+        val patH = java.lang.Long.toUnsignedString(addrPattern, 16)
+        val resp = sendCommandLocked("SET_ADDR_FILTER $minH $maxH $maskH $patH", isScan = false) ?: return false
         return resp.startsWith("OK")
     }
 
     @Synchronized
     fun getRegions(): List<MemoryRegion> {
-        val header = sendCommandLocked("REGIONS") ?: return emptyList()
+        val header = sendCommandLocked("REGIONS", isScan = false) ?: return emptyList()
         if (!header.startsWith("OK ")) return emptyList()
         val count = header.removePrefix("OK ").trim().toIntOrNull() ?: 0
         if (count <= 0) return emptyList()
         val r = reader ?: return emptyList()
-        val out = ArrayList<MemoryRegion>(count)
-        for (i in 0 until count) {
-            val line = r.readLine() ?: break
-            val parts = line.split(' ', limit = 5)
-            if (parts.size < 4) continue
-            val start = parts[0].toULongOrNull(16)?.toLong() ?: continue
-            val end = parts[1].toULongOrNull(16)?.toLong() ?: continue
-            val perms = parts[2]
-            val code = parts[3]
-            val rawPath = if (parts.size >= 5) parts[4] else "-"
-            val path = if (rawPath == "-") "" else rawPath
-            out.add(
-                MemoryRegion(
-                    start = start,
-                    end = end,
-                    perms = perms,
-                    path = path,
-                    code = code,
-                    system = (code == "Xs" || code == "O")
+        return readBulkWithTimeout(r, CONTROL_TIMEOUT_MS) { br ->
+            val out = ArrayList<MemoryRegion>(count)
+            for (i in 0 until count) {
+                val line = br.readLine() ?: break
+                val parts = line.split(' ', limit = 5)
+                if (parts.size < 4) continue
+                val start = parseHexLong(parts[0], 0, parts[0].length) ?: continue
+                val end = parseHexLong(parts[1], 0, parts[1].length) ?: continue
+                val perms = parts[2]
+                val code = parts[3]
+                val rawPath = if (parts.size >= 5) parts[4] else "-"
+                val path = if (rawPath == "-") "" else rawPath
+                out.add(
+                    MemoryRegion(
+                        start = start,
+                        end = end,
+                        perms = perms,
+                        path = path,
+                        code = code,
+                        system = (code == "Xs" || code == "O")
+                    )
                 )
-            )
-        }
-        return out
+            }
+            out
+        } ?: emptyList()
     }
 
     @Synchronized
     fun readBlock(address: Long, size: Int): ByteArray? {
         val safeLen = size.coerceIn(1, 16 * 1024 * 1024)
         val addrHex = java.lang.Long.toUnsignedString(address, 16)
-        val resp = sendCommandLocked("READ $addrHex $safeLen") ?: return null
+        val resp = sendCommandLocked("READ $addrHex $safeLen", isScan = false) ?: return null
         if (!resp.startsWith("OK ")) return null
         val hex = resp.removePrefix("OK ").trim()
         return hexToBytes(hex, safeLen)
     }
 
-    /**
-     * 批量单次 IPC 往返读取多个地址的最新原始值，用于搜索列表、保存列表、内存视图的实时刷新
-     */
     @Synchronized
     fun batchReadValues(items: List<Pair<Long, Int>>): Map<Long, Long> {
         if (items.isEmpty() || lastAttachedPid <= 0) return emptyMap()
@@ -438,21 +633,19 @@ object RootMemDaemon {
                     val clampedSz = sz.coerceIn(1, 8)
                     sb.append(' ').append(java.lang.Long.toUnsignedString(addr, 16)).append(':').append(clampedSz)
                 }
-                val header = sendCommandLocked(sb.toString()) ?: break
+                val header = sendCommandLocked(sb.toString(), isScan = false) ?: break
                 if (!header.startsWith("OK ")) break
                 val r = reader ?: break
                 val count = header.removePrefix("OK ").trim().toIntOrNull() ?: 0
-                for (i in 0 until count) {
-                    val line = r.readLine() ?: break
-                    val parts = line.trim().split(' ')
-                    if (parts.size < 3) continue
-                    val addr = parts[0].toULongOrNull(16)?.toLong() ?: continue
-                    val ok = parts[1].toIntOrNull() ?: 0
-                    val rawVal = parts[2].toLongOrNull() ?: 0L
-                    if (ok == 1) {
-                        result[addr] = rawVal
+                if (count <= 0) continue
+                val okChunk = readBulkWithTimeout(r, CONTROL_TIMEOUT_MS) { br ->
+                    for (i in 0 until count) {
+                        val line = br.readLine() ?: break
+                        parseBatchReadLine(line, result)
                     }
+                    true
                 }
+                if (okChunk == null) break
             }
             result
         } catch (_: Throwable) {
@@ -466,7 +659,7 @@ object RootMemDaemon {
         if (data.isEmpty()) return false
         val addrHex = java.lang.Long.toUnsignedString(address, 16)
         val hex = bytesToHex(data)
-        val resp = sendCommandLocked("WRITE $addrHex $hex") ?: return false
+        val resp = sendCommandLocked("WRITE $addrHex $hex", isScan = false) ?: return false
         return resp.startsWith("OK")
     }
 
@@ -474,7 +667,7 @@ object RootMemDaemon {
     fun copyMemory(fromAddr: Long, toAddr: Long, length: Long): Long {
         val fromHex = java.lang.Long.toUnsignedString(fromAddr, 16)
         val toHex = java.lang.Long.toUnsignedString(toAddr, 16)
-        val resp = sendCommandLocked("COPY $fromHex $toHex $length") ?: return 0L
+        val resp = sendCommandLocked("COPY $fromHex $toHex $length", isScan = true) ?: return 0L
         if (!resp.startsWith("OK ")) return 0L
         return resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L
     }
@@ -483,7 +676,7 @@ object RootMemDaemon {
     fun dumpMemory(startAddr: Long, endAddr: Long, outPath: String): Long {
         val startHex = java.lang.Long.toUnsignedString(startAddr, 16)
         val endHex = java.lang.Long.toUnsignedString(endAddr, 16)
-        val resp = sendCommandLocked("DUMP $startHex $endHex $outPath") ?: return 0L
+        val resp = sendCommandLocked("DUMP $startHex $endHex $outPath", isScan = true) ?: return 0L
         if (!resp.startsWith("OK ")) return 0L
         return resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L
     }
@@ -493,7 +686,7 @@ object RootMemDaemon {
         if (data.isEmpty()) return
         val addrHex = java.lang.Long.toUnsignedString(address, 16)
         val hex = bytesToHex(data)
-        sendCommandLocked("LOCK $addrHex $hex")
+        sendCommandLocked("LOCK $addrHex $hex", isScan = false)
     }
 
     @Synchronized
@@ -508,35 +701,35 @@ object RootMemDaemon {
         if (data.isEmpty()) return
         val addrHex = java.lang.Long.toUnsignedString(address, 16)
         val hex = bytesToHex(data)
-        sendCommandLocked("LOCK_CONFIG $addrHex $hex $dataType $freezeMode $minVal $maxVal")
+        sendCommandLocked("LOCK_CONFIG $addrHex $hex $dataType $freezeMode $minVal $maxVal", isScan = false)
     }
 
     @Synchronized
     fun setFreezePaused(paused: Boolean) {
         val p = if (paused) 1 else 0
-        sendCommandLocked("LOCK_PAUSE $p")
+        sendCommandLocked("LOCK_PAUSE $p", isScan = false)
     }
 
     @Synchronized
     fun setFreezeIntervalMs(intervalMs: Int) {
         val safeMs = intervalMs.coerceIn(5, 5000)
-        sendCommandLocked("LOCK_INTERVAL $safeMs")
+        sendCommandLocked("LOCK_INTERVAL $safeMs", isScan = false)
     }
 
     @Synchronized
     fun unlockAddress(address: Long) {
         val addrHex = java.lang.Long.toUnsignedString(address, 16)
-        sendCommandLocked("UNLOCK $addrHex")
+        sendCommandLocked("UNLOCK $addrHex", isScan = false)
     }
 
     @Synchronized
     fun unlockAll() {
-        sendCommandLocked("UNLOCK_ALL")
+        sendCommandLocked("UNLOCK_ALL", isScan = false)
     }
 
     @Synchronized
     fun clearSession() {
-        sendCommandLocked("CLEAR_SESSION")
+        sendCommandLocked("CLEAR_SESSION", isScan = false)
     }
 
     @Synchronized
@@ -548,7 +741,7 @@ object RootMemDaemon {
             for (addr in chunk) {
                 sb.append(' ').append(java.lang.Long.toUnsignedString(addr, 16))
             }
-            val resp = sendCommandLocked(sb.toString()) ?: continue
+            val resp = sendCommandLocked(sb.toString(), isScan = false) ?: continue
             if (resp.startsWith("OK ")) {
                 remaining = resp.removePrefix("OK ").trim().toLongOrNull() ?: remaining
             }
@@ -567,8 +760,7 @@ object RootMemDaemon {
     ): Long {
         val a = if (aligned) 1 else 0
         val cmd = "SEARCH_EXACT $dataType $intTarget ${formatDouble(floatTarget)} ${formatDouble(epsilon)} $a"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
@@ -580,8 +772,33 @@ object RootMemDaemon {
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
         val cmd = "REFINE_EXACT $dataType $intTarget ${formatDouble(floatTarget)} ${formatDouble(epsilon)}"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
+    }
+
+    @Synchronized
+    fun searchNotEqual(
+        dataType: Int,
+        intTarget: Long,
+        floatTarget: Double,
+        epsilon: Double,
+        aligned: Boolean,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): Long {
+        val a = if (aligned) 1 else 0
+        val cmd = "SEARCH_NEQ $dataType $intTarget ${formatDouble(floatTarget)} ${formatDouble(epsilon)} $a"
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
+    }
+
+    @Synchronized
+    fun refineNotEqual(
+        dataType: Int,
+        intTarget: Long,
+        floatTarget: Double,
+        epsilon: Double,
+        onProgress: ((Long, Long, Long) -> Unit)? = null
+    ): Long {
+        val cmd = "REFINE_NEQ $dataType $intTarget ${formatDouble(floatTarget)} ${formatDouble(epsilon)}"
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
@@ -593,13 +810,14 @@ object RootMemDaemon {
         floatMax: Double,
         inclusive: Boolean,
         aligned: Boolean,
+        excludeRange: Boolean = false,
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
         val inc = if (inclusive) 1 else 0
         val aln = if (aligned) 1 else 0
-        val cmd = "SEARCH_RANGE $dataType $intMin $intMax ${formatDouble(floatMin)} ${formatDouble(floatMax)} $inc $aln"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        val exc = if (excludeRange) 1 else 0
+        val cmd = "SEARCH_RANGE $dataType $intMin $intMax ${formatDouble(floatMin)} ${formatDouble(floatMax)} $inc $aln $exc"
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
@@ -610,12 +828,13 @@ object RootMemDaemon {
         floatMin: Double,
         floatMax: Double,
         inclusive: Boolean,
+        excludeRange: Boolean = false,
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
         val inc = if (inclusive) 1 else 0
-        val cmd = "REFINE_RANGE $dataType $intMin $intMax ${formatDouble(floatMin)} ${formatDouble(floatMax)} $inc"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        val exc = if (excludeRange) 1 else 0
+        val cmd = "REFINE_RANGE $dataType $intMin $intMax ${formatDouble(floatMin)} ${formatDouble(floatMax)} $inc $exc"
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
@@ -632,8 +851,7 @@ object RootMemDaemon {
         val uOff = java.lang.Long.toUnsignedString(if (maxOffset >= 0L) maxOffset else -maxOffset)
         val uProt = protMask.toLong() and 0xFFFFFFFFL
         val cmd = "SEARCH_POINTER $dataType $addrHex $uOff $uProt $aln"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
@@ -648,8 +866,7 @@ object RootMemDaemon {
         val uOff = java.lang.Long.toUnsignedString(if (maxOffset >= 0L) maxOffset else -maxOffset)
         val uProt = protMask.toLong() and 0xFFFFFFFFL
         val cmd = "REFINE_POINTER $dataType $addrHex $uOff $uProt"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
@@ -709,8 +926,7 @@ object RootMemDaemon {
                 .append(' ').append(formatDouble(fMax))
                 .append(' ').append(op)
         }
-        val resp = sendCommandLocked(sb.toString(), onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked(sb.toString(), onProgress, isScan = true))
     }
 
     @Synchronized
@@ -721,8 +937,7 @@ object RootMemDaemon {
     ): Long {
         val hex = bytesToHex(pattern)
         val safeMask = mask.ifEmpty { "x".repeat(pattern.size) }
-        val resp = sendCommandLocked("SEARCH_PATTERN $hex $safeMask", onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked("SEARCH_PATTERN $hex $safeMask", onProgress, isScan = true))
     }
 
     @Synchronized
@@ -738,8 +953,7 @@ object RootMemDaemon {
         val aln = if (aligned) 1 else 0
         val uKey = java.lang.Long.toUnsignedString(keyOrMask)
         val cmd = "SEARCH_ENCODED $dataType $encodedMode $logicalInt ${formatDouble(logicalFloat)} $uKey $aln"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
@@ -753,8 +967,7 @@ object RootMemDaemon {
     ): Long {
         val uKey = java.lang.Long.toUnsignedString(keyOrMask)
         val cmd = "REFINE_ENCODED $dataType $encodedMode $logicalInt ${formatDouble(logicalFloat)} $uKey"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
@@ -762,8 +975,7 @@ object RootMemDaemon {
         dataType: Int,
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
-        val resp = sendCommandLocked("FUZZY_INIT $dataType", onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        return parseScanCount(sendCommandLocked("FUZZY_INIT $dataType", onProgress, isScan = true))
     }
 
     @Synchronized
@@ -772,31 +984,29 @@ object RootMemDaemon {
         intDelta: Long,
         floatDelta: Double,
         epsilon: Double = 1e-4,
+        onlyNth: Int = 0,
         onProgress: ((Long, Long, Long) -> Unit)? = null
     ): Long {
-        val cmd = "FUZZY_REFINE $deltaOp $intDelta ${formatDouble(floatDelta)} ${formatDouble(epsilon)}"
-        val resp = sendCommandLocked(cmd, onProgress) ?: return 0L
-        return if (resp.startsWith("OK ")) resp.removePrefix("OK ").trim().toLongOrNull() ?: 0L else 0L
+        val cmd = "FUZZY_REFINE $deltaOp $intDelta ${formatDouble(floatDelta)} ${formatDouble(epsilon)} ${onlyNth.coerceAtLeast(0)}"
+        return parseScanCount(sendCommandLocked(cmd, onProgress, isScan = true))
     }
 
     @Synchronized
-    fun getCandidates(offset: Int, limit: Int): List<RawCandidate> {
-        val header = sendCommandLocked("GET_CANDIDATES $offset $limit") ?: return emptyList()
+    fun getCandidates(offset: Int, limit: Int): List<MemoryBackend.RawCandidate> {
+        val header = sendCommandLocked("GET_CANDIDATES $offset $limit", isScan = false) ?: return emptyList()
         if (!header.startsWith("OK ")) return emptyList()
         val count = header.removePrefix("OK ").trim().toIntOrNull() ?: 0
         if (count <= 0) return emptyList()
         val r = reader ?: return emptyList()
-        val out = ArrayList<RawCandidate>(count)
-        for (i in 0 until count) {
-            val line = r.readLine() ?: break
-            val parts = line.trim().split(' ')
-            if (parts.size < 3) continue
-            val addr = parts[0].toULongOrNull(16)?.toLong() ?: continue
-            val rawVal = parts[1].toLongOrNull() ?: 0L
-            val meta = parts[2].toULongOrNull()?.toInt() ?: 0
-            out.add(RawCandidate(addr, rawVal, meta))
-        }
-        return out
+        return readBulkWithTimeout(r, BULK_READ_TIMEOUT_MS) { br ->
+            val out = ArrayList<MemoryBackend.RawCandidate>(count)
+            for (i in 0 until count) {
+                val line = br.readLine() ?: break
+                val cand = parseCandidateLine(line) ?: continue
+                out.add(cand)
+            }
+            out
+        } ?: emptyList()
     }
 
     private val HEX_CHARS = "0123456789ABCDEF".toCharArray()

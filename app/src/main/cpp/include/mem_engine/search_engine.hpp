@@ -11,6 +11,10 @@
 #include <string>
 #include <cstdint>
 #include <cstddef>
+#include <functional>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 namespace mem_engine {
 
@@ -61,13 +65,26 @@ public:
     static constexpr size_t DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB per chunk task
 
     SearchEngine(ProcIO& io, size_t workerThreads = 4, const std::string& spillDir = "/data/local/tmp");
-    ~SearchEngine() = default;
+    ~SearchEngine();
 
     SearchEngine(const SearchEngine&) = delete;
     SearchEngine& operator=(const SearchEngine&) = delete;
 
     void setRegionMask(uint32_t mask) noexcept { m_regionMask = mask; }
     uint32_t regionMask() const noexcept { return m_regionMask; }
+
+    void setAddressFilter(uint64_t minAddr, uint64_t maxAddr, uint64_t addrMask = 0, uint64_t addrPattern = 0) noexcept {
+        m_addrMin     = minAddr;
+        m_addrMax     = maxAddr;
+        m_addrMask    = addrMask;
+        m_addrPattern = addrPattern;
+    }
+    void clearAddressFilter() noexcept {
+        m_addrMin = 0;
+        m_addrMax = 0;
+        m_addrMask = 0;
+        m_addrPattern = 0;
+    }
 
     void setWorkerThreads(size_t count) noexcept { m_workerThreads = (count == 0) ? 1 : count; }
     size_t workerThreads() const noexcept { return m_workerThreads; }
@@ -132,8 +149,27 @@ public:
         ProgressCallback progress = nullptr
     );
 
+    EngineErrc searchNotEqual(
+        DataType type,
+        int64_t intTarget,
+        double floatTarget,
+        double epsilon = 1e-4,
+        bool aligned = true,
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
+    );
+
+    EngineErrc refineNotEqual(
+        DataType type,
+        int64_t intTarget,
+        double floatTarget,
+        double epsilon = 1e-4,
+        CancellationToken* token = nullptr,
+        ProgressCallback progress = nullptr
+    );
+
     // ------------------------------------------------------------------------
-    // 2. Range Search ([Min, Max] Inclusive or (Min, Max) Exclusive) + Refine
+    // 2. Range Search ([Min, Max] Inclusive, (Min, Max) Exclusive, or Inverted ~~) + Refine
     // ------------------------------------------------------------------------
     EngineErrc searchRange(
         DataType type,
@@ -144,7 +180,8 @@ public:
         bool inclusive = true,
         bool aligned = true,
         CancellationToken* token = nullptr,
-        ProgressCallback progress = nullptr
+        ProgressCallback progress = nullptr,
+        bool excludeRange = false
     );
 
     EngineErrc refineRange(
@@ -155,7 +192,8 @@ public:
         double floatMax,
         bool inclusive = true,
         CancellationToken* token = nullptr,
-        ProgressCallback progress = nullptr
+        ProgressCallback progress = nullptr,
+        bool excludeRange = false
     );
 
     // ------------------------------------------------------------------------
@@ -173,7 +211,8 @@ public:
         double floatDelta = 0.0,
         double epsilon = 1e-4,
         CancellationToken* token = nullptr,
-        ProgressCallback progress = nullptr
+        ProgressCallback progress = nullptr,
+        uint32_t onlyNth = 0
     );
 
     // ------------------------------------------------------------------------
@@ -258,10 +297,27 @@ private:
 
     static uint8_t regionFlagToIndex(uint32_t flag) noexcept;
 
+    inline bool matchesAddressFilter(uintptr_t addr) const noexcept {
+        const uint64_t a = static_cast<uint64_t>(addr);
+        if (m_addrMin != 0 && a < m_addrMin) return false;
+        if (m_addrMax != 0 && a > m_addrMax) return false;
+        if (m_addrMask != 0 && ((a & m_addrMask) != (m_addrPattern & m_addrMask))) return false;
+        return true;
+    }
+
+    // Reusable fixed-size worker pool to avoid per-scan thread creation overhead
+    void runParallel(size_t desiredWorkers, const std::function<void(size_t)>& fn);
+    void ensurePoolLocked(size_t desiredWorkers);
+    void shutdownPool() noexcept;
+
     ProcIO&                  m_io;
     size_t                   m_workerThreads = 4;
     size_t                   m_chunkSize     = DEFAULT_CHUNK_SIZE;
     uint32_t                 m_regionMask    = RegionFlag::DEFAULT_RW;
+    uint64_t                 m_addrMin       = 0;
+    uint64_t                 m_addrMax       = 0;
+    uint64_t                 m_addrMask      = 0;
+    uint64_t                 m_addrPattern   = 0;
     std::string              m_spillDir      = "/data/local/tmp";
 
     std::vector<VmaRegion>   m_regions;
@@ -275,6 +331,17 @@ private:
     DataType                 m_snapshotType      = DataType::INT32;
     std::atomic<size_t>      m_totalMatchedCount{0};
     ScanTelemetry            m_lastTelemetry{};
+
+    // Persistent worker pool state
+    std::mutex               m_poolMutex;
+    std::condition_variable  m_poolWorkCv;
+    std::condition_variable  m_poolDoneCv;
+    std::vector<std::thread> m_poolWorkers;
+    const std::function<void(size_t)>* m_poolTask = nullptr;
+    uint64_t                 m_poolGeneration = 0;
+    size_t                   m_poolActiveWorkers = 0;
+    size_t                   m_poolRemaining = 0;
+    bool                     m_poolStop = false;
 };
 
 } // namespace mem_engine

@@ -93,7 +93,7 @@ fun SavedListScreen(ui: Ui) {
                 key = { _, i -> (i.address shl 8) xor (i.flags and 0xFF).toLong() },
                 contentType = { _, _ -> "saved_row" }
             ) { idx, item ->
-                SavedRow(item, ui.valueMaskSaved, idx)
+                SavedRow(item, ui.isSavedItemSelected(item), ui.valueMaskSaved, idx)
             }
         }
         VerticalFastScrollbar(
@@ -109,14 +109,15 @@ fun SavedListScreen(ui: Ui) {
  *   且全部采用与滚动容器协同的 clickableWithTooltip / clickableLongPress，手指在任意按钮上滑动均可顺畅滚动列表。
  */
 @Composable
-private fun SavedRow(item: MemoryItem, mask: Int, index: Int) {
+private fun SavedRow(item: MemoryItem, checked: Boolean, mask: Int, index: Int) {
     val currentItem by rememberUpdatedState(item)
     val bgOpacity = com.littlecodesauce.ggnext.ui.theme.LocalUiMetrics.current.bgOpacity.coerceIn(0.25f, 1.0f)
-    val accent = remember(item.flags) { typeColor(item.flags) }
-    val regColor = remember(item.region) { regionColor(item.region) }
+    val isDark = Rose.IsDark
+    val accent = remember(item.flags, isDark) { typeColor(item.flags) }
+    val regColor = remember(item.region, isDark) { regionColor(item.region) }
     val shortType = remember(item.flags) { ValueType.shortName(item.flags) }
     val rowBg by animateColorAsState(
-        if (item.checked) Rose.Primary.copy(alpha = if (Rose.IsDark) 0.18f else 0.22f)
+        if (checked) Rose.Primary.copy(alpha = if (isDark) 0.18f else 0.20f)
         else Rose.Row.copy(alpha = (bgOpacity * 0.88f).coerceIn(0.18f, 1.0f)),
         Motion.ColorFast,
         label = "savedRowBg"
@@ -149,7 +150,7 @@ private fun SavedRow(item: MemoryItem, mask: Int, index: Int) {
         ) {
             // 1. 左侧独立勾选框区域
             GgCheckBox(
-                checked = item.checked,
+                checked = checked,
                 onCheckedChange = { Session.toggle(currentItem) },
                 size = 21.dp,
                 accentColor = Rose.Primary

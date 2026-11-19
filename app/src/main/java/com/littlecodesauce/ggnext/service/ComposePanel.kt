@@ -46,10 +46,7 @@ class ComposePanel(
     private val store = ViewModelStore()
     private val savedStateController = SavedStateRegistryController.create(this)
     private val backDispatcher = OnBackPressedDispatcher {
-        val currentSheet = Session.ui.value.sheet
-        if (currentSheet != Sheet.NONE) {
-            Session.closeSheet()
-        } else {
+        if (!Session.popSheet()) {
             onClose()
         }
     }
@@ -64,13 +61,14 @@ class ComposePanel(
         runCatching { savedStateController.performRestore(null) }
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
 
-        // 关键修复：将四个 ViewTreeOwner 挂载在窗口根容器 parent 上，确保 WindowRecomposer 在 rootView 上能找到 LifecycleOwner
+        // 将四个 ViewTreeOwner 挂载在窗口根容器 parent 上，确保 WindowRecomposer 在 rootView 上能找到 LifecycleOwner
         parent.setViewTreeLifecycleOwner(this@ComposePanel)
         parent.setViewTreeViewModelStoreOwner(this@ComposePanel)
         parent.setViewTreeSavedStateRegistryOwner(this@ComposePanel)
         parent.setViewTreeOnBackPressedDispatcherOwner(this@ComposePanel)
 
         val cv = ComposeView(themedContext).apply {
+            setBackgroundColor(android.graphics.Color.TRANSPARENT)
             setViewTreeLifecycleOwner(this@ComposePanel)
             setViewTreeViewModelStoreOwner(this@ComposePanel)
             setViewTreeSavedStateRegistryOwner(this@ComposePanel)

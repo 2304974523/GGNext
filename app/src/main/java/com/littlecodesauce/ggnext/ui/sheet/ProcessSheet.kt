@@ -97,7 +97,7 @@ fun ProcessSheet(ui: Ui) {
     NextSheetCard(
         title = "进程列表",
         subtitle = "选择要附加的进程",
-        onDismiss = Session::closeSheet,
+        onDismiss = { Session.popSheet() },
         maxBodyHeight = 640
     ) {
         Column {
@@ -200,7 +200,7 @@ private fun ProcessRow(p: TargetProcess, index: Int, onClick: () -> Unit) {
                 if (p.isVirtual) {
                     Text(
                         text = "*",
-                        color = Color(0xFF42A5F5),
+                        color = if (Rose.IsDark) Color(0xFF42A5F5) else Color(0xFF1565C0),
                         fontSize = fsp(16f),
                         fontWeight = FontWeight.ExtraBold
                     )

@@ -1,5 +1,6 @@
 package com.littlecodesauce.ggnext.engine
 
+import com.littlecodesauce.ggnext.core.AppStrings
 import com.littlecodesauce.ggnext.model.ValueType
 
 /**
@@ -14,7 +15,7 @@ import com.littlecodesauce.ggnext.model.ValueType
  */
 object NumberParser {
 
-    class ParseException(message: String) : Exception(message)
+    class ParseException(message: String) : Exception(AppStrings.tr(message))
 
     enum class Kind { NUMBER, TEXT, RANGE, GROUP }
 

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -38,6 +40,29 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val propsFile = rootProject.file("keystore.properties")
+            val props = Properties().apply {
+                if (propsFile.isFile) propsFile.inputStream().use { load(it) }
+            }
+            val storePath = props.getProperty("storeFile")
+                ?: System.getenv("GGNEXT_KEYSTORE_PATH")
+            if (!storePath.isNullOrBlank() && file(storePath).isFile) {
+                storeFile = file(storePath)
+                storePassword = props.getProperty("storePassword")
+                    ?: System.getenv("GGNEXT_KEYSTORE_PASSWORD")
+                    ?: ""
+                keyAlias = props.getProperty("keyAlias")
+                    ?: System.getenv("GGNEXT_KEY_ALIAS")
+                    ?: ""
+                keyPassword = props.getProperty("keyPassword")
+                    ?: System.getenv("GGNEXT_KEY_PASSWORD")
+                    ?: ""
+            }
+        }
+    }
+
     buildTypes {
         release {
             // R8：代码压缩 + 混淆 + 资源裁剪
@@ -49,8 +74,9 @@ android {
             )
             // 关闭调试符号，减小体积
             isDebuggable = false
-            // 用 debug keystore 签名，产物可直接安装
-            signingConfig = signingConfigs.getByName("debug")
+            // 若配置了 keystore.properties 或 GGNEXT_KEYSTORE_* 环境变量则使用正式签名，否则回退 debug 签名
+            val relCfg = signingConfigs.getByName("release")
+            signingConfig = if (relCfg.storeFile != null) relCfg else signingConfigs.getByName("debug")
         }
         debug {
             isMinifyEnabled = false

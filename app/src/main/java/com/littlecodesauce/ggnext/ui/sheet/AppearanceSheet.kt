@@ -23,6 +23,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.littlecodesauce.ggnext.core.Session
@@ -49,7 +50,7 @@ fun AppearanceSheet(ui: Ui) {
     NextSheetCard(
         title = "外观",
         subtitle = "主题配色、深浅色模式、背景透明度与屏幕占比",
-        onDismiss = Session::closeSheet,
+        onDismiss = { Session.popSheet() },
         maxBodyHeight = 720
     ) {
         Column {
@@ -61,31 +62,34 @@ fun AppearanceSheet(ui: Ui) {
             ) {
                 Text(tr("主题色"), color = Rose.TextSecond, fontSize = fsp(13f))
                 Spacer(Modifier.height(8.dp))
+                val isDark = Rose.IsDark
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     ThemePreset.entries.chunked(4).forEach { row ->
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             row.forEach { p ->
                                 val on = ui.preset == p
+                                val swatch = p.seedFor(isDark)
+                                val checkTint = if (swatch.luminance() > 0.55f) Color(0xFF141013) else Color.White
                                 Column(
                                     Modifier
                                         .weight(1f)
-                                        .clickableWithTooltip {
+                                        .clickableWithTooltip(tooltip = tr(p.label)) {
                                             Session.setPreset(p)
-                                            Session.toast("已切换为「${tr(p.label)}」主题")
+                                            Session.toast("${tr("已切换主题：")}${tr(p.label)}")
                                         },
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     Box(
                                         Modifier
-                                            .size(44.dp)
-                                            .background(p.seed, CircleShape)
+                                            .size(40.dp)
+                                            .background(swatch, CircleShape)
                                             .then(if (on) Modifier.border(2.dp, Rose.Text, CircleShape) else Modifier),
                                         contentAlignment = Alignment.Center
                                     ) {
                                         if (on) {
                                             Icon(
                                                 Icons.Rounded.Check, null,
-                                                tint = Color(0xFF161114),
+                                                tint = checkTint,
                                                 modifier = Modifier.size(18.dp)
                                             )
                                         }
@@ -95,7 +99,8 @@ fun AppearanceSheet(ui: Ui) {
                                         tr(p.label),
                                         color = if (on) Rose.Text else Rose.TextSecond,
                                         fontSize = fsp(11f),
-                                        fontWeight = if (on) FontWeight.Medium else FontWeight.Normal
+                                        fontWeight = if (on) FontWeight.Medium else FontWeight.Normal,
+                                        maxLines = 1
                                     )
                                 }
                             }
@@ -192,7 +197,7 @@ fun AppearanceSheet(ui: Ui) {
                 }
             }
             Spacer(Modifier.height(8.dp))
-            RoseButton("完成", Modifier.fillMaxWidth(), filled = true) { Session.closeSheet() }
+            RoseButton("完成", Modifier.fillMaxWidth(), filled = true) { Session.popSheet() }
         }
     }
 }

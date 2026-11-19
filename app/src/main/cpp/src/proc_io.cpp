@@ -706,9 +706,7 @@ EngineErrc ProcIO::writeStringUTF16(uintptr_t addr, const std::u16string& str, b
 // ValueLocker Implementation (Unified Multi-Mode C++ Worker)
 // ============================================================================
 ValueLocker::ValueLocker(ProcIO& io, uint32_t intervalMs)
-    : m_io(io), m_intervalMs(std::max(1u, intervalMs)), m_paused(false), m_running(true) {
-    m_worker = std::thread(&ValueLocker::workerLoop, this);
-}
+    : m_io(io), m_intervalMs(std::max(1u, intervalMs)), m_paused(false), m_running(false), m_started(false) {}
 
 ValueLocker::~ValueLocker() {
     {
@@ -752,6 +750,11 @@ void ValueLocker::lockAddressConfigured(
         item.minVal = minVal;
         item.maxVal = maxVal;
         m_items[addr] = std::move(item);
+        if (!m_started) {
+            m_running = true;
+            m_started = true;
+            m_worker = std::thread(&ValueLocker::workerLoop, this);
+        }
     }
     m_cv.notify_one();
 }

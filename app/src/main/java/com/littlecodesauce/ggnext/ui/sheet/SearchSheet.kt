@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -779,6 +780,7 @@ fun FilterSearchSheet(ui: Ui) {
         Column(
             Modifier
                 .padding(horizontal = 10.dp, vertical = 4.dp)
+                .widthIn(max = 560.dp)
                 .fillMaxWidth()
                 .heightIn(max = maxCardHeight)
                 .clickableNoRipple(remember { MutableInteractionSource() }) {}
@@ -1120,15 +1122,6 @@ fun FilterSearchSheet(ui: Ui) {
             FormatCheckItem("UTF-16LE", st.formatUtf16, Rose.Text) {
                 st = st.copy(formatUtf16 = it)
             }
-            FormatCheckItem("ARM (x32)操作码", st.formatArm32, Rose.Violet) {
-                st = st.copy(formatArm32 = it)
-            }
-            FormatCheckItem("Thumb操作码", st.formatThumb, Rose.Magenta) {
-                st = st.copy(formatThumb = it)
-            }
-            FormatCheckItem("ARM (x64)操作码", st.formatArm64, Rose.Violet) {
-                st = st.copy(formatArm64 = it)
-            }
 
             AnimatedVisibility(showKeyboard, enter = expandEnter(), exit = expandExit()) {
                 Column(Modifier.padding(vertical = 4.dp)) {
@@ -1325,7 +1318,10 @@ fun FuzzySearchSheet(ui: Ui) {
     var distTf by remember {
         mutableStateOf(TextFieldValue(fz.nearbyDistance, TextRange(fz.nearbyDistance.length)))
     }
-    // 0: deltaTf, 1: fromTf, 2: toTf, 3: addrTf, 4: distTf
+    var onlyNthTf by remember(fz.onlyNth) {
+        mutableStateOf(TextFieldValue(fz.onlyNth, TextRange(fz.onlyNth.length)))
+    }
+    // 0: deltaTf, 1: fromTf, 2: toTf, 3: addrTf, 4: distTf, 5: onlyNthTf
     var activeField by remember { mutableIntStateOf(if (hasResults) 0 else 1) }
 
     val activeFuzzyTf = when (activeField) {
@@ -1333,6 +1329,7 @@ fun FuzzySearchSheet(ui: Ui) {
         2 -> toTf
         3 -> addrTf
         4 -> distTf
+        5 -> onlyNthTf
         else -> deltaTf
     }
 
@@ -1353,6 +1350,10 @@ fun FuzzySearchSheet(ui: Ui) {
             4 -> {
                 distTf = next
                 Session.updateFuzzy { it.copy(nearbyDistance = next.text) }
+            }
+            5 -> {
+                onlyNthTf = next
+                Session.updateFuzzy { it.copy(onlyNth = next.text) }
             }
             else -> {
                 deltaTf = next
@@ -1384,6 +1385,7 @@ fun FuzzySearchSheet(ui: Ui) {
         Column(
             Modifier
                 .padding(horizontal = 10.dp, vertical = 4.dp)
+                .widthIn(max = 560.dp)
                 .fillMaxWidth()
                 .heightIn(max = maxCardHeight)
                 .clickableNoRipple(remember { MutableInteractionSource() }) {}
@@ -1837,7 +1839,37 @@ fun FuzzySearchSheet(ui: Ui) {
                                     Modifier
                                         .fillMaxWidth()
                                         .height(2.dp)
-                                        .background(Rose.Primary)
+                                        .background(if (activeField == 0) Rose.Primary else Rose.Divider)
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(tr("每 N 个取 1 个: "), color = Rose.TextSecond, fontSize = fsp(12.5f))
+                        Box(Modifier.weight(1f)) {
+                            Column {
+                                GgTextField(
+                                    value = onlyNthTf,
+                                    onValueChange = {
+                                        activeField = 5
+                                        onActiveChange(it)
+                                    },
+                                    onFocus = { activeField = 5 },
+                                    modifier = Modifier.fillMaxWidth().height(28.dp),
+                                    textStyle = monoStyle(13, Rose.Text),
+                                    cursorColor = Rose.Primary,
+                                    suppressSystemKeyboard = fz.keyboardVisible,
+                                    placeholder = "1"
+                                )
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .height(2.dp)
+                                        .background(if (activeField == 5) Rose.Primary else Rose.Divider)
                                 )
                             }
                         }

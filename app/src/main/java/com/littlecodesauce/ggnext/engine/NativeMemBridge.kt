@@ -104,6 +104,17 @@ object NativeMemBridge {
         return sessionHandle
     }
 
+    @Synchronized
+    fun releaseHandle() {
+        val h = sessionHandle
+        if (h != 0L && isLoaded) {
+            sessionHandle = 0L
+            runCatching { nativeDestroy(h) }
+        }
+    }
+
+    fun currentHandle(): Long = sessionHandle
+
     fun toNativeDataType(ggType: Int): Int = when (ggType and 0x7F) {
         ValueType.BYTE -> DT_INT8
         ValueType.WORD -> DT_INT16
@@ -156,7 +167,10 @@ object NativeMemBridge {
     @JvmStatic external fun nativeCreate(workerThreads: Int, spillDir: String): Long
     @JvmStatic external fun nativeDestroy(handle: Long)
     @JvmStatic external fun nativeAttach(handle: Long, pid: Int): Int
+    @JvmStatic external fun nativeIsProcessAlive(handle: Long): Boolean
     @JvmStatic external fun nativeSetRegionMask(handle: Long, regionMask: Int)
+    @JvmStatic external fun nativeSetAddressFilter(handle: Long, minAddr: Long, maxAddr: Long, addrMask: Long, addrPattern: Long)
+    @JvmStatic external fun nativeCancelScan(handle: Long)
     @JvmStatic external fun nativeGetRegionTotals(handle: Long, pid: Int): LongArray?
     @JvmStatic external fun nativeGetRegionCodeAt(handle: Long, address: Long): String?
     @JvmStatic external fun nativeClassifyPointer(handle: Long, ptrValue: Long): Int
@@ -179,6 +193,21 @@ object NativeMemBridge {
         floatTarget: Double,
         epsilon: Double
     ): Int
+    @JvmStatic external fun nativeSearchNotEqual(
+        handle: Long,
+        dataType: Int,
+        intTarget: Long,
+        floatTarget: Double,
+        epsilon: Double,
+        aligned: Boolean
+    ): Int
+    @JvmStatic external fun nativeRefineNotEqual(
+        handle: Long,
+        dataType: Int,
+        intTarget: Long,
+        floatTarget: Double,
+        epsilon: Double
+    ): Int
     @JvmStatic external fun nativeSearchRange(
         handle: Long,
         dataType: Int,
@@ -187,7 +216,8 @@ object NativeMemBridge {
         floatMin: Double,
         floatMax: Double,
         inclusive: Boolean,
-        aligned: Boolean
+        aligned: Boolean,
+        excludeRange: Boolean = false
     ): Int
     @JvmStatic external fun nativeRefineRange(
         handle: Long,
@@ -196,7 +226,8 @@ object NativeMemBridge {
         intMax: Long,
         floatMin: Double,
         floatMax: Double,
-        inclusive: Boolean
+        inclusive: Boolean,
+        excludeRange: Boolean = false
     ): Int
     @JvmStatic external fun nativeSearchPointers(
         handle: Long,
@@ -265,7 +296,8 @@ object NativeMemBridge {
         deltaOp: Int,
         intDelta: Long,
         floatDelta: Double,
-        epsilon: Double
+        epsilon: Double,
+        onlyNth: Int = 0
     ): Int
     @JvmStatic external fun nativeGetCandidateCount(handle: Long): Long
     @JvmStatic external fun nativeGetCandidatesPacked(handle: Long, offset: Int, limit: Int): LongArray?

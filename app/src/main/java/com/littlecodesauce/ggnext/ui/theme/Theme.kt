@@ -18,18 +18,18 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import com.littlecodesauce.ggnext.core.AppStrings
 import com.littlecodesauce.ggnext.core.Session
 import com.littlecodesauce.ggnext.ui.components.I18n
 
-/**
- * 全局动态响应式色板：
- * Bug 1 修复 & 界面调整 10：
- * 1. 当切换深色/浅色模式、主题色或语言时，在 `GgNextTheme` 中通过 `key(activePreset, activeDarkMode, activeDynamicColor, systemDark, lang)`
- *    强制整棵 UI 组合树在同一帧内同步重绘，彻底消除部分子组件跳过重组导致字体残留白色的问题（如图1）。
- * 2. 浅色模式下所有数据类型语义色、指针色与区域色均采用高对比深色值，保证极佳可读性。
- */
+val LocalAppPalette = staticCompositionLocalOf {
+    buildAppPalette(ThemePreset.ROSE.darkSeed, dark = true)
+}
+
+val LocalAppLang = staticCompositionLocalOf { AppStrings.LANG_ZH }
+
 object Rose {
-    var palette by mutableStateOf(buildAppPalette(ThemePreset.ROSE.seed, dark = true))
+    var palette by mutableStateOf(buildAppPalette(ThemePreset.ROSE.darkSeed, dark = true))
 
     val IsDark: Boolean get() = palette.isDark
     val Scrim: Color get() = palette.scrim
@@ -50,7 +50,7 @@ object Rose {
     val TextDim: Color get() = palette.textDim
     val Divider: Color get() = palette.divider
 
-    // 界面调整 10：数据类型与内存区域语义色（浅色模式下采用深色高对比度色值）
+    // 数据类型与内存区域语义色（浅色模式下采用深色高对比度色值）
     val Green: Color get() = if (palette.isDark) Color(0xFF7FD99A) else Color(0xFF0E632B)
     val Lime: Color get() = if (palette.isDark) Color(0xFFA8D97F) else Color(0xFF33610B)
     val Cyan: Color get() = if (palette.isDark) Color(0xFF8FD6DE) else Color(0xFF0B5863)
@@ -73,24 +73,26 @@ object Rose {
     val PointerWX: Color get() = if (palette.isDark) Color(0xFFFF66FF) else Color(0xFF8A0C8A)
 }
 
-fun regionColor(code: String): Color = when (code.uppercase()) {
-    "CH" -> Rose.Green
-    "JH" -> Rose.Green
-    "CA" -> Rose.Lime
-    "CD" -> Rose.Lime
-    "CB" -> Rose.Lime
-    "A", "AA" -> Rose.Green
-    "PS" -> Rose.Lime
-    // 需求 2：内存类型（J，S，As，V）配色参考图 1（暖黄/黄褐/橄榄绿系）
-    "J" -> Color(0xFFD4C894)   // Java：暖黄褐色
-    "S" -> Color(0xFFC8CA8E)   // Stack：浅卡其黄
-    "AS" -> Color(0xFFBAC484)  // Ashmem：橄榄卡其绿
-    "V" -> Color(0xFFBAC484)   // Video：橄榄卡其绿
-    "O" -> Color(0xFFD4D050)   // Other：金黄偏暗
-    "B" -> Rose.Red            // Bad：红色 (危险)
-    "XA" -> Color(0xFFB880B8)  // Code app：浅紫红 (危险)
-    "XS" -> Rose.Magenta       // Code system：亮品红 (危险)
-    else -> Rose.TextSecond
+fun regionColor(code: String): Color {
+    val isDark = Rose.palette.isDark
+    return when (code.uppercase()) {
+        "CH" -> Rose.Green
+        "JH" -> Rose.Green
+        "CA" -> Rose.Lime
+        "CD" -> Rose.Lime
+        "CB" -> Rose.Lime
+        "A", "AA" -> Rose.Green
+        "PS" -> Rose.Lime
+        "J" -> if (isDark) Color(0xFFD4C894) else Color(0xFF7A6318)
+        "S" -> if (isDark) Color(0xFFC8CA8E) else Color(0xFF5E6614)
+        "AS" -> if (isDark) Color(0xFFBAC484) else Color(0xFF4B6318)
+        "V" -> if (isDark) Color(0xFFBAC484) else Color(0xFF4B6318)
+        "O" -> if (isDark) Color(0xFFD4D050) else Color(0xFF756A00)
+        "B" -> Rose.Red
+        "XA" -> if (isDark) Color(0xFFB880B8) else Color(0xFF7B2B7B)
+        "XS" -> Rose.Magenta
+        else -> Rose.TextSecond
+    }
 }
 
 fun typeColor(flags: Int): Color = when (flags and 0x7F) {
@@ -163,7 +165,7 @@ fun GgNextTheme(
     val activePreset = preset ?: ui.preset
     val activeDarkMode = darkMode ?: ui.darkMode
     val activeDynamic = dynamicColor ?: ui.dynamicColor
-    val lang = ui.settings["language"] ?: "0"
+    val lang = ui.settings["language"] ?: AppStrings.LANG_ZH
 
     val (computedPalette, scheme) = rememberPaletteAndScheme(
         preset = activePreset,
@@ -171,11 +173,15 @@ fun GgNextTheme(
         dynamicColor = activeDynamic,
         systemDark = systemDark
     )
-    Rose.palette = computedPalette
-    I18n.currentLang = lang
+
     SideEffect {
-        Rose.palette = computedPalette
-        I18n.currentLang = lang
+        if (Rose.palette != computedPalette) {
+            Rose.palette = computedPalette
+        }
+        AppStrings.setLang(lang)
+        if (I18n.currentLang != lang) {
+            I18n.currentLang = lang
+        }
     }
 
     val m = metrics ?: ui.metrics
@@ -199,6 +205,8 @@ fun GgNextTheme(
     )
 
     CompositionLocalProvider(
+        LocalAppPalette provides computedPalette,
+        LocalAppLang provides lang,
         LocalUiMetrics provides m,
         LocalContentColor provides computedPalette.text
     ) {

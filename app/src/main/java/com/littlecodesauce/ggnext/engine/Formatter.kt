@@ -35,9 +35,6 @@ object Formatter {
         FormatItem(F_RHEX, "r", "HEX 逆序"),
         FormatItem(F_STRING, "S", "字符串"),
         FormatItem(F_JAVA, "J", "Java 字符串"),
-        FormatItem(F_ARM, "A", "反汇编 ARM (x32)"),
-        FormatItem(F_THUMB, "T", "反汇编 Thumb"),
-        FormatItem(F_ARM8, "A8", "反汇编 ARM (x64)"),
         FormatItem(F_DWORD, "D", "Dword"),
         FormatItem(F_FLOAT, "F", "Float"),
         FormatItem(F_DOUBLE, "E", "Double"),
@@ -105,7 +102,8 @@ object Formatter {
 
     /** 按当前显示掩码渲染一个地址条目 */
     fun render(item: com.littlecodesauce.ggnext.model.MemoryItem, mask: Int): String {
-        val key = (item.value * 31 + mask) * 31 + item.flags
+        val addrPart = if (mask and F_XOR != 0) item.address else 0L
+        val key = ((item.value * 31 + mask) * 31 + item.flags) * 31 + addrPart
         synchronized(renderCache) {
             renderCache[key]?.let { return it }
         }
@@ -152,7 +150,8 @@ object Formatter {
             sb.append(decimal(item.value, 8)).append("Q; ")
         }
         if (mask and F_XOR != 0) {
-            sb.append(decimal(item.value, 4)).append("X; ")
+            val xorDecoded = (item.value xor (item.address and 0xFFFFFFFFL))
+            sb.append(decimal(xorDecoded, 4)).append("X; ")
         }
         return sb.toString().trim().ifEmpty { "--" }
     }
@@ -166,7 +165,7 @@ object Formatter {
             mask and F_WORD != 0 && item.flags and 0x7F == ValueType.WORD -> decimal(item.value, 2) + "W"
             mask and F_BYTE != 0 && item.flags and 0x7F == ValueType.BYTE -> decimal(item.value, 1) + "B"
             mask and F_QWORD != 0 && item.flags and 0x7F == ValueType.QWORD -> decimal(item.value, 8) + "Q"
-            mask and F_XOR != 0 && item.flags and 0x7F == ValueType.XOR -> decimal(item.value, 4) + "X"
+            mask and F_XOR != 0 && item.flags and 0x7F == ValueType.XOR -> decimal(item.value xor (item.address and 0xFFFFFFFFL), 4) + "X"
             mask and F_HEX != 0 -> hex(item.value, item.size) + "h"
             else -> decimal(item.value, item.size)
         }

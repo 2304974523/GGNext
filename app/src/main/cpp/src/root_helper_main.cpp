@@ -5,6 +5,7 @@
 #include "mem_engine/search_engine.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +18,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -63,9 +66,17 @@ std::string formatPerms(const mem_engine::VmaRegion& r) {
     return p;
 }
 
+bool isPidAlive(int pid) {
+    if (pid <= 0) return false;
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    return ::access(path, F_OK) == 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IOFBF, 65536);
     std::string spillDir = "/data/local/tmp";
     size_t threads = 4;
     if (argc >= 2 && argv[1] && argv[1][0] != '\0') {
@@ -82,7 +93,18 @@ int main(int argc, char** argv) {
     mem_engine::CancellationToken cancelToken;
     std::vector<mem_engine::VmaRegion> cachedAllRegions;
     mem_engine::VmaIndex cachedVmaIndex;
+
+    std::mutex stdoutMutex;
     std::mutex progressMutex;
+    std::thread scanThread;
+    std::atomic<bool> scanActive{false};
+
+    auto waitForScan = [&]() {
+        if (scanThread.joinable()) {
+            scanThread.join();
+        }
+        scanActive.store(false, std::memory_order_release);
+    };
 
     auto makeProgressReporter = [&]() -> mem_engine::ProgressCallback {
         auto lastReport = std::make_shared<std::chrono::steady_clock::time_point>(
@@ -94,10 +116,33 @@ int main(int argc, char** argv) {
             auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - *lastReport).count();
             if (elapsedMs >= 45 || done >= total) {
                 *lastReport = now;
+                std::lock_guard<std::mutex> outLk(stdoutMutex);
                 std::printf("PROGRESS %zu %zu %zu\n", done, total, scanner.totalMatchedCount());
                 std::fflush(stdout);
             }
         };
+    };
+
+    auto launchScan = [&](std::function<mem_engine::EngineErrc(mem_engine::ProgressCallback)> task) {
+        waitForScan();
+        cancelToken.reset();
+        scanActive.store(true, std::memory_order_release);
+        auto reporter = makeProgressReporter();
+        scanThread = std::thread([&, task = std::move(task), reporter = std::move(reporter)]() {
+            mem_engine::EngineErrc rc = task(reporter);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
+            if (rc == mem_engine::EngineErrc::ERR_CANCELLED) {
+                std::printf("CANCELLED %zu\n", scanner.totalMatchedCount());
+            } else if (rc == mem_engine::EngineErrc::ERR_SRCH) {
+                std::printf("ERR -2\n");
+            } else if (rc != mem_engine::EngineErrc::OK) {
+                std::printf("ERR %d\n", static_cast<int>(rc));
+            } else {
+                std::printf("OK %zu\n", scanner.totalMatchedCount());
+            }
+            std::fflush(stdout);
+            scanActive.store(false, std::memory_order_release);
+        });
     };
 
     std::string line;
@@ -111,19 +156,41 @@ int main(int argc, char** argv) {
         std::string cmd;
         iss >> cmd;
 
-        if (cmd == "PING") {
-            std::printf("OK PONG\n");
-            std::fflush(stdout);
-        } else if (cmd == "EXIT" || cmd == "QUIT") {
+        // Asynchronous out-of-band commands handled immediately without blocking on scanThread
+        if (cmd == "CANCEL") {
+            cancelToken.cancel();
+            continue;
+        }
+        if (cmd == "EXIT" || cmd == "QUIT") {
+            cancelToken.cancel();
+            waitForScan();
             locker.unlockAll();
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK BYE\n");
             std::fflush(stdout);
             break;
+        }
+        if (cmd == "PING") {
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
+            std::printf("OK PONG\n");
+            std::fflush(stdout);
+            continue;
+        }
+
+        // All state-mutating / scan / IO commands synchronize with any prior scanThread
+        waitForScan();
+
+        if (cmd == "ALIVE") {
+            bool alive = isPidAlive(io.pid());
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
+            std::printf("OK %d\n", alive ? 1 : 0);
+            std::fflush(stdout);
         } else if (cmd == "ATTACH") {
             int pid = 0;
             iss >> pid;
             locker.unlockAll();
             auto rc = io.attach(pid);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             if (rc == mem_engine::EngineErrc::OK) {
                 scanner.refreshRegions();
                 cachedAllRegions = mem_engine::MapsParser::parseProcessMaps(pid, 0, false);
@@ -142,14 +209,33 @@ int main(int argc, char** argv) {
             if (io.pid() > 0) {
                 scanner.refreshRegions();
             }
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
+            std::printf("OK\n");
+            std::fflush(stdout);
+        } else if (cmd == "SET_ADDR_FILTER") {
+            std::string minHex = "0", maxHex = "0", maskHex = "0", patHex = "0";
+            iss >> minHex >> maxHex >> maskHex >> patHex;
+            uint64_t minA = std::strtoull(minHex.c_str(), nullptr, 16);
+            uint64_t maxA = std::strtoull(maxHex.c_str(), nullptr, 16);
+            uint64_t maskA = std::strtoull(maskHex.c_str(), nullptr, 16);
+            uint64_t patA = std::strtoull(patHex.c_str(), nullptr, 16);
+            scanner.setAddressFilter(minA, maxA, maskA, patA);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK\n");
             std::fflush(stdout);
         } else if (cmd == "REGIONS") {
             int pid = io.pid();
+            if (pid > 0 && !isPidAlive(pid)) {
+                std::lock_guard<std::mutex> outLk(stdoutMutex);
+                std::printf("ERR -2\n");
+                std::fflush(stdout);
+                continue;
+            }
             if (pid > 0) {
                 cachedAllRegions = mem_engine::MapsParser::parseProcessMaps(pid, 0, false);
                 cachedVmaIndex.rebuild(cachedAllRegions);
             }
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK %zu\n", cachedAllRegions.size());
             for (const auto& r : cachedAllRegions) {
                 std::string perms = formatPerms(r);
@@ -170,6 +256,7 @@ int main(int argc, char** argv) {
             size_t size = 0;
             iss >> addrHex >> size;
             uintptr_t addr = static_cast<uintptr_t>(std::strtoull(addrHex.c_str(), nullptr, 16));
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             if (size == 0 || size > 16 * 1024 * 1024) {
                 std::printf("ERR 0\n");
                 std::fflush(stdout);
@@ -177,15 +264,26 @@ int main(int argc, char** argv) {
             }
             std::vector<uint8_t> buf(size, 0);
             size_t bytesRead = 0;
-            io.readMemory(addr, buf.data(), size, &bytesRead);
-            std::string hex = bytesToHex(buf.data(), size);
-            std::printf("OK %s\n", hex.c_str());
+            auto rc = io.readMemory(addr, buf.data(), size, &bytesRead);
+            if (rc == mem_engine::EngineErrc::ERR_SRCH) {
+                std::printf("ERR -2\n");
+            } else {
+                std::string hex = bytesToHex(buf.data(), size);
+                std::printf("OK %s\n", hex.c_str());
+            }
             std::fflush(stdout);
         } else if (cmd == "BATCH_READ") {
             size_t count = 0;
             iss >> count;
             if (count == 0 || count > 8192) {
+                std::lock_guard<std::mutex> outLk(stdoutMutex);
                 std::printf("OK 0\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (io.pid() > 0 && !isPidAlive(io.pid())) {
+                std::lock_guard<std::mutex> outLk(stdoutMutex);
+                std::printf("ERR -2\n");
                 std::fflush(stdout);
                 continue;
             }
@@ -215,7 +313,13 @@ int main(int argc, char** argv) {
                 ranges[i].localBuf   = slab.data() + (i * 8);
                 ranges[i].success    = false;
             }
-            io.readBatchScattered(ranges);
+            auto batchRc = io.readBatchScattered(ranges);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
+            if (batchRc == mem_engine::EngineErrc::ERR_SRCH) {
+                std::printf("ERR -2\n");
+                std::fflush(stdout);
+                continue;
+            }
             std::printf("OK %zu\n", count);
             for (size_t i = 0; i < count; ++i) {
                 int64_t rawVal = 0;
@@ -241,6 +345,7 @@ int main(int argc, char** argv) {
             iss >> addrHex >> hexBytes;
             uintptr_t addr = static_cast<uintptr_t>(std::strtoull(addrHex.c_str(), nullptr, 16));
             auto bytes = hexToBytes(hexBytes);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             if (bytes.empty()) {
                 std::printf("ERR 0\n");
                 std::fflush(stdout);
@@ -272,6 +377,7 @@ int main(int argc, char** argv) {
                 if (wrc != mem_engine::EngineErrc::OK) break;
                 copied += bytesRead;
             }
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK %zu\n", copied);
             std::fflush(stdout);
         } else if (cmd == "DUMP") {
@@ -280,6 +386,7 @@ int main(int argc, char** argv) {
             std::getline(iss >> std::ws, outPath);
             uintptr_t startAddr = static_cast<uintptr_t>(std::strtoull(startHex.c_str(), nullptr, 16));
             uintptr_t endAddr = static_cast<uintptr_t>(std::strtoull(endHex.c_str(), nullptr, 16));
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             if (endAddr <= startAddr || outPath.empty()) {
                 std::printf("ERR 0\n");
                 std::fflush(stdout);
@@ -314,6 +421,7 @@ int main(int argc, char** argv) {
             if (!bytes.empty()) {
                 locker.lockAddress(addr, bytes.data(), bytes.size());
             }
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK\n");
             std::fflush(stdout);
         } else if (cmd == "LOCK_CONFIG") {
@@ -334,18 +442,21 @@ int main(int argc, char** argv) {
                     maxVal
                 );
             }
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK\n");
             std::fflush(stdout);
         } else if (cmd == "LOCK_PAUSE") {
             int paused = 0;
             iss >> paused;
             locker.setPaused(paused != 0);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK\n");
             std::fflush(stdout);
         } else if (cmd == "LOCK_INTERVAL") {
             uint32_t ms = 10;
             iss >> ms;
             locker.setIntervalMs(ms);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK\n");
             std::fflush(stdout);
         } else if (cmd == "UNLOCK") {
@@ -353,14 +464,17 @@ int main(int argc, char** argv) {
             iss >> addrHex;
             uintptr_t addr = static_cast<uintptr_t>(std::strtoull(addrHex.c_str(), nullptr, 16));
             locker.unlockAddress(addr);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK\n");
             std::fflush(stdout);
         } else if (cmd == "UNLOCK_ALL") {
             locker.unlockAll();
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK\n");
             std::fflush(stdout);
         } else if (cmd == "CLEAR_SESSION") {
             scanner.clearSession();
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK\n");
             std::fflush(stdout);
         } else if (cmd == "REMOVE_CANDIDATES") {
@@ -376,6 +490,7 @@ int main(int argc, char** argv) {
                 }
                 scanner.removeCandidates(addrs.data(), addrs.size());
             }
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK %zu\n", scanner.totalMatchedCount());
             std::fflush(stdout);
         } else if (cmd == "SEARCH_EXACT") {
@@ -383,37 +498,51 @@ int main(int argc, char** argv) {
             int64_t iTarget = 0;
             double fTarget = 0.0, eps = 1e-4;
             iss >> dt >> iTarget >> fTarget >> eps >> aligned;
-            cancelToken.reset();
-            scanner.searchExact(static_cast<mem_engine::DataType>(dt), iTarget, fTarget, eps, aligned != 0, &cancelToken, makeProgressReporter());
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.searchExact(static_cast<mem_engine::DataType>(dt), iTarget, fTarget, eps, aligned != 0, &cancelToken, cb);
+            });
         } else if (cmd == "REFINE_EXACT") {
             int dt = 0;
             int64_t iTarget = 0;
             double fTarget = 0.0, eps = 1e-4;
             iss >> dt >> iTarget >> fTarget >> eps;
-            cancelToken.reset();
-            scanner.refineExact(static_cast<mem_engine::DataType>(dt), iTarget, fTarget, eps, &cancelToken, makeProgressReporter());
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.refineExact(static_cast<mem_engine::DataType>(dt), iTarget, fTarget, eps, &cancelToken, cb);
+            });
+        } else if (cmd == "SEARCH_NEQ") {
+            int dt = 0, aligned = 1;
+            int64_t iTarget = 0;
+            double fTarget = 0.0, eps = 1e-4;
+            iss >> dt >> iTarget >> fTarget >> eps >> aligned;
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.searchNotEqual(static_cast<mem_engine::DataType>(dt), iTarget, fTarget, eps, aligned != 0, &cancelToken, cb);
+            });
+        } else if (cmd == "REFINE_NEQ") {
+            int dt = 0;
+            int64_t iTarget = 0;
+            double fTarget = 0.0, eps = 1e-4;
+            iss >> dt >> iTarget >> fTarget >> eps;
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.refineNotEqual(static_cast<mem_engine::DataType>(dt), iTarget, fTarget, eps, &cancelToken, cb);
+            });
         } else if (cmd == "SEARCH_RANGE") {
-            int dt = 0, inclusive = 1, aligned = 1;
+            int dt = 0, inclusive = 1, aligned = 1, excludeRange = 0;
             int64_t iMin = 0, iMax = 0;
             double fMin = 0.0, fMax = 0.0;
             iss >> dt >> iMin >> iMax >> fMin >> fMax >> inclusive >> aligned;
-            cancelToken.reset();
-            scanner.searchRange(static_cast<mem_engine::DataType>(dt), iMin, iMax, fMin, fMax, inclusive != 0, aligned != 0, &cancelToken, makeProgressReporter());
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            if (iss >> excludeRange) { /* optional 8th field */ }
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.searchRange(static_cast<mem_engine::DataType>(dt), iMin, iMax, fMin, fMax, inclusive != 0, aligned != 0, &cancelToken, cb, excludeRange != 0);
+            });
         } else if (cmd == "REFINE_RANGE") {
-            int dt = 0, inclusive = 1;
+            int dt = 0, inclusive = 1, excludeRange = 0;
             int64_t iMin = 0, iMax = 0;
             double fMin = 0.0, fMax = 0.0;
             iss >> dt >> iMin >> iMax >> fMin >> fMax >> inclusive;
-            cancelToken.reset();
-            scanner.refineRange(static_cast<mem_engine::DataType>(dt), iMin, iMax, fMin, fMax, inclusive != 0, &cancelToken, makeProgressReporter());
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            if (iss >> excludeRange) { /* optional 7th field */ }
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.refineRange(static_cast<mem_engine::DataType>(dt), iMin, iMax, fMin, fMax, inclusive != 0, &cancelToken, cb, excludeRange != 0);
+            });
         } else if (cmd == "SEARCH_POINTER") {
             int dt = 0, aligned = 1;
             std::string targetHex;
@@ -421,18 +550,17 @@ int main(int argc, char** argv) {
             uint32_t protMask = mem_engine::PointerProtMask::ALL;
             iss >> dt >> targetHex >> maxOffset >> protMask >> aligned;
             uintptr_t targetAddr = static_cast<uintptr_t>(std::strtoull(targetHex.c_str(), nullptr, 16));
-            cancelToken.reset();
-            scanner.searchPointers(
-                static_cast<mem_engine::DataType>(dt),
-                targetAddr,
-                maxOffset,
-                protMask,
-                aligned != 0,
-                &cancelToken,
-                makeProgressReporter()
-            );
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.searchPointers(
+                    static_cast<mem_engine::DataType>(dt),
+                    targetAddr,
+                    maxOffset,
+                    protMask,
+                    aligned != 0,
+                    &cancelToken,
+                    cb
+                );
+            });
         } else if (cmd == "REFINE_POINTER") {
             int dt = 0;
             std::string targetHex;
@@ -440,17 +568,16 @@ int main(int argc, char** argv) {
             uint32_t protMask = mem_engine::PointerProtMask::ALL;
             iss >> dt >> targetHex >> maxOffset >> protMask;
             uintptr_t targetAddr = static_cast<uintptr_t>(std::strtoull(targetHex.c_str(), nullptr, 16));
-            cancelToken.reset();
-            scanner.refinePointers(
-                static_cast<mem_engine::DataType>(dt),
-                targetAddr,
-                maxOffset,
-                protMask,
-                &cancelToken,
-                makeProgressReporter()
-            );
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.refinePointers(
+                    static_cast<mem_engine::DataType>(dt),
+                    targetAddr,
+                    maxOffset,
+                    protMask,
+                    &cancelToken,
+                    cb
+                );
+            });
         } else if (cmd == "SEARCH_GROUP" || cmd == "REFINE_GROUP") {
             int windowSize = 512, ordered = 0, aligned = 1, count = 0;
             iss >> windowSize >> ordered >> aligned >> count;
@@ -474,14 +601,12 @@ int main(int argc, char** argv) {
                 f.origIndex = static_cast<size_t>(i);
                 query.fields.push_back(f);
             }
-            cancelToken.reset();
-            if (cmd == "REFINE_GROUP") {
-                scanner.refineGroup(query, &cancelToken, makeProgressReporter());
-            } else {
-                scanner.searchGroup(query, &cancelToken, makeProgressReporter());
-            }
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            const bool isRefine = (cmd == "REFINE_GROUP");
+            launchScan([query = std::move(query), isRefine, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return isRefine
+                    ? scanner.refineGroup(query, &cancelToken, cb)
+                    : scanner.searchGroup(query, &cancelToken, cb);
+            });
         } else if (cmd == "SEARCH_PATTERN") {
             std::string patHex, maskStr;
             iss >> patHex >> maskStr;
@@ -490,68 +615,66 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < std::min(pat.size(), maskStr.size()); ++i) {
                 maskBytes[i] = (maskStr[i] == '?' || maskStr[i] == '.') ? 0x00 : 0xFF;
             }
-            cancelToken.reset();
-            scanner.searchBytePattern(pat, maskBytes, &cancelToken, makeProgressReporter());
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            launchScan([pat = std::move(pat), maskBytes = std::move(maskBytes), &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.searchBytePattern(pat, maskBytes, &cancelToken, cb);
+            });
         } else if (cmd == "SEARCH_ENCODED") {
             int dt = 0, encMode = 0, aligned = 1;
             int64_t logicalInt = 0;
             double logicalFloat = 0.0;
             uint64_t keyOrMask = 0;
             iss >> dt >> encMode >> logicalInt >> logicalFloat >> keyOrMask >> aligned;
-            cancelToken.reset();
-            scanner.searchEncoded(
-                static_cast<mem_engine::DataType>(dt),
-                static_cast<mem_engine::EncodedMode>(encMode),
-                logicalInt,
-                logicalFloat,
-                keyOrMask,
-                aligned != 0,
-                &cancelToken,
-                makeProgressReporter()
-            );
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.searchEncoded(
+                    static_cast<mem_engine::DataType>(dt),
+                    static_cast<mem_engine::EncodedMode>(encMode),
+                    logicalInt,
+                    logicalFloat,
+                    keyOrMask,
+                    aligned != 0,
+                    &cancelToken,
+                    cb
+                );
+            });
         } else if (cmd == "REFINE_ENCODED") {
             int dt = 0, encMode = 0;
             int64_t logicalInt = 0;
             double logicalFloat = 0.0;
             uint64_t keyOrMask = 0;
             iss >> dt >> encMode >> logicalInt >> logicalFloat >> keyOrMask;
-            cancelToken.reset();
-            scanner.refineEncoded(
-                static_cast<mem_engine::DataType>(dt),
-                static_cast<mem_engine::EncodedMode>(encMode),
-                logicalInt,
-                logicalFloat,
-                keyOrMask,
-                &cancelToken,
-                makeProgressReporter()
-            );
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.refineEncoded(
+                    static_cast<mem_engine::DataType>(dt),
+                    static_cast<mem_engine::EncodedMode>(encMode),
+                    logicalInt,
+                    logicalFloat,
+                    keyOrMask,
+                    &cancelToken,
+                    cb
+                );
+            });
         } else if (cmd == "FUZZY_INIT") {
             int dt = 0;
             iss >> dt;
-            cancelToken.reset();
-            scanner.startUnknownSnapshot(static_cast<mem_engine::DataType>(dt), &cancelToken, makeProgressReporter());
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.startUnknownSnapshot(static_cast<mem_engine::DataType>(dt), &cancelToken, cb);
+            });
         } else if (cmd == "FUZZY_REFINE") {
             int deltaOp = 0;
             int64_t iDelta = 0;
             double fDelta = 0.0, eps = 1e-4;
+            uint32_t onlyNth = 0;
             iss >> deltaOp >> iDelta >> fDelta >> eps;
-            cancelToken.reset();
-            scanner.refineFuzzy(static_cast<mem_engine::SearchOp>(deltaOp), iDelta, fDelta, eps, &cancelToken, makeProgressReporter());
-            std::printf("OK %zu\n", scanner.totalMatchedCount());
-            std::fflush(stdout);
+            if (iss >> onlyNth) { /* optional 5th field */ }
+            launchScan([=, &scanner, &cancelToken](mem_engine::ProgressCallback cb) {
+                return scanner.refineFuzzy(static_cast<mem_engine::SearchOp>(deltaOp), iDelta, fDelta, eps, &cancelToken, cb, onlyNth);
+            });
         } else if (cmd == "GET_CANDIDATES") {
             size_t offset = 0, limit = 1000;
             iss >> offset >> limit;
             std::vector<mem_engine::CandidateEntry> slice;
             scanner.fetchCandidates(offset, limit, slice);
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("OK %zu\n", slice.size());
             for (const auto& c : slice) {
                 uint64_t meta = static_cast<uint64_t>(c.type) |
@@ -566,9 +689,14 @@ int main(int argc, char** argv) {
             }
             std::fflush(stdout);
         } else {
+            std::lock_guard<std::mutex> outLk(stdoutMutex);
             std::printf("ERR UNKNOWN_CMD\n");
             std::fflush(stdout);
         }
     }
+
+    cancelToken.cancel();
+    waitForScan();
+    locker.unlockAll();
     return 0;
 }

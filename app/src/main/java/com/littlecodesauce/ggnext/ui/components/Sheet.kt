@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
@@ -61,6 +62,8 @@ fun NextSheetCard(
         contentAlignment = Alignment.Center
     ) {
         val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+        val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE ||
+            configuration.screenWidthDp > configuration.screenHeightDp
         val fallbackHeightDp = configuration.screenHeightDp.coerceAtLeast(240)
         val availHeightDp = if (maxHeight.value.isFinite() && maxHeight.value > 120f) {
             maxHeight.value.toInt()
@@ -79,6 +82,7 @@ fun NextSheetCard(
         Column(
             Modifier
                 .padding(horizontal = 10.dp, vertical = if (isCompactHeight) 3.dp else 6.dp)
+                .then(if (isLandscape) Modifier.widthIn(max = 560.dp) else Modifier)
                 .fillMaxWidth()
                 .heightIn(max = maxCardHeight)
                 .clickable(

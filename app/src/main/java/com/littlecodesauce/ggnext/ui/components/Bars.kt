@@ -14,8 +14,10 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -25,6 +27,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -126,7 +129,7 @@ fun NavBar(
         BoxWithConstraints(
             modifier = Modifier
                 .weight(4f)
-                .height(42.dp)
+                .height(44.dp)
         ) {
             val slotWidth = maxWidth / 4f
             val indicatorX by animateDpAsState(
@@ -142,22 +145,13 @@ fun NavBar(
                 Modifier
                     .offset(x = indicatorX)
                     .width(slotWidth)
-                    .height(42.dp)
-                    .padding(horizontal = 3.dp, vertical = 2.dp)
-                    .background(
-                        color = primary.copy(alpha = if (Rose.IsDark) 0.22f else 0.18f),
-                        shape = RoundedCornerShape(12.dp)
-                    )
-                    .border(
-                        width = 1.dp,
-                        color = primary.copy(alpha = 0.35f),
-                        shape = RoundedCornerShape(12.dp)
-                    )
+                    .height(44.dp)
+                    .padding(bottom = 2.dp)
             ) {
                 Box(
                     Modifier
                         .align(Alignment.BottomCenter)
-                        .width(22.dp)
+                        .width(24.dp)
                         .height(2.5.dp)
                         .background(primary, RoundedCornerShape(2.dp))
                 )
@@ -214,6 +208,155 @@ fun NavBar(
     }
 }
 
+/**
+ * 横屏左侧竖向导航栏（Rail）：
+ * - 顶部当前进程图标按钮
+ * - 下方 4 个竖排导航页签 + Y 轴弹簧跟随底部横条指示器（无遮罩背景）
+ * - 最小化按钮（×）在横屏模式下固定于工具栏最右侧
+ * - 右侧 0.6dp 细分割线
+ */
+@Composable
+fun VerticalNavRail(
+    tab: NextTab,
+    target: TargetProcess?,
+    searchCount: Int,
+    savedCount: Int,
+    onPickProcess: () -> Unit,
+    onTab: (NextTab) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val primary = MaterialTheme.colorScheme.primary
+    val ctx = LocalContext.current
+    val appBmp = remember(target?.packageName, target?.apkPath) {
+        target?.let { AppIconCache.get(ctx, it.packageName, it.apkPath) }
+    }
+
+    Row(modifier = modifier.fillMaxHeight()) {
+        Column(
+            modifier = Modifier
+                .width(52.dp)
+                .fillMaxHeight()
+                .padding(horizontal = 4.dp, vertical = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            var iconPressed by remember { mutableStateOf(false) }
+            val iconScale by animateFloatAsState(if (iconPressed) 0.88f else 1f, Motion.Fast, label = "railProcIcon")
+            Box(
+                Modifier
+                    .size(38.dp)
+                    .scale(iconScale)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Rose.CardHigh)
+                    .clickableWithTooltip(
+                        tooltip = "选择进程",
+                        onPressChange = { iconPressed = it },
+                        onClick = onPickProcess
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                if (appBmp != null) {
+                    Image(bitmap = appBmp, contentDescription = target?.label, modifier = Modifier.size(30.dp))
+                } else {
+                    Text("G", color = primary, fontSize = fsp(16f), fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+
+            BoxWithConstraints(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) {
+                val slotHeight = (maxHeight / 4f).coerceAtLeast(40.dp)
+                val indicatorY by animateDpAsState(
+                    targetValue = slotHeight * tab.ordinal,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioNoBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    ),
+                    label = "railSlideY"
+                )
+
+                Box(
+                    Modifier
+                        .offset(y = indicatorY)
+                        .fillMaxWidth()
+                        .height(slotHeight)
+                        .padding(bottom = 4.dp)
+                ) {
+                    Box(
+                        Modifier
+                            .align(Alignment.BottomCenter)
+                            .width(20.dp)
+                            .height(2.5.dp)
+                            .background(primary, RoundedCornerShape(2.dp))
+                    )
+                }
+
+                Column(
+                    Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    NavIcon(
+                        icon = Icons.Rounded.Tune,
+                        desc = "设置",
+                        selected = tab == NextTab.SETTINGS,
+                        primary = primary,
+                        modifier = Modifier.weight(1f).fillMaxWidth()
+                    ) { onTab(NextTab.SETTINGS) }
+
+                    NavIcon(
+                        icon = Icons.Rounded.Search,
+                        desc = "搜索列表",
+                        selected = tab == NextTab.SEARCH_LIST,
+                        primary = primary,
+                        badgeCount = searchCount,
+                        modifier = Modifier.weight(1f).fillMaxWidth()
+                    ) { onTab(NextTab.SEARCH_LIST) }
+
+                    NavIcon(
+                        icon = Icons.Rounded.Save,
+                        desc = "保存列表",
+                        selected = tab == NextTab.SAVED_LIST,
+                        primary = primary,
+                        badgeCount = savedCount,
+                        modifier = Modifier.weight(1f).fillMaxWidth()
+                    ) { onTab(NextTab.SAVED_LIST) }
+
+                    NavIcon(
+                        icon = GgIcons.MemoryList,
+                        desc = "内存编辑器",
+                        selected = tab == NextTab.MEMORY,
+                        primary = primary,
+                        modifier = Modifier.weight(1f).fillMaxWidth()
+                    ) { onTab(NextTab.MEMORY) }
+                }
+            }
+        }
+
+        Box(
+            Modifier
+                .width(0.6.dp)
+                .fillMaxHeight()
+                .background(Rose.Divider)
+        )
+    }
+}
+
+internal fun formatNavBadgeCount(count: Int): String = when {
+    count <= 0 -> ""
+    count < 1_000 -> count.toString()
+    count < 10_000 -> {
+        val tenths = (count / 100)
+        val whole = tenths / 10
+        val frac = tenths % 10
+        if (frac == 0) "${whole}k" else "$whole.${frac}k"
+    }
+    count < 100_000 -> "${count / 1_000}k"
+    else -> "99k+"
+}
+
 @Composable
 private fun NavIcon(
     icon: ImageVector,
@@ -238,7 +381,7 @@ private fun NavIcon(
     Box(
         modifier
             .padding(horizontal = 2.dp)
-            .height(42.dp)
+            .height(44.dp)
             .scale(scale)
             .clickableWithTooltip(
                 tooltip = desc,
@@ -247,28 +390,37 @@ private fun NavIcon(
             ),
         contentAlignment = Alignment.Center
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = desc,
-            tint = tint,
-            modifier = Modifier.size(22.dp)
-        )
         if (badgeCount > 0) {
-            Box(
-                Modifier
-                    .align(Alignment.TopEnd)
-                    .offset(x = (-3).dp, y = 3.dp)
-                    .background(primary, RoundedCornerShape(8.dp))
-                    .padding(horizontal = 4.dp, vertical = 1.dp),
-                contentAlignment = Alignment.Center
+            Column(
+                modifier = Modifier.padding(bottom = 3.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
             ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = desc,
+                    tint = tint,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.height(1.dp))
                 Text(
-                    text = if (badgeCount > 9999) "9999+" else badgeCount.toString(),
-                    color = Rose.OnPrimary,
-                    fontSize = fsp(9f),
-                    fontWeight = FontWeight.Bold
+                    text = formatNavBadgeCount(badgeCount),
+                    color = if (selected) primary else Rose.TextSecond,
+                    fontSize = fsp(9.5f),
+                    lineHeight = fsp(10.5f),
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Clip
                 )
             }
+        } else {
+            Icon(
+                imageVector = icon,
+                contentDescription = desc,
+                tint = tint,
+                modifier = Modifier.size(22.dp)
+            )
         }
     }
 }
@@ -290,6 +442,7 @@ fun ToolBar(
     onMoreMenu: () -> Unit,
     onMoveFlowingTool: (from: Int, to: Int) -> Unit,
     onMovePinnedTool: (from: Int, to: Int) -> Unit,
+    onMinimize: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
@@ -543,6 +696,30 @@ fun ToolBar(
                 }
             }
         }
+
+        if (onMinimize != null) {
+            Spacer(Modifier.width(2.dp))
+            var minPressed by remember { mutableStateOf(false) }
+            val minScale by animateFloatAsState(if (minPressed) 0.88f else 1f, Motion.Fast, label = "toolMinScale")
+            Box(
+                Modifier
+                    .size(40.dp)
+                    .scale(minScale)
+                    .clickableWithTooltip(
+                        tooltip = "收起面板",
+                        onPressChange = { minPressed = it },
+                        onClick = onMinimize
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Close,
+                    contentDescription = "收起面板",
+                    tint = Rose.Text,
+                    modifier = Modifier.size(21.dp)
+                )
+            }
+        }
     }
 }
 
@@ -621,7 +798,8 @@ fun ProcessBar(
     onPick: () -> Unit,
     onCountClick: () -> Unit,
     onRefresh: () -> Unit,
-    onPause: () -> Unit
+    onPause: () -> Unit,
+    onMinimize: (() -> Unit)? = null
 ) {
     Row(
         Modifier
@@ -680,7 +858,7 @@ fun ProcessBar(
                 if (target.isVirtual) {
                     Text(
                         text = "*",
-                        color = Color(0xFF42A5F5),
+                        color = if (Rose.IsDark) Color(0xFF42A5F5) else Color(0xFF1565C0),
                         fontSize = fsp(14f),
                         fontWeight = FontWeight.ExtraBold
                     )
@@ -743,6 +921,30 @@ fun ProcessBar(
                 style = monoStyle(12, if (countPressed) Rose.Primary else Rose.TextSecond)
             )
         }
+
+        if (onMinimize != null) {
+            Spacer(Modifier.width(4.dp))
+            var minPressed by remember { mutableStateOf(false) }
+            val minScale by animateFloatAsState(if (minPressed) 0.88f else 1f, Motion.Fast, label = "procMinScale")
+            Box(
+                Modifier
+                    .size(24.dp)
+                    .scale(minScale)
+                    .clickableWithTooltip(
+                        tooltip = "收起面板",
+                        onPressChange = { minPressed = it },
+                        onClick = onMinimize
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Close,
+                    contentDescription = "收起面板",
+                    tint = Rose.Text,
+                    modifier = Modifier.size(17.dp)
+                )
+            }
+        }
     }
 }
 
@@ -752,15 +954,16 @@ fun ProcessBar(
  */
 @Composable
 fun InlineSearchProgressBar(ui: com.littlecodesauce.ggnext.core.Ui) {
+    val sp by Session.searchProgressState.collectAsStateWithLifecycle()
     val progress by animateFloatAsState(
-        targetValue = ui.searchProgress.coerceIn(0.04f, 1f),
+        targetValue = sp.progress.coerceIn(0.04f, 1f),
         animationSpec = Motion.Fast,
         label = "inlineSearchProg"
     )
-    val pct = (ui.searchProgress.coerceIn(0f, 1f) * 100f).toInt()
-    val etaStr = if (ui.searchEtaSeconds >= 0) "剩余 ~${ui.searchEtaSeconds}s" else "扫描中"
+    val pct = (sp.progress.coerceIn(0f, 1f) * 100f).toInt()
+    val etaStr = if (sp.etaSeconds >= 0) "${tr("剩余")} ~${sp.etaSeconds}s" else tr("扫描中")
 
-    androidx.compose.foundation.layout.Column(
+    Column(
         Modifier
             .fillMaxWidth()
             .background(Rose.Card.copy(alpha = (ui.metrics.bgOpacity * 0.92f).coerceIn(0.25f, 1f)))
@@ -768,13 +971,13 @@ fun InlineSearchProgressBar(ui: com.littlecodesauce.ggnext.core.Ui) {
         Row(
             Modifier
                 .fillMaxWidth()
-                .height(22.dp)
+                .height(26.dp)
                 .padding(horizontal = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Text(
-                text = ui.busyText.ifEmpty { "搜索中..." },
+                text = tr(sp.busyText.ifEmpty { ui.busyText.ifEmpty { "搜索中..." } }),
                 color = Rose.Primary,
                 fontSize = fsp(11f),
                 fontWeight = FontWeight.Medium,
@@ -785,21 +988,41 @@ fun InlineSearchProgressBar(ui: com.littlecodesauce.ggnext.core.Ui) {
             Spacer(Modifier.width(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = "命中 ${ui.searchFoundSoFar}",
+                    text = "${tr("命中")} ${sp.foundSoFar}",
                     style = monoStyle(11, Rose.Green, FontWeight.SemiBold)
                 )
-                if (ui.searchTotalMb > 0.1f) {
-                    Spacer(Modifier.width(8.dp))
+                if (sp.totalMb > 0.1f) {
+                    Spacer(Modifier.width(6.dp))
                     Text(
-                        text = String.format(java.util.Locale.US, "%.0f/%.0fMB", ui.searchScannedMb, ui.searchTotalMb),
+                        text = String.format(java.util.Locale.US, "%.0f/%.0fMB", sp.scannedMb, sp.totalMb),
                         style = monoStyle(10, Rose.TextDim)
                     )
                 }
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(6.dp))
                 Text(
                     text = "$pct% · $etaStr",
-                    style = monoStyle(11, Rose.TextSecond)
+                    style = monoStyle(10.5f.toInt(), Rose.TextSecond)
                 )
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Rose.Red.copy(alpha = if (Rose.IsDark) 0.22f else 0.14f))
+                        .border(0.8.dp, Rose.Red.copy(alpha = 0.55f), RoundedCornerShape(6.dp))
+                        .clickableWithTooltip(
+                            tooltip = tr("取消搜索"),
+                            onClick = { Session.cancelSearch() }
+                        )
+                        .padding(horizontal = 7.dp, vertical = 2.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = tr("取消"),
+                        color = Rose.Red,
+                        fontSize = fsp(10.5f),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
         }
         Box(

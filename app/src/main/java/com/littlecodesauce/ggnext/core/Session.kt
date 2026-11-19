@@ -2,13 +2,19 @@ package com.littlecodesauce.ggnext.core
 
 import android.app.Application
 import com.littlecodesauce.ggnext.data.AppLog
+import com.littlecodesauce.ggnext.data.HistoryPersistence
+import com.littlecodesauce.ggnext.data.LocalBlobStore
 import com.littlecodesauce.ggnext.data.ProcessScanner
+import com.littlecodesauce.ggnext.data.SavedListFileCodec
+import com.littlecodesauce.ggnext.data.ScriptHistoryEntry
 import com.littlecodesauce.ggnext.data.SearchHistory
+import com.littlecodesauce.ggnext.data.SettingKeys
 import com.littlecodesauce.ggnext.data.SettingsRepository
 import com.littlecodesauce.ggnext.data.SettingsSpecs
 import com.littlecodesauce.ggnext.engine.Formatter
 import com.littlecodesauce.ggnext.engine.MemoryEngine
 import com.littlecodesauce.ggnext.engine.NumberParser
+import com.littlecodesauce.ggnext.engine.Shell
 import com.littlecodesauce.ggnext.model.MemoryItem
 import com.littlecodesauce.ggnext.model.MemoryRegion
 import com.littlecodesauce.ggnext.model.TargetProcess
@@ -24,16 +30,20 @@ import com.littlecodesauce.ggnext.ui.theme.ThemePreset
 import com.littlecodesauce.ggnext.ui.theme.UiMetrics
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
 import kotlin.math.abs
 
@@ -44,8 +54,6 @@ enum class NextTab(val label: String) {
     SAVED_LIST("保存列表"),
     MEMORY("内存")
 }
-
-/** 弹窗枚举 */
 
 /** 工作模式枚举：Root 模式 与 免 Root 模式（共享 UID / 虚拟空间沙盒） */
 enum class WorkMode(val code: String, val title: String, val desc: String) {
@@ -92,7 +100,14 @@ enum class Sheet {
     ALLOCATE
 }
 
-/** 改进5：文件浏览器打开参数与回调目标 */
+/** 列表文件操作模式：严格区分只读载入与只写保存/导出 */
+enum class FileSheetMode {
+    LOAD,
+    SAVE,
+    EXPORT
+}
+
+/** 文件浏览器打开参数与回调目标 */
 enum class FileBrowserTarget {
     SCRIPT,
     FILE_MANAGER,
@@ -107,6 +122,17 @@ data class FileBrowserConfig(
 )
 
 enum class SearchMode { EXACT, FUZZY, MASK, POINTER, DIFF, RANGE }
+
+/** 独立高频搜索进度状态（脱离 Ui，避免每 45ms 触发全界面重组） */
+data class SearchProgressUi(
+    val active: Boolean = false,
+    val text: String = "",
+    val progress: Float = 0f,
+    val foundSoFar: Long = 0L,
+    val etaSeconds: Int = -1,
+    val scannedMb: Float = 0f,
+    val totalMb: Float = 0f
+)
 
 /** 搜索面板输入 */
 data class SearchInput(
@@ -133,7 +159,7 @@ data class SearchInput(
 data class FuzzyState(
     val active: Boolean = false,
     val type: Int = ValueType.DWORD,
-    val rangeMode: Int = 0, // 0=全部内存, 1=指定地址区间, 2=附近
+    val rangeMode: Int = 0,
     val rangeFrom: String = "00000000",
     val rangeTo: String = "FFFFFFFFFFFFFFFF",
     val nearbyAddress: String = "",
@@ -174,10 +200,7 @@ data class FilterState(
     val formatHex: Boolean = false,
     val formatRHex: Boolean = false,
     val formatString: Boolean = false,
-    val formatUtf16: Boolean = false,
-    val formatArm32: Boolean = false,
-    val formatThumb: Boolean = false,
-    val formatArm64: Boolean = false
+    val formatUtf16: Boolean = false
 ) {
     val isAnyFilterActive: Boolean
         get() = addrGreatEnabled || addrLessEnabled || valGreatEnabled || valLessEnabled ||
@@ -200,7 +223,6 @@ data class Ui(
     val saved: List<MemoryItem> = emptyList(),
     val memoryRows: List<MemoryItem> = emptyList(),
     val memoryBase: Long = 0L,
-    /** 改进7 & 改进9：跳转到地址后的专属高亮目标地址与滚动触发计数器 */
     val memoryHighlightAddress: Long? = null,
     val memoryScrollTrigger: Int = 0,
     val memoryTop: Long = 0L,
@@ -208,9 +230,14 @@ data class Ui(
     val memoryHistoryBack: List<Long> = emptyList(),
     val memoryHistoryForward: List<Long> = emptyList(),
 
+    // O(1) 独立分标签选择状态（模块 4）
+    val searchSelection: SelectionState = SelectionState.EMPTY,
+    val savedSelection: SelectionState = SelectionState.EMPTY,
+    val memorySelection: SelectionState = SelectionState.EMPTY,
+
     val processes: List<TargetProcess> = emptyList(),
     val processFilter: Int = 0, // 0=全部, 1=用户, 2=系统
-    val processSortBySize: Boolean = true, // "大小"可多选排序按钮（可与全部/用户/系统同时选中）
+    val processSortBySize: Boolean = true,
     val processLoading: Boolean = true,
     val target: TargetProcess? = null,
     val processPaused: Boolean = false,
@@ -220,24 +247,18 @@ data class Ui(
 
     val busy: Boolean = false,
     val busyText: String = "",
-    val searchProgress: Float = 0f,
-    val searchFoundSoFar: Long = 0L,
-    val searchEtaSeconds: Int = -1,
-    val searchScannedMb: Float = 0f,
-    val searchTotalMb: Float = 0f,
+    val isBatchBusy: Boolean = false,
 
-    val sheet: Sheet = Sheet.NONE,
+    /** 分层弹窗导航栈（支持子弹窗逐级返回） */
+    val sheetStack: List<Sheet> = emptyList(),
+    val fileSheetMode: FileSheetMode = FileSheetMode.SAVE,
+
     val search: SearchInput = SearchInput(),
     val fuzzy: FuzzyState = FuzzyState(),
     val filter: FilterState = FilterState(),
 
-    /** 改进5：脚本路径、文件管理路径、导出目录及文件浏览器状态 */
     val scriptPath: String = "/sdcard/Download/script.lua",
-    val scriptHistory: List<String> = listOf(
-        "/sdcard/Download/script.lua",
-        "/sdcard/GGNext/scripts/main.lua",
-        "/sdcard/GGNext/scripts/pointer_scan.lua"
-    ),
+    val scriptHistory: List<ScriptHistoryEntry> = HistoryPersistence.DEFAULT_SCRIPT_HISTORY,
     val fileManagerPath: String = "/sdcard/GGNext/saved_list.txt",
     val dumpDirPath: String = "/sdcard/GGNext/dump",
     val fileBrowser: FileBrowserConfig = FileBrowserConfig(),
@@ -256,10 +277,8 @@ data class Ui(
 
     val tools: Map<NextTab, List<ToolId>> = emptyMap(),
     val pinnedTools: Map<NextTab, List<ToolId>> = emptyMap(),
-    val selectedCount: Int = 0,
     val totalCount: Long = 0,
     val hintVisible: Boolean = true,
-    val toast: String? = null,
     val workMode: WorkMode = WorkMode.ROOT,
     val hasRootPermission: Boolean = false,
     val attachedOk: Boolean = false,
@@ -276,21 +295,46 @@ data class Ui(
     val speedMultiplier: Float = 1.0f,
     val homeSettingsOpen: Boolean = false
 ) {
+    /** 当前栈顶弹窗（派生属性，保持调用方兼容） */
+    val sheet: Sheet get() = sheetStack.lastOrNull() ?: Sheet.NONE
+
+    val searchSelectedCount: Int get() = searchSelection.selectedCount(results.size)
+    val savedSelectedCount: Int get() = savedSelection.selectedCount(saved.size)
+    val memorySelectedCount: Int get() = memorySelection.selectedCount(memoryRows.size)
+
+    /** O(1) 当前标签已选数量 */
+    val selectedCount: Int
+        get() = when (tab) {
+            NextTab.SAVED_LIST -> savedSelectedCount
+            NextTab.MEMORY -> memorySelectedCount
+            NextTab.SEARCH_LIST -> searchSelectedCount
+            NextTab.SETTINGS -> 0
+        }
+
+    fun isSearchItemSelected(item: MemoryItem): Boolean =
+        searchSelection.isSelected(SelectionState.itemKey(item))
+
+    fun isSavedItemSelected(item: MemoryItem): Boolean =
+        savedSelection.isSelected(SelectionState.itemKey(item))
+
+    fun isMemoryRowSelected(item: MemoryItem): Boolean =
+        memorySelection.isSelected(SelectionState.memoryRowKey(item))
+
     val currentMask: Int get() = if (tab == NextTab.SAVED_LIST) valueMaskSaved else valueMask
     val currentPinnedTools: List<ToolId> get() = pinnedTools[tab] ?: DEFAULT_PINNED_TOOLS
-    val flowingTools: List<ToolId> get() {
-        val base = tools[tab] ?: when (tab) {
-            NextTab.SEARCH_LIST -> DEFAULT_TOOLS_SEARCH
-            NextTab.SAVED_LIST -> DEFAULT_TOOLS_SAVED
-            NextTab.MEMORY -> DEFAULT_TOOLS_MEMORY
-            NextTab.SETTINGS -> emptyList()
+    val flowingTools: List<ToolId>
+        get() {
+            val base = tools[tab] ?: when (tab) {
+                NextTab.SEARCH_LIST -> DEFAULT_TOOLS_SEARCH
+                NextTab.SAVED_LIST -> DEFAULT_TOOLS_SAVED
+                NextTab.MEMORY -> DEFAULT_TOOLS_MEMORY
+                NextTab.SETTINGS -> emptyList()
+            }
+            val pinned = currentPinnedTools.toSet()
+            return base.filter { it !in pinned }
         }
-        val pinned = currentPinnedTools.toSet()
-        return base.filter { it !in pinned }
-    }
     val searchToolList: List<ToolId> get() = flowingTools
 
-    /** 3.4 同步显示为 (显示数量/本轮搜索总数量) */
     val countButtonText: String
         get() {
             val total = maxOf(totalCount, rawResults.size.toLong(), results.size.toLong())
@@ -312,7 +356,6 @@ data class Ui(
  */
 object Session {
 
-    /** 单内存页大小设定为 4KB（4096 字节 = 1024 行 Dword） */
     const val MEMORY_PAGE_BYTES = 4096
     const val MEMORY_PAGE_ROWS = MEMORY_PAGE_BYTES / 4
 
@@ -325,17 +368,33 @@ object Session {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var repo: SettingsRepository? = null
     private var appContext: Application? = null
-    internal val engine = MemoryEngine()
+    private var blobStoreDir: File? = null
+    private val engine = MemoryEngine()
     private val historyStore = SearchHistory()
+
     @Volatile
     private var hasFuzzySession: Boolean = false
     @Volatile
     private var liveRefreshRunning: Boolean = false
     @Volatile
     private var frozenItemsSnapshot: List<MemoryItem> = emptyList()
-    private val attachMutex = Mutex()
+    @Volatile
+    private var activeSearchJob: Job? = null
 
-    /** Bug 2.1：记录各列表（search_list / saved_list / memory_list / settings_list）的滚动位置 */
+    private val pendingSettingsBuffer = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val settingsFlushMutex = Mutex()
+    @Volatile
+    private var persistSettingsJob: Job? = null
+    @Volatile
+    private var persistSearchHistJob: Job? = null
+    @Volatile
+    private var persistGotoHistJob: Job? = null
+    @Volatile
+    private var persistScriptHistJob: Job? = null
+    @Volatile
+    private var persistSavedListJob: Job? = null
+
+    private val attachMutex = Mutex()
     private val listScrollPositions = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Int>>()
 
     fun getListScrollPosition(key: String): Pair<Int, Int> =
@@ -348,6 +407,12 @@ object Session {
     private val _ui = MutableStateFlow(Ui())
     val ui: StateFlow<Ui> = _ui.asStateFlow()
 
+    private val _searchProgressState = MutableStateFlow(SearchProgressUi())
+    val searchProgressState: StateFlow<SearchProgressUi> = _searchProgressState.asStateFlow()
+
+    private val _toastState = MutableStateFlow<String?>(null)
+    val toastState: StateFlow<String?> = _toastState.asStateFlow()
+
     private fun buildMetrics(map: Map<String, String>): UiMetrics = UiMetrics(
         fontScale = (map["font_scale"]?.toFloatOrNull() ?: 0.88f).coerceIn(0.7f, 1.3f),
         dialogCorner = (map["dialog_corner"]?.toIntOrNull() ?: 12).coerceIn(0, 28),
@@ -357,6 +422,9 @@ object Session {
         bgOpacity = (map["bg_opacity"]?.toFloatOrNull() ?: 0.96f).coerceIn(0.25f, 1.0f),
         panelScale = (map["panel_scale"]?.toFloatOrNull() ?: 1.0f).coerceIn(0.40f, 1.0f)
     )
+
+    private fun currentHistoryLimit(settings: Map<String, String> = _ui.value.settings): Int =
+        (settings["history_limit"]?.toIntOrNull() ?: 500).coerceIn(0, 100000)
 
     private fun parseRegionsCsv(csv: String?): Set<String>? {
         if (csv.isNullOrBlank()) return null
@@ -382,23 +450,54 @@ object Session {
         return RegionCatalog.DEFAULT_SELECTED
     }
 
-    private fun persistSelectedRegions(regions: Set<String>, packageName: String?) {
+    private fun enqueueSettingWrite(id: String, value: String, immediate: Boolean = false) {
+        pendingSettingsBuffer[id] = value
+        scheduleSettingsFlush(delayMs = if (immediate) 0L else 140L)
+    }
+
+    private fun enqueueSettingsWrite(pairs: Map<String, String>, immediate: Boolean = false) {
+        if (pairs.isEmpty()) return
+        pendingSettingsBuffer.putAll(pairs)
+        scheduleSettingsFlush(delayMs = if (immediate) 0L else 140L)
+    }
+
+    private fun scheduleSettingsFlush(delayMs: Long) {
+        persistSettingsJob?.cancel()
+        persistSettingsJob = scope.launch(Dispatchers.IO) {
+            if (delayMs > 0L) delay(delayMs)
+            settingsFlushMutex.withLock {
+                withContext(NonCancellable) {
+                    while (pendingSettingsBuffer.isNotEmpty()) {
+                        val batch = LinkedHashMap<String, String>()
+                        val iter = pendingSettingsBuffer.entries.iterator()
+                        while (iter.hasNext()) {
+                            val entry = iter.next()
+                            batch[entry.key] = entry.value
+                            iter.remove()
+                        }
+                        if (batch.isNotEmpty()) {
+                            runCatching { repo?.setStrings(batch) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun persistSelectedRegions(
+        regions: Set<String>,
+        packageName: String?,
+        immediate: Boolean = false
+    ) {
         val csv = regions.joinToString(",")
         val pkgKey = packageRegionKey(packageName)
-        _ui.update { st ->
-            val nextSettings = st.settings.toMutableMap()
-            nextSettings["default_selected_regions"] = csv
-            if (pkgKey != null) {
-                nextSettings[pkgKey] = csv
-            }
-            st.copy(settings = nextSettings)
+        val pairs = LinkedHashMap<String, String>(2)
+        pairs["default_selected_regions"] = csv
+        if (pkgKey != null) {
+            pairs[pkgKey] = csv
         }
-        scope.launch {
-            repo?.setString("default_selected_regions", csv)
-            if (pkgKey != null) {
-                repo?.setString(pkgKey, csv)
-            }
-        }
+        _ui.update { st -> st.copy(settings = st.settings + pairs) }
+        enqueueSettingsWrite(pairs, immediate = immediate)
     }
 
     private fun parseToolOrderCsv(csv: String?): List<ToolId>? {
@@ -412,91 +511,227 @@ object Session {
         val key = "toolbar_order_${tab.name}"
         val csv = list.joinToString(",") { it.name }
         _ui.update { st -> st.copy(settings = st.settings + (key to csv)) }
-        scope.launch { repo?.setString(key, csv) }
+        enqueueSettingWrite(key, csv)
     }
 
     private fun persistPinnedToolsForTab(tab: NextTab, list: List<ToolId>) {
         val key = "pinned_tools_${tab.name}"
         val csv = list.joinToString(",") { it.name }
         _ui.update { st -> st.copy(settings = st.settings + (key to csv)) }
-        scope.launch { repo?.setString(key, csv) }
+        enqueueSettingWrite(key, csv)
+    }
+
+    private fun persistSearchHistoryAsync() {
+        val snapshot = historyStore.exportEntries()
+        persistSearchHistJob?.cancel()
+        persistSearchHistJob = scope.launch(Dispatchers.IO) {
+            delay(150L)
+            val json = HistoryPersistence.encodeSearchHistory(snapshot)
+            LocalBlobStore.writeTextAtomic(blobStoreDir, SettingKeys.KEY_HISTORY_SEARCH_JSON, json)
+        }
+    }
+
+    private fun persistGotoHistoryAsync(entries: List<String>) {
+        persistGotoHistJob?.cancel()
+        persistGotoHistJob = scope.launch(Dispatchers.IO) {
+            delay(150L)
+            val json = HistoryPersistence.encodeGotoHistory(entries)
+            LocalBlobStore.writeTextAtomic(blobStoreDir, SettingKeys.KEY_HISTORY_GOTO_JSON, json)
+        }
+    }
+
+    private fun persistScriptHistoryAsync(entries: List<ScriptHistoryEntry>) {
+        persistScriptHistJob?.cancel()
+        persistScriptHistJob = scope.launch(Dispatchers.IO) {
+            delay(150L)
+            val json = HistoryPersistence.encodeScriptHistory(entries)
+            LocalBlobStore.writeTextAtomic(blobStoreDir, SettingKeys.KEY_HISTORY_SCRIPT_JSON, json)
+        }
+    }
+
+    private fun persistSavedListAsync(items: List<MemoryItem>) {
+        persistSavedListJob?.cancel()
+        persistSavedListJob = scope.launch(Dispatchers.IO) {
+            delay(150L)
+            val json = HistoryPersistence.encodeSavedList(items)
+            LocalBlobStore.writeTextAtomic(blobStoreDir, SettingKeys.KEY_SAVED_LIST_JSON, json)
+        }
     }
 
     private fun syncFrozenSnapshot(savedList: List<MemoryItem>) {
         frozenItemsSnapshot = if (savedList.isEmpty()) emptyList() else savedList.filter { it.freeze }
     }
 
+    /** 统一处理目标进程退出/死亡回调 */
+    private fun handleTargetProcessDead() {
+        val hadAttach = _ui.value.attachedOk
+        if (!hadAttach) return
+        scope.launch {
+            withContext(Dispatchers.IO) { engine.clearNativeFreezes() }
+            _ui.update { st ->
+                if (!st.attachedOk) st
+                else st.copy(attachedOk = false, processPaused = false, busy = false)
+            }
+            _searchProgressState.value = SearchProgressUi()
+            toast("目标进程已退出或重启，请重新附加")
+        }
+    }
+
     fun init(app: Application) {
         appContext = app
-        val rootOk = com.littlecodesauce.ggnext.engine.Shell.hasRoot()
-        _ui.update { it.copy(hasRootPermission = rootOk, workMode = if (rootOk) WorkMode.ROOT else WorkMode.NO_ROOT) }
+        blobStoreDir = File(app.filesDir, "ggnext_store")
+        engine.setOnTargetProcessDead { handleTargetProcessDead() }
         if (repo != null) return
         val r = SettingsRepository(app)
         repo = r
-        scope.launch {
-            r.settingsSnapshot().collect { map ->
-                _ui.update { st ->
-                    val merged = st.settings + map
-                    val savedMode = merged["work_mode"]
-                    val resolvedMode = when (savedMode) {
-                        "no_root" -> WorkMode.NO_ROOT
-                        "root" -> WorkMode.ROOT
-                        else -> if (rootOk) WorkMode.ROOT else WorkMode.NO_ROOT
-                    }
-                    val restoredMaxShow = (merged["filter_max_show"]?.toIntOrNull() ?: st.filter.maxShow).coerceIn(1, 100000)
-                    val restoredSearchType = merged["search_type"]?.toIntOrNull() ?: st.search.type
-                    val restoredPointerType = merged["pointer_type"]?.toIntOrNull() ?: st.search.pointerType
-                    val restoredOffsetHex = merged["pointer_offset_hex"]?.let { it != "0" } ?: st.search.offsetHex
-                    val restoredFuzzyType = merged["fuzzy_type"]?.toIntOrNull() ?: st.fuzzy.type
-                    val restoredProcFilter = (merged["process_filter"]?.toIntOrNull() ?: st.processFilter).coerceIn(0, 2)
-                    val restoredProcSort = merged["process_sort_by_size"]?.let { it != "0" } ?: st.processSortBySize
-                    val restoredSpeed = (merged["speed_value"]?.toFloatOrNull() ?: st.speedMultiplier).coerceIn(0.01f, 100f)
-                    val restoredScriptPath = merged["script_path"]?.takeIf { it.isNotBlank() } ?: st.scriptPath
-                    val restoredFilePath = merged["file_manager_path"]?.takeIf { it.isNotBlank() } ?: st.fileManagerPath
-                    val restoredDumpDir = merged["dump_dir_path"]?.takeIf { it.isNotBlank() } ?: st.dumpDirPath
-                    val restoredRegions = resolveRegionsForPackage(merged, st.target?.packageName)
 
-                    val restoredTools = st.tools.toMutableMap()
-                    val restoredPinned = st.pinnedTools.toMutableMap()
-                    listOf(NextTab.SEARCH_LIST, NextTab.SAVED_LIST, NextTab.MEMORY).forEach { t ->
-                        parseToolOrderCsv(merged["toolbar_order_${t.name}"])?.let { restoredTools[t] = it }
-                        parseToolOrderCsv(merged["pinned_tools_${t.name}"])?.let { restoredPinned[t] = it }
-                    }
-
-                    st.copy(
-                        settings = merged,
-                        settingsLoaded = true,
-                        disclaimerAccepted = merged["disclaimer_v1_accepted"] == "1",
-                        metrics = buildMetrics(merged),
-                        preset = ThemePreset.entries.firstOrNull { p -> p.name == merged["theme_preset"] }
-                            ?: st.preset,
-                        darkMode = DarkMode.entries.firstOrNull { d -> d.name == merged["dark_mode"] }
-                            ?: st.darkMode,
-                        dynamicColor = merged["dynamic_color"] == "1",
-                        workMode = resolvedMode,
-                        selectedRegions = restoredRegions,
-                        filter = st.filter.copy(maxShow = restoredMaxShow),
-                        searchType = restoredSearchType,
-                        search = st.search.copy(
-                            type = restoredSearchType,
-                            pointerType = restoredPointerType,
-                            offsetHex = restoredOffsetHex
-                        ),
-                        fuzzy = st.fuzzy.copy(type = restoredFuzzyType),
-                        processFilter = restoredProcFilter,
-                        processSortBySize = restoredProcSort,
-                        speedMultiplier = restoredSpeed,
-                        scriptPath = restoredScriptPath,
-                        fileManagerPath = restoredFilePath,
-                        dumpDirPath = restoredDumpDir,
-                        tools = restoredTools,
-                        pinnedTools = restoredPinned
-                    )
+        // 模块 1：绝不在主线程执行 Shell.hasRoot()，异步移至 Dispatchers.IO
+        scope.launch(Dispatchers.IO) {
+            val rootOk = Shell.hasRoot()
+            _ui.update { st ->
+                val savedMode = st.settings["work_mode"]
+                val resolvedMode = when (savedMode) {
+                    "no_root" -> WorkMode.NO_ROOT
+                    "root" -> WorkMode.ROOT
+                    else -> if (rootOk) WorkMode.ROOT else WorkMode.NO_ROOT
                 }
+                st.copy(hasRootPermission = rootOk, workMode = resolvedMode)
             }
         }
-        scope.launch { r.valueFormatMask().collect { m -> _ui.update { it.copy(valueMask = m) } } }
-        scope.launch { r.savedFormatMask().collect { m -> _ui.update { it.copy(valueMaskSaved = m) } } }
+
+        // 启动时单次磁盘水合（避免 DataStore 写入回声反复覆盖内存中的实时修改/区域勾选），
+        // 同时将旧版保存在 DataStore 中的大体积 JSON 自动迁移至独立文件存储，防止 Protobuf 序列化 OOM。
+        scope.launch(Dispatchers.IO) {
+            val map = runCatching { r.settingsSnapshot().first() }.getOrDefault(emptyMap())
+            val vMask = runCatching { r.valueFormatMask().first() }.getOrDefault(SettingsSpecs.DEFAULT_FORMAT_MASK)
+            val sMask = runCatching { r.savedFormatMask().first() }.getOrDefault(SettingsSpecs.DEFAULT_FORMAT_MASK)
+
+            val limit = (map["history_limit"]?.toIntOrNull() ?: 500).coerceIn(0, 100000)
+            historyStore.setLimit(limit)
+            map["language"]?.let { lang -> AppStrings.setLang(lang) }
+
+            val blobKeys = listOf(
+                SettingKeys.KEY_HISTORY_SEARCH_JSON,
+                SettingKeys.KEY_HISTORY_GOTO_JSON,
+                SettingKeys.KEY_HISTORY_SCRIPT_JSON,
+                SettingKeys.KEY_SAVED_LIST_JSON
+            )
+            val legacyKeysToPurge = ArrayList<String>(4)
+            fun loadBlobWithMigration(key: String): String? {
+                val fromFile = LocalBlobStore.readText(blobStoreDir, key)
+                val fromLegacy = map[key]
+                if (fromLegacy != null) {
+                    legacyKeysToPurge.add(key)
+                    if (fromFile == null && fromLegacy.isNotBlank()) {
+                        LocalBlobStore.writeTextAtomic(blobStoreDir, key, fromLegacy)
+                    }
+                }
+                return fromFile ?: fromLegacy
+            }
+
+            val searchJson = loadBlobWithMigration(SettingKeys.KEY_HISTORY_SEARCH_JSON)
+            val gotoJson = loadBlobWithMigration(SettingKeys.KEY_HISTORY_GOTO_JSON)
+            val scriptJson = loadBlobWithMigration(SettingKeys.KEY_HISTORY_SCRIPT_JSON)
+            val savedJson = loadBlobWithMigration(SettingKeys.KEY_SAVED_LIST_JSON)
+
+            if (legacyKeysToPurge.isNotEmpty()) {
+                runCatching { r.removeKeys(legacyKeysToPurge) }
+            }
+
+            val decodedSearch = HistoryPersistence.decodeSearchHistory(searchJson)
+            val restoredSearchHist: List<String>? = if (decodedSearch.isNotEmpty()) {
+                historyStore.restore(decodedSearch)
+                historyStore.list()
+            } else null
+
+            val decodedGoto = HistoryPersistence.decodeGotoHistory(gotoJson)
+            val restoredGotoHist: List<String>? = if (decodedGoto.isNotEmpty()) {
+                if (limit > 0) decodedGoto.take(limit.coerceAtMost(200)) else emptyList()
+            } else null
+
+            val restoredScriptHist: List<ScriptHistoryEntry>? = if (scriptJson != null) {
+                HistoryPersistence.decodeScriptHistory(scriptJson)
+            } else null
+
+            val decodedSaved = HistoryPersistence.decodeSavedList(savedJson)
+            val restoredSavedItems: List<MemoryItem>? = if (decodedSaved.isNotEmpty()) {
+                syncFrozenSnapshot(decodedSaved)
+                decodedSaved
+            } else null
+
+            val cleanMap = LinkedHashMap<String, String>(map.size)
+            for ((k, v) in map) {
+                if (k !in blobKeys) {
+                    cleanMap[k] = v
+                }
+            }
+
+            _ui.update { st ->
+                // 内存中已发生的实时修改（st.settings）优先于磁盘旧快照，防止启动瞬间点击被回滚
+                val merged = cleanMap + st.settings
+                val savedMode = merged["work_mode"]
+                val resolvedMode = when (savedMode) {
+                    "no_root" -> WorkMode.NO_ROOT
+                    "root" -> WorkMode.ROOT
+                    else -> if (st.hasRootPermission) WorkMode.ROOT else WorkMode.NO_ROOT
+                }
+                val restoredMaxShow = (merged["filter_max_show"]?.toIntOrNull() ?: st.filter.maxShow).coerceIn(1, 100000)
+                val restoredSearchType = merged["search_type"]?.toIntOrNull() ?: st.search.type
+                val restoredPointerType = merged["pointer_type"]?.toIntOrNull() ?: st.search.pointerType
+                val restoredOffsetHex = merged["pointer_offset_hex"]?.let { it != "0" } ?: st.search.offsetHex
+                val restoredFuzzyType = merged["fuzzy_type"]?.toIntOrNull() ?: st.fuzzy.type
+                val restoredProcFilter = (merged["process_filter"]?.toIntOrNull() ?: st.processFilter).coerceIn(0, 2)
+                val restoredProcSort = merged["process_sort_by_size"]?.let { it != "0" } ?: st.processSortBySize
+                val restoredSpeed = (merged["speed_value"]?.toFloatOrNull() ?: st.speedMultiplier).coerceIn(0.01f, 100f)
+                val restoredScriptPath = merged["script_path"]?.takeIf { it.isNotBlank() } ?: st.scriptPath
+                val restoredFilePath = merged["file_manager_path"]?.takeIf { it.isNotBlank() } ?: st.fileManagerPath
+                val restoredDumpDir = merged["dump_dir_path"]?.takeIf { it.isNotBlank() } ?: st.dumpDirPath
+                val restoredRegions = resolveRegionsForPackage(merged, st.target?.packageName)
+
+                val restoredTools = st.tools.toMutableMap()
+                val restoredPinned = st.pinnedTools.toMutableMap()
+                listOf(NextTab.SEARCH_LIST, NextTab.SAVED_LIST, NextTab.MEMORY).forEach { t ->
+                    parseToolOrderCsv(merged["toolbar_order_${t.name}"])?.let { restoredTools[t] = it }
+                    parseToolOrderCsv(merged["pinned_tools_${t.name}"])?.let { restoredPinned[t] = it }
+                }
+
+                st.copy(
+                    settings = merged,
+                    settingsLoaded = true,
+                    disclaimerAccepted = merged["disclaimer_v1_accepted"] == "1",
+                    metrics = buildMetrics(merged),
+                    preset = ThemePreset.entries.firstOrNull { p -> p.name == merged["theme_preset"] } ?: st.preset,
+                    darkMode = DarkMode.entries.firstOrNull { d -> d.name == merged["dark_mode"] } ?: st.darkMode,
+                    dynamicColor = merged["dynamic_color"] == "1",
+                    workMode = resolvedMode,
+                    selectedRegions = restoredRegions,
+                    filter = st.filter.copy(maxShow = restoredMaxShow),
+                    valueMask = vMask,
+                    valueMaskSaved = sMask,
+                    searchType = restoredSearchType,
+                    search = st.search.copy(
+                        type = restoredSearchType,
+                        pointerType = restoredPointerType,
+                        offsetHex = restoredOffsetHex
+                    ),
+                    fuzzy = st.fuzzy.copy(type = restoredFuzzyType),
+                    processFilter = restoredProcFilter,
+                    processSortBySize = restoredProcSort,
+                    speedMultiplier = restoredSpeed,
+                    scriptPath = restoredScriptPath,
+                    fileManagerPath = restoredFilePath,
+                    dumpDirPath = restoredDumpDir,
+                    tools = restoredTools,
+                    pinnedTools = restoredPinned,
+                    history = restoredSearchHist ?: st.history,
+                    gotoHistory = restoredGotoHist ?: st.gotoHistory,
+                    scriptHistory = restoredScriptHist ?: st.scriptHistory,
+                    saved = restoredSavedItems ?: st.saved
+                )
+            }
+        }
+
+        // JVM 回退锁值与冻结间隔同步循环
         scope.launch(Dispatchers.IO) {
             var lastSyncedInterval = -1L
             while (true) {
@@ -508,66 +743,147 @@ object Session {
                 }
                 delay(intervalMs)
                 val frozen = frozenItemsSnapshot
-                if (frozen.isNotEmpty() && !_ui.value.processPaused) {
+                if (frozen.isNotEmpty() && !_ui.value.processPaused && _ui.value.attachedOk) {
                     engine.tickFreeze(frozen)
                 }
             }
         }
-        // 3.1 周期性实时刷新搜索列表、保存列表与内存浏览页中的动态数值
+
+        // 实时刷新 + 周期性目标进程存活检测
         scope.launch(Dispatchers.IO) {
+            var livenessTick = 0
             while (true) {
                 delay(900L)
                 val st = _ui.value
-                if (st.attachedOk && !st.busy && st.sheet == Sheet.NONE) {
-                    if (st.results.isNotEmpty() || st.saved.isNotEmpty() || (st.tab == NextTab.MEMORY && st.memoryRows.isNotEmpty())) {
-                        refreshLiveValues(manual = false)
+                if (st.attachedOk && !st.busy) {
+                    livenessTick++
+                    if (livenessTick >= 4) {
+                        livenessTick = 0
+                        if (!engine.isTargetProcessAlive()) {
+                            handleTargetProcessDead()
+                            continue
+                        }
                     }
+                    if (st.sheet == Sheet.NONE) {
+                        if (st.results.isNotEmpty() || st.saved.isNotEmpty() || (st.tab == NextTab.MEMORY && st.memoryRows.isNotEmpty())) {
+                            refreshLiveValues(manual = false)
+                        }
+                    }
+                } else {
+                    livenessTick = 0
                 }
             }
         }
         loadProcesses(app)
     }
 
-    // ============ 基础 ============
+    // ============ 异步数据读取封装（UI 绝不直接访问 Session.engine） ============
 
+    suspend fun readMemoryPreview(address: Long, size: Int): ByteArray =
+        withContext(Dispatchers.IO) {
+            engine.readBlock(address, size.coerceIn(1, 4096))
+        }
+
+    suspend fun loadProcessRegions(): List<MemoryRegion> =
+        withContext(Dispatchers.IO) {
+            engine.regions()
+        }
+
+    fun firstRegionBase(code: String): Long? = engine.firstRegionBase(code)
+
+    // ============ 工作模式与 Root 检测（全部异步 IO） ============
 
     fun setWorkMode(mode: WorkMode) {
-        val hasRoot = if (mode == WorkMode.ROOT) {
-            com.littlecodesauce.ggnext.engine.Shell.resetRootCache()
-            com.littlecodesauce.ggnext.engine.Shell.hasRoot()
-        } else {
-            _ui.value.hasRootPermission
+        _ui.update { it.copy(workMode = mode, settings = it.settings + ("work_mode" to mode.code)) }
+        enqueueSettingWrite("work_mode", mode.code, immediate = true)
+        scope.launch(Dispatchers.IO) {
+            val hasRoot = if (mode == WorkMode.ROOT) {
+                Shell.resetRootCache()
+                Shell.hasRoot()
+            } else {
+                _ui.value.hasRootPermission
+            }
+            withContext(Dispatchers.Main) {
+                _ui.update { it.copy(workMode = mode, hasRootPermission = hasRoot) }
+                appContext?.let { loadProcesses(it) }
+                val target = _ui.value.target
+                if (target != null) {
+                    attach(target, silent = true, forceReattach = true)
+                }
+                toast(
+                    when (mode) {
+                        WorkMode.ROOT -> if (hasRoot) "已切换至 Root 模式" else "已切换至 Root 模式，未检测到 Root 授权"
+                        WorkMode.NO_ROOT -> "已切换至免 Root 模式"
+                    }
+                )
+            }
         }
-        _ui.update { it.copy(workMode = mode, hasRootPermission = hasRoot) }
-        scope.launch { repo?.setString("work_mode", mode.code) }
-        appContext?.let { loadProcesses(it) }
-        val target = _ui.value.target
-        if (target != null) {
-            attach(target, silent = true, forceReattach = true)
-        }
-        toast(when (mode) {
-            WorkMode.ROOT -> if (hasRoot) "已切换至 Root 模式" else "已切换至 Root 模式，未检测到 Root 授权"
-            WorkMode.NO_ROOT -> "已切换至免 Root 模式"
-        })
     }
 
     fun refreshRootStatus(promptIfMissing: Boolean = false) {
-        com.littlecodesauce.ggnext.engine.Shell.resetRootCache()
-        val hasRoot = com.littlecodesauce.ggnext.engine.Shell.hasRoot()
-        _ui.update { it.copy(hasRootPermission = hasRoot) }
-        appContext?.let { loadProcesses(it) }
-        val target = _ui.value.target
-        if (target != null) {
-            attach(target, silent = true, forceReattach = true)
+        scope.launch(Dispatchers.IO) {
+            Shell.resetRootCache()
+            val hasRoot = Shell.hasRoot()
+            withContext(Dispatchers.Main) {
+                _ui.update { it.copy(hasRootPermission = hasRoot) }
+                appContext?.let { loadProcesses(it) }
+                val target = _ui.value.target
+                if (target != null) {
+                    attach(target, silent = true, forceReattach = true)
+                }
+                if (hasRoot) {
+                    toast("Root 权限已获取")
+                } else if (promptIfMissing) {
+                    toast("未检测到 Root 权限，请在管理器中授权或切换到免 Root 模式")
+                }
+            }
         }
-        if (hasRoot) {
-            toast("Root 权限已获取")
-        } else if (promptIfMissing) {
-            toast("未检测到 Root 权限，请在管理器中授权或切换到免 Root 模式")
+    }
+
+    // ============ 分层弹窗导航栈 ============
+
+    private val childStackSheets = setOf(
+        Sheet.HISTORY,
+        Sheet.FILE_BROWSER,
+        Sheet.MODULE_LIST,
+        Sheet.TYPE_PICK,
+        Sheet.TOOLBAR_PICK,
+        Sheet.ADDRESS_EDIT
+    )
+
+    fun pushSheet(sheet: Sheet, item: MemoryItem? = null, singleEdit: Boolean = false) {
+        if (sheet == Sheet.NONE) {
+            closeAllSheets()
+            return
+        }
+        if (sheet == Sheet.PROCESS) {
+            appContext?.let { loadProcesses(it) }
+        } else if (sheet == Sheet.REGION) {
+            scope.launch {
+                val fresh = withContext(Dispatchers.IO) { aggregate(engine.regions()) }
+                _ui.update { it.copy(regions = fresh) }
+            }
+        }
+        _ui.update { st ->
+            val nextStack = if (st.sheetStack.lastOrNull() == sheet) st.sheetStack else st.sheetStack + sheet
+            st.copy(
+                sheetStack = nextStack,
+                editing = item ?: st.editing,
+                editSingleOnly = singleEdit && item != null,
+                contextItem = item ?: st.contextItem
+            )
         }
     }
 
     fun openSheet(sheet: Sheet, item: MemoryItem? = null, singleEdit: Boolean = false) {
+        if (sheet == Sheet.NONE) {
+            closeAllSheets()
+            return
+        }
+        if (sheet in childStackSheets && _ui.value.sheetStack.isNotEmpty()) {
+            pushSheet(sheet, item, singleEdit)
+            return
+        }
         if (sheet == Sheet.PROCESS) {
             appContext?.let { loadProcesses(it) }
         } else if (sheet == Sheet.REGION) {
@@ -578,7 +894,7 @@ object Session {
         }
         _ui.update {
             it.copy(
-                sheet = sheet,
+                sheetStack = listOf(sheet),
                 editing = item ?: it.editing,
                 editSingleOnly = singleEdit && item != null,
                 contextItem = item ?: it.contextItem
@@ -586,48 +902,77 @@ object Session {
         }
     }
 
-    private var historyCallerSheet: Sheet = Sheet.SEARCH
+    fun openFileSheet(mode: FileSheetMode) {
+        _ui.update { st ->
+            st.copy(
+                fileSheetMode = mode,
+                sheetStack = listOf(Sheet.FILE_MANAGER)
+            )
+        }
+    }
+
+    fun popSheet(): Boolean {
+        val stack = _ui.value.sheetStack
+        if (stack.isEmpty()) return false
+        _ui.update { st ->
+            val popped = st.sheetStack.dropLast(1)
+            st.copy(
+                sheetStack = popped,
+                editSingleOnly = if (popped.lastOrNull() == Sheet.EDITOR) st.editSingleOnly else false
+            )
+        }
+        return true
+    }
+
+    fun closeAllSheets() {
+        _ui.update { it.copy(sheetStack = emptyList(), editSingleOnly = false) }
+    }
+
+    fun closeSheet() {
+        popSheet()
+    }
 
     fun openHistorySheet(fromSheet: Sheet = _ui.value.sheet) {
-        historyCallerSheet = if (fromSheet != Sheet.HISTORY && fromSheet != Sheet.NONE) fromSheet else Sheet.SEARCH
-        openSheet(Sheet.HISTORY)
+        if (fromSheet != Sheet.NONE && fromSheet != Sheet.HISTORY && _ui.value.sheetStack.isEmpty()) {
+            _ui.update { it.copy(sheetStack = listOf(fromSheet, Sheet.HISTORY)) }
+        } else {
+            pushSheet(Sheet.HISTORY)
+        }
     }
 
     fun recordGotoHistory(hex: String) {
-        val clean = hex.trim().removePrefix("0x").removeSuffix("h").uppercase()
-        if (clean.isNotEmpty()) {
-            _ui.update {
-                val list = (listOf(clean) + it.gotoHistory.filter { h -> h != clean }).take(20)
-                it.copy(gotoHistory = list)
-            }
+        val clean = hex.trim().removePrefix("0x").removePrefix("0X").removeSuffix("h").removeSuffix("H").uppercase()
+        if (clean.isEmpty()) return
+        val limit = currentHistoryLimit()
+        if (limit <= 0) return
+        val cap = limit.coerceAtMost(200)
+        var updatedList: List<String> = emptyList()
+        _ui.update { st ->
+            val list = (listOf(clean) + st.gotoHistory.filter { h -> h != clean }).take(cap)
+            updatedList = list
+            st.copy(gotoHistory = list)
         }
+        persistGotoHistoryAsync(updatedList)
     }
 
-    fun closeSheet() = _ui.update {
-        if (it.sheet == Sheet.HISTORY && historyCallerSheet != Sheet.NONE && historyCallerSheet != Sheet.HISTORY) {
-            val returnTo = historyCallerSheet
-            historyCallerSheet = Sheet.SEARCH
-            it.copy(sheet = returnTo, editSingleOnly = false)
-        } else {
-            it.copy(sheet = Sheet.NONE, editSingleOnly = false)
-        }
+    fun toast(msg: String) {
+        _toastState.value = AppStrings.tr(msg)
     }
 
-    fun toast(msg: String) = _ui.update { it.copy(toast = msg) }
-
-    fun consumeToast() = _ui.update { it.copy(toast = null) }
+    fun consumeToast() {
+        _toastState.value = null
+    }
 
     fun selectTab(tab: NextTab) {
         _ui.update {
             if (it.tab == tab) it else it.copy(tab = tab)
         }
-        recount()
         if (tab == NextTab.MEMORY && _ui.value.memoryRows.isEmpty()) {
             goto(_ui.value.memoryBase, recordHistory = false, highlightTarget = false)
         }
     }
 
-    // ============ 改进5：文件浏览器联动 ============
+    // ============ 文件浏览器与脚本路径管理（持久化 + 诚实提示） ============
 
     fun openFileBrowser(
         initialPath: String,
@@ -640,9 +985,14 @@ object Session {
             else if (selectDirectory) p
             else p.substringBeforeLast('/', "/sdcard/Download").ifEmpty { "/sdcard" }
         }
-        _ui.update {
-            it.copy(
-                sheet = Sheet.FILE_BROWSER,
+        _ui.update { st ->
+            val baseStack = if (st.sheetStack.lastOrNull() == returnSheet) {
+                st.sheetStack
+            } else {
+                listOf(returnSheet)
+            }
+            st.copy(
+                sheetStack = baseStack + Sheet.FILE_BROWSER,
                 fileBrowser = FileBrowserConfig(
                     currentDir = dir,
                     selectDirectory = selectDirectory,
@@ -656,24 +1006,23 @@ object Session {
     fun onFileBrowserPicked(selectedPath: String) {
         val target = _ui.value.fileBrowser.target
         when (target) {
-            FileBrowserTarget.SCRIPT -> setSetting("script_path", selectedPath)
+            FileBrowserTarget.SCRIPT -> {
+                setSetting("script_path", selectedPath)
+                addOrTouchScriptHistory(selectedPath)
+            }
             FileBrowserTarget.FILE_MANAGER -> setSetting("file_manager_path", selectedPath)
             FileBrowserTarget.DUMP -> setSetting("dump_dir_path", selectedPath)
         }
         _ui.update { st ->
+            val nextStack = if (st.sheetStack.size > 1 && st.sheetStack.lastOrNull() == Sheet.FILE_BROWSER) {
+                st.sheetStack.dropLast(1)
+            } else {
+                listOf(st.fileBrowser.returnSheet)
+            }
             when (st.fileBrowser.target) {
-                FileBrowserTarget.SCRIPT -> st.copy(
-                    scriptPath = selectedPath,
-                    sheet = st.fileBrowser.returnSheet
-                )
-                FileBrowserTarget.FILE_MANAGER -> st.copy(
-                    fileManagerPath = selectedPath,
-                    sheet = st.fileBrowser.returnSheet
-                )
-                FileBrowserTarget.DUMP -> st.copy(
-                    dumpDirPath = selectedPath,
-                    sheet = st.fileBrowser.returnSheet
-                )
+                FileBrowserTarget.SCRIPT -> st.copy(scriptPath = selectedPath, sheetStack = nextStack)
+                FileBrowserTarget.FILE_MANAGER -> st.copy(fileManagerPath = selectedPath, sheetStack = nextStack)
+                FileBrowserTarget.DUMP -> st.copy(dumpDirPath = selectedPath, sheetStack = nextStack)
             }
         }
     }
@@ -693,37 +1042,83 @@ object Session {
         _ui.update { it.copy(dumpDirPath = path) }
     }
 
-    fun removeScriptHistory(path: String) = _ui.update {
-        it.copy(scriptHistory = it.scriptHistory.filterNot { p -> p == path })
-    }
-
-    fun pinScriptHistory(path: String) = _ui.update {
-        val next = (listOf(path) + it.scriptHistory.filterNot { p -> p == path })
-        it.copy(scriptHistory = next)
-    }
-
-    fun updateScriptHistory(oldPath: String, newPath: String) = _ui.update {
-        val next = it.scriptHistory.map { p -> if (p == oldPath) newPath else p }
-        it.copy(scriptHistory = next, scriptPath = if (it.scriptPath == oldPath) newPath else it.scriptPath)
-    }
-
-    fun runScript(path: String) {
+    private fun addOrTouchScriptHistory(path: String) {
         val clean = path.trim()
-        if (clean.isEmpty()) {
-            toast("请输入或选择有效的 Lua 脚本路径")
-            return
-        }
-        setSetting("script_path", clean)
-        AppLog.add("script", "execute lua script: $clean")
+        if (clean.isEmpty()) return
+        val limit = currentHistoryLimit()
+        var nextList: List<ScriptHistoryEntry> = emptyList()
         _ui.update { st ->
-            val nextHist = (listOf(clean) + st.scriptHistory.filterNot { it == clean }).take(12)
+            val existing = st.scriptHistory.firstOrNull { it.path == clean }
+            val entry = existing ?: ScriptHistoryEntry(path = clean)
+            val combined = if (limit <= 0 && existing == null) {
+                st.scriptHistory
+            } else {
+                HistoryPersistence.trimScriptHistory(
+                    listOf(entry) + st.scriptHistory.filterNot { it.path == clean },
+                    limit.coerceAtMost(200)
+                )
+            }
+            nextList = combined
+            st.copy(scriptHistory = combined)
+        }
+        persistScriptHistoryAsync(nextList)
+    }
+
+    fun removeScriptHistory(path: String) {
+        var nextList: List<ScriptHistoryEntry> = emptyList()
+        _ui.update { st ->
+            val next = st.scriptHistory.filterNot { it.path == path }
+            nextList = next
+            st.copy(scriptHistory = next)
+        }
+        persistScriptHistoryAsync(nextList)
+    }
+
+    fun toggleScriptPin(path: String) {
+        var nextList: List<ScriptHistoryEntry> = emptyList()
+        _ui.update { st ->
+            val updated = st.scriptHistory.map { entry ->
+                if (entry.path == path) entry.copy(pinned = !entry.pinned) else entry
+            }.sortedByDescending { it.pinned }
+            nextList = updated
+            st.copy(scriptHistory = updated)
+        }
+        persistScriptHistoryAsync(nextList)
+    }
+
+    fun pinScriptHistory(path: String) = toggleScriptPin(path)
+
+    fun updateScriptEntry(oldPath: String, newPath: String, note: String? = null) {
+        val cleanNew = newPath.trim()
+        if (cleanNew.isEmpty()) return
+        var nextList: List<ScriptHistoryEntry> = emptyList()
+        _ui.update { st ->
+            val next = st.scriptHistory.map { entry ->
+                if (entry.path == oldPath) {
+                    entry.copy(path = cleanNew, note = note ?: entry.note)
+                } else entry
+            }
+            nextList = next
             st.copy(
-                scriptPath = clean,
-                scriptHistory = nextHist,
-                sheet = Sheet.NONE,
-                toast = "正在执行脚本：${clean.substringAfterLast('/')}"
+                scriptHistory = next,
+                scriptPath = if (st.scriptPath == oldPath) cleanNew else st.scriptPath
             )
         }
+        persistScriptHistoryAsync(nextList)
+    }
+
+    fun updateScriptHistory(oldPath: String, newPath: String) =
+        updateScriptEntry(oldPath, newPath, null)
+
+    /** 模块 2：诚实处理未内置 Lua 执行引擎的事实，绝不伪造执行成功 */
+    fun runScript(path: String) {
+        val clean = path.trim()
+        if (clean.isNotEmpty()) {
+            setSetting("script_path", clean)
+            addOrTouchScriptHistory(clean)
+            _ui.update { it.copy(scriptPath = clean) }
+        }
+        toast("当前版本暂未内置 Lua 执行引擎，仅支持脚本路径管理与编辑")
     }
 
     fun setting(id: String): String =
@@ -731,7 +1126,14 @@ object Session {
             ?: _ui.value.settings[id].orEmpty()
 
     fun setSetting(id: String, value: String) {
-        repo?.let { r -> scope.launch { r.setString(id, value) } }
+        if (id == "language") {
+            AppStrings.setLang(value)
+        } else if (id == "history_limit") {
+            val newLimit = (value.toIntOrNull() ?: 500).coerceIn(0, 100000)
+            historyStore.setLimit(newLimit)
+            persistSearchHistoryAsync()
+        }
+        enqueueSettingWrite(id, value)
         _ui.update { st ->
             val nextSettings = st.settings + (id to value)
             val nextPreset = if (id == "theme_preset") {
@@ -746,7 +1148,8 @@ object Session {
                 preset = nextPreset,
                 darkMode = nextDark,
                 dynamicColor = nextDyn,
-                metrics = buildMetrics(nextSettings)
+                metrics = buildMetrics(nextSettings),
+                history = if (id == "history_limit") historyStore.list() else st.history
             )
         }
     }
@@ -794,9 +1197,9 @@ object Session {
         _ui.update { it.copy(processPaused = panelOpening) }
         scope.launch(Dispatchers.IO) {
             engine.setFreezePaused(panelOpening)
-            com.littlecodesauce.ggnext.engine.Shell.runAs(
+            Shell.runAs(
                 "kill $sig $pid",
-                asRoot = (st.workMode == WorkMode.ROOT && com.littlecodesauce.ggnext.engine.Shell.hasRoot())
+                asRoot = (st.workMode == WorkMode.ROOT && Shell.hasRoot())
             )
         }
     }
@@ -822,7 +1225,7 @@ object Session {
                 panelVisible = next,
                 floatingBallVisible = true,
                 speedBarExpanded = false,
-                sheet = if (!next) Sheet.NONE else it.sheet
+                sheetStack = if (!next) emptyList() else it.sheetStack
             )
         }
         applyAutoPauseIfEnabled(next)
@@ -832,7 +1235,7 @@ object Session {
         val wasVisible = _ui.value.panelVisible
         _ui.update {
             it.copy(
-                sheet = Sheet.NONE,
+                sheetStack = emptyList(),
                 panelVisible = false,
                 floatingBallVisible = true
             )
@@ -842,14 +1245,13 @@ object Session {
         }
     }
 
-    // ============ 悬浮球长按变速控制 ============
+    // ============ 悬浮球变速控制（模块 2：诚实提示暂未实现底层变速 Hook） ============
 
-    fun toggleSpeedBar() = _ui.update { st ->
-        val next = !st.speedBarExpanded
-        st.copy(
-            speedBarExpanded = next,
-            toast = if (next) "变速控制已展开：${st.speedText}" else null
-        )
+    fun toggleSpeedBar() {
+        _ui.update { st -> st.copy(speedBarExpanded = !st.speedBarExpanded) }
+        if (_ui.value.speedBarExpanded) {
+            toast("当前版本暂未实现底层变速 Hook，倍率仅作占位提示")
+        }
     }
 
     fun setSpeedBarExpanded(expanded: Boolean) = _ui.update {
@@ -864,26 +1266,21 @@ object Session {
         val nextIdx = (if (faster) idx + 1 else idx - 1).coerceIn(0, SPEED_STEPS.lastIndex)
         val nextSpeed = SPEED_STEPS[nextIdx]
         setSetting("speed_value", nextSpeed.toString())
-        _ui.update { st ->
-            val nextSt = st.copy(speedMultiplier = nextSpeed, speedBarExpanded = true)
-            nextSt.copy(toast = "游戏变速: ${nextSt.speedText}")
-        }
+        _ui.update { st -> st.copy(speedMultiplier = nextSpeed, speedBarExpanded = true) }
+        toast("当前版本暂未实现底层变速 Hook，倍率仅作占位提示")
     }
 
     fun setSpeedMultiplier(v: Float) {
         val clamped = v.coerceIn(0.01f, 100f)
         setSetting("speed_value", clamped.toString())
-        _ui.update { st ->
-            val nextSt = st.copy(speedMultiplier = clamped)
-            nextSt.copy(toast = "游戏变速已设为 ${nextSt.speedText}")
-        }
+        _ui.update { it.copy(speedMultiplier = clamped) }
+        toast("当前版本暂未实现底层变速 Hook，倍率仅作占位提示")
     }
 
     fun resetSpeed() {
         setSetting("speed_value", "1.0")
-        _ui.update { st ->
-            st.copy(speedMultiplier = 1.0f, toast = "已恢复正常速度 1.0x")
-        }
+        _ui.update { it.copy(speedMultiplier = 1.0f) }
+        toast("当前版本暂未实现底层变速 Hook，倍率仅作占位提示")
     }
 
     // ============ 进程 ============
@@ -903,43 +1300,38 @@ object Session {
     fun setProcessFilter(index: Int) {
         val clamped = index.coerceIn(0, 2)
         setSetting("process_filter", clamped.toString())
-        _ui.update { st ->
-            st.copy(processFilter = clamped)
-        }
+        _ui.update { st -> st.copy(processFilter = clamped) }
     }
 
     fun toggleProcessSortBySize() {
         val next = !_ui.value.processSortBySize
         setSetting("process_sort_by_size", if (next) "1" else "0")
-        _ui.update { st ->
-            st.copy(processSortBySize = next)
-        }
+        _ui.update { st -> st.copy(processSortBySize = next) }
     }
 
-    fun toggleProcessPause() = _ui.update { st ->
+    fun toggleProcessPause() {
+        val st = _ui.value
         val next = !st.processPaused
         val pid = st.target?.pid ?: 0
         if (pid > 0) {
             val sig = if (next) "-STOP" else "-CONT"
             scope.launch(Dispatchers.IO) {
                 engine.setFreezePaused(next)
-                com.littlecodesauce.ggnext.engine.Shell.runAs(
+                Shell.runAs(
                     "kill $sig $pid",
-                    asRoot = (st.workMode == WorkMode.ROOT && com.littlecodesauce.ggnext.engine.Shell.hasRoot())
+                    asRoot = (st.workMode == WorkMode.ROOT && Shell.hasRoot())
                 )
             }
         }
-        st.copy(
-            processPaused = next,
-            toast = if (next) "已暂停目标进程 ${st.target?.label.orEmpty()}" else "已恢复目标进程 ${st.target?.label.orEmpty()}"
-        )
+        _ui.update { it.copy(processPaused = next) }
+        toast(if (next) "已暂停目标进程 ${st.target?.label.orEmpty()}" else "已恢复目标进程 ${st.target?.label.orEmpty()}")
     }
 
     fun attach(proc: TargetProcess, silent: Boolean = false, forceReattach: Boolean = false) {
         val currentTarget = _ui.value.target
         if (!forceReattach && currentTarget?.pid == proc.pid && _ui.value.attachedOk) {
             if (!silent) toast("当前已附加到 ${proc.label}")
-            _ui.update { it.copy(sheet = Sheet.NONE) }
+            closeAllSheets()
             return
         }
         hasFuzzySession = false
@@ -956,7 +1348,6 @@ object Session {
                         context = appContext
                     )
                 }
-                // 若目标应用重启导致缓存的 PID 失效，实时重新扫描进程表并按包名匹配最新存活 PID 重试附加
                 if (!ok && resolvedProc.packageName.isNotBlank()) {
                     val app = appContext
                     if (app != null) {
@@ -985,6 +1376,27 @@ object Session {
                 val defaultBase = rawRegions.firstOrNull { it.code == "Xa" || it.code == "Cd" || it.code == "Jh" || it.code == "Ca" }?.start
                     ?: rawRegions.firstOrNull { it.readable }?.start
                     ?: 0L
+
+                // 若持久化恢复的保存列表中存在已冻结项，重新附加后自动下发到底层 ValueLocker
+                if (ok) {
+                    val savedFrozen = _ui.value.saved.filter { it.freeze }
+                    if (savedFrozen.isNotEmpty()) {
+                        withContext(Dispatchers.IO) {
+                            savedFrozen.forEach { item ->
+                                engine.setFreeze(
+                                    address = item.address,
+                                    flags = item.flags,
+                                    value = item.value,
+                                    enabled = true,
+                                    freezeType = item.freezeType,
+                                    freezeFrom = item.freezeFrom,
+                                    freezeTo = item.freezeTo
+                                )
+                            }
+                        }
+                    }
+                }
+
                 _ui.update {
                     val pkgRegions = resolveRegionsForPackage(it.settings, resolvedProc.packageName)
                     it.copy(
@@ -994,12 +1406,13 @@ object Session {
                         regions = regions,
                         selectedRegions = pkgRegions,
                         memoryBase = if (defaultBase != 0L) defaultBase else it.memoryBase,
-                        sheet = if (silent) it.sheet else Sheet.NONE,
+                        sheetStack = if (silent) it.sheetStack else emptyList(),
                         hintVisible = true,
                         rawResults = emptyList(),
                         results = emptyList(),
                         totalCount = 0,
-                        selectedCount = 0,
+                        searchSelection = SelectionState.EMPTY,
+                        memorySelection = SelectionState.EMPTY,
                         memoryRows = emptyList(),
                         fuzzy = it.fuzzy.copy(active = false)
                     )
@@ -1017,12 +1430,6 @@ object Session {
         }
     }
 
-    /**
-     * 3.1 实时刷新搜索列表、保存列表与内存浏览页中的动态数值
-     * Bug 5 & Bug 6 深度优化：
-     * 1. 当列表项目达到数万条时，仅对当前可视窗口附近（最多 80 条）执行跨进程实时读取，彻底消除 50000+ 条目后台轮询导致的卡死与 GC 风暴；
-     * 2. 在 `_ui.update { s -> ... }` 内部基于最新状态 `s` 原地合并实时数值，绝不用旧快照覆盖用户在 I/O 期间刚勾选的 `checked` 状态，彻底根治勾选闪烁/自动取消勾选 Bug！
-     */
     fun refreshLiveValues(manual: Boolean = false) {
         val st = _ui.value
         if (!st.attachedOk || st.target == null) {
@@ -1036,19 +1443,14 @@ object Session {
         scope.launch(Dispatchers.IO) {
             try {
                 val cur = _ui.value
-                // 1. 仅读取当前可见区域的搜索结果（最多 80 条）
                 val liveResultMap: Map<Long, Long> = if (cur.results.isNotEmpty() && (manual || cur.tab == NextTab.SEARCH_LIST)) {
                     val scrollIdx = getListScrollPosition("search_list").first.coerceIn(0, (cur.results.size - 1).coerceAtLeast(0))
                     val startIdx = (scrollIdx - 15).coerceAtLeast(0)
                     val endIdx = (scrollIdx + 65).coerceAtMost(cur.results.size)
                     val slice = cur.results.subList(startIdx, endIdx)
-                    val pairs = slice.map { it.address to it.size }
-                    engine.batchReadRawValues(pairs)
-                } else {
-                    emptyMap()
-                }
+                    engine.batchReadRawValues(slice.map { it.address to it.size })
+                } else emptyMap()
 
-                // 2. 仅读取当前可见区域的保存列表（最多 80 条未冻结或动态递增/递减/范围冻结项）
                 val liveSavedMap: Map<Long, Long> = if (cur.saved.isNotEmpty() && (manual || cur.tab == NextTab.SAVED_LIST)) {
                     val scrollIdx = getListScrollPosition("saved_list").first.coerceIn(0, (cur.saved.size - 1).coerceAtLeast(0))
                     val startIdx = (scrollIdx - 15).coerceAtLeast(0)
@@ -1056,27 +1458,19 @@ object Session {
                     val slice = cur.saved.subList(startIdx, endIdx)
                     val dynamicOrUnfrozen = slice.filter { !it.freeze || it.freezeType != 0 }.map { it.address to it.size }
                     if (dynamicOrUnfrozen.isNotEmpty()) engine.batchReadRawValues(dynamicOrUnfrozen) else emptyMap()
-                } else {
-                    emptyMap()
-                }
+                } else emptyMap()
 
-                // 3. 刷新内存页数值（当处于内存页或手动点击刷新且已加载内存页时）
                 val pageBase = cur.memoryBase
                 val memCount = cur.memoryRows.size
                 val memBlock: ByteArray? = if (memCount > 0 && (manual || cur.tab == NextTab.MEMORY)) {
                     engine.readBlock(pageBase, memCount * 4)
-                } else {
-                    null
-                }
+                } else null
 
                 if (liveResultMap.isEmpty() && liveSavedMap.isEmpty() && memBlock == null) {
-                    if (manual) {
-                        withContext(Dispatchers.Main) { toast("已刷新实时内存数据") }
-                    }
+                    if (manual) withContext(Dispatchers.Main) { toast("已刷新实时内存数据") }
                     return@launch
                 }
 
-                // 在 _ui.update 中基于最新状态 s 原地合并数值，保留最新的 checked / freeze / note 等字段
                 _ui.update { s ->
                     var nextResults = s.results
                     var nextRaw = s.rawResults
@@ -1128,9 +1522,7 @@ object Session {
                                 }
                             }
                         }
-                        if (savedChanged) {
-                            nextSaved = updatedSaved
-                        }
+                        if (savedChanged) nextSaved = updatedSaved
                     }
 
                     var nextMemRows = s.memoryRows
@@ -1153,9 +1545,7 @@ object Session {
                                 updatedMem.add(oldItem)
                             }
                         }
-                        if (memChanged) {
-                            nextMemRows = updatedMem
-                        }
+                        if (memChanged) nextMemRows = updatedMem
                     }
 
                     if (nextResults === s.results && nextRaw === s.rawResults && nextSaved === s.saved && nextMemRows === s.memoryRows) {
@@ -1169,18 +1559,14 @@ object Session {
                         )
                     }
                 }
-                if (manual) {
-                    withContext(Dispatchers.Main) {
-                        toast("已刷新实时内存数据")
-                    }
-                }
+                if (manual) withContext(Dispatchers.Main) { toast("已刷新实时内存数据") }
             } finally {
                 liveRefreshRunning = false
             }
         }
     }
 
-    private fun makeProgressCallback(startTimeMs: Long): (Long, Long, Long) -> Unit = { doneBytes, totalBytes, foundSoFar ->
+    private fun makeProgressCallback(label: String, startTimeMs: Long): (Long, Long, Long) -> Unit = { doneBytes, totalBytes, foundSoFar ->
         val frac = if (totalBytes > 0L) (doneBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
         val elapsedSec = ((System.currentTimeMillis() - startTimeMs).coerceAtLeast(1L)) / 1000.0
         val eta = if (frac > 0.03f && frac < 0.995f) {
@@ -1192,20 +1578,26 @@ object Session {
         }
         val scannedMb = doneBytes.toFloat() / (1024f * 1024f)
         val totalMb = totalBytes.toFloat() / (1024f * 1024f)
-        _ui.update {
-            it.copy(
-                searchProgress = frac,
-                searchFoundSoFar = foundSoFar,
-                searchEtaSeconds = eta,
-                searchScannedMb = scannedMb,
-                searchTotalMb = totalMb
-            )
-        }
+        _searchProgressState.value = SearchProgressUi(
+            active = true,
+            text = label,
+            progress = frac,
+            foundSoFar = foundSoFar,
+            etaSeconds = eta,
+            scannedMb = scannedMb,
+            totalMb = totalMb
+        )
     }
 
-    fun currentProcessRegions(): List<MemoryRegion> = engine.regions()
-
-    fun firstRegionBase(code: String): Long? = engine.firstRegionBase(code)
+    /** 端到端扫描取消（模块 2）：立即下发 CANCEL 到 C++ 守护进程/JNI 及 JVM 回退 */
+    fun cancelSearch() {
+        engine.cancelScan()
+        activeSearchJob?.cancel()
+        activeSearchJob = null
+        _searchProgressState.value = SearchProgressUi()
+        _ui.update { it.copy(busy = false) }
+        toast("已取消搜索")
+    }
 
     private val regionNames = mapOf(
         "Ch" to "C++ heap", "Jh" to "Java heap", "Ca" to "C++ alloc", "Cd" to "C++ .data",
@@ -1228,23 +1620,48 @@ object Session {
     }
 
     fun toggleRegion(code: String) {
-        val cur = _ui.value
-        val nextSet = if (cur.selectedRegions.contains(code)) cur.selectedRegions - code else cur.selectedRegions + code
-        _ui.update { it.copy(selectedRegions = nextSet) }
-        persistSelectedRegions(nextSet, cur.target?.packageName)
+        var nextSet: Set<String> = emptySet()
+        var pkgName: String? = null
+        _ui.update { cur ->
+            val updated = if (cur.selectedRegions.contains(code)) cur.selectedRegions - code else cur.selectedRegions + code
+            nextSet = updated
+            pkgName = cur.target?.packageName
+            cur.copy(selectedRegions = updated)
+        }
+        persistSelectedRegions(nextSet, pkgName, immediate = false)
     }
 
     fun resetRegions() {
         val defaultSet = RegionCatalog.DEFAULT_SELECTED
-        _ui.update { it.copy(selectedRegions = defaultSet) }
-        persistSelectedRegions(defaultSet, _ui.value.target?.packageName)
+        var pkgName: String? = null
+        _ui.update { cur ->
+            pkgName = cur.target?.packageName
+            cur.copy(selectedRegions = defaultSet)
+        }
+        persistSelectedRegions(defaultSet, pkgName, immediate = true)
     }
 
     fun saveRegions() {
         val cur = _ui.value
-        persistSelectedRegions(cur.selectedRegions, cur.target?.packageName)
-        _ui.update { it.copy(sheet = Sheet.NONE) }
+        persistSelectedRegions(cur.selectedRegions, cur.target?.packageName, immediate = true)
+        closeAllSheets()
         toast("已保存内存范围设置")
+    }
+
+    /**
+     * 计算本次搜索从 C++ 层拉取到 Kotlin 列表的最大条目数：
+     * C++ `MmapCandidateStore` 已完整保存全部数百万候选以供改善 (Refine)，
+     * UI 层仅需按当前显示上限 `filter.maxShow`（开启过滤条件时适度放宽缓冲）拉取即可，
+     * 避免每次搜索结束后通过管道传输 10 万条数据造成严重卡顿与堆内存膨胀。
+     */
+    private fun computeNativeFetchLimit(filter: FilterState): Int {
+        if (!engine.supportsNativeScan) return MemoryEngine.MAX_CACHED_CANDIDATES
+        val maxShow = filter.maxShow.coerceIn(1, MemoryEngine.MAX_CACHED_CANDIDATES)
+        return if (filter.isAnyFilterActive) {
+            maxOf(maxShow * 4, 4000).coerceAtMost(MemoryEngine.MAX_CACHED_CANDIDATES)
+        } else {
+            maxShow
+        }
     }
 
     // ============ 精确 / 范围 / 联合 / 蒙版 / 指针 / 模糊搜索 ============
@@ -1267,6 +1684,26 @@ object Session {
 
     fun updateFilter(f: (FilterState) -> FilterState) = _ui.update { it.copy(filter = f(it.filter)) }
 
+    /** 解析精确搜索可选地址掩码（默认全 F 代表禁用掩码过滤） */
+    private fun parseOptionalAddressMask(rawMask: String): Pair<Long, Long> {
+        val clean = rawMask.trim().removePrefix("0x").removePrefix("0X").removeSuffix("h").removeSuffix("H").uppercase()
+        if (clean.isEmpty() || clean.all { it == 'F' } || clean == "0") return 0L to 0L
+        var maskBits = 0L
+        var patternBits = 0L
+        for (ch in clean) {
+            maskBits = maskBits shl 4
+            patternBits = patternBits shl 4
+            if (ch != '?' && ch != '*') {
+                val digit = Character.digit(ch, 16)
+                if (digit in 0..15) {
+                    maskBits = maskBits or 0xFL
+                    patternBits = patternBits or digit.toLong()
+                }
+            }
+        }
+        return maskBits to patternBits
+    }
+
     fun runSearch(newSearch: Boolean) {
         val st = _ui.value
         if (st.target == null) {
@@ -1287,7 +1724,8 @@ object Session {
             engine.clearRemoved()
             saveListScrollPosition("search_list", 0, 0)
         }
-        scope.launch {
+        activeSearchJob?.cancel()
+        activeSearchJob = scope.launch {
             val parsed = try {
                 NumberParser.parse(input, st.search.type, st.search.sign)
             } catch (e: NumberParser.ParseException) {
@@ -1295,16 +1733,13 @@ object Session {
                 return@launch
             }
             val startTime = System.currentTimeMillis()
+            val label = if (newSearch) "新搜索: $input" else "改善: $input"
+            _searchProgressState.value = SearchProgressUi(active = true, text = label)
             _ui.update {
                 it.copy(
                     busy = true,
-                    busyText = if (newSearch) "新搜索: $input" else "改善: $input",
-                    searchProgress = 0f,
-                    searchFoundSoFar = 0L,
-                    searchEtaSeconds = -1,
-                    searchScannedMb = 0f,
-                    searchTotalMb = 0f,
-                    sheet = Sheet.NONE,
+                    busyText = label,
+                    sheetStack = emptyList(),
                     tab = NextTab.SEARCH_LIST
                 )
             }
@@ -1328,6 +1763,7 @@ object Session {
                 }
                 else -> Long.MAX_VALUE
             }
+            val (addrMask, addrPattern) = parseOptionalAddressMask(st.search.mask)
             val criteria = MemoryEngine.Criteria(
                 type = type,
                 value = parsed.numbers.firstOrNull() ?: 0L,
@@ -1346,41 +1782,52 @@ object Session {
                 area = parsed.area.coerceIn(2, 65536),
                 memoryFrom = memFrom,
                 memoryTo = memTo,
-                limit = maxOf(st.filter.maxShow, MemoryEngine.MAX_CACHED_CANDIDATES),
+                limit = computeNativeFetchLimit(st.filter),
                 rawExpression = input,
                 encryptedXor = st.search.encrypted,
                 selectedRegions = st.selectedRegions,
+                mask = addrMask,
+                maskPattern = addrPattern,
                 isText = (parsed.kind == NumberParser.Kind.TEXT),
                 textBytes = parsed.textBytes,
                 textUtf16 = parsed.textUtf16
             )
             val isRefine = !newSearch && (hasFuzzySession || st.rawResults.isNotEmpty() || st.totalCount > 0L)
             val previous = if (isRefine) st.rawResults else null
-            val progressCb = makeProgressCallback(startTime)
-            val result = withContext(Dispatchers.IO) { engine.search(criteria, previous, progressCb) }
+            val progressCb = makeProgressCallback(label, startTime)
+            val activeFilter = _ui.value.filter
+            val (result, filtered) = withContext(Dispatchers.IO) {
+                val res = engine.search(criteria, previous, progressCb)
+                val flt = if (res.cancelled) emptyList() else filterList(res.items, activeFilter)
+                res to flt
+            }
+            _searchProgressState.value = SearchProgressUi()
+            if (result.cancelled) {
+                _ui.update { it.copy(busy = false) }
+                return@launch
+            }
             hasFuzzySession = false
-            val filtered = filterList(result.items, _ui.value.filter)
+            if (historyStore.add(input)) {
+                persistSearchHistoryAsync()
+            }
             _ui.update {
                 it.copy(
                     rawResults = result.items,
                     results = filtered,
                     totalCount = result.totalFound,
                     busy = false,
-                    searchProgress = 1f,
-                    searchEtaSeconds = 0,
                     hintVisible = filtered.isEmpty(),
-                    selectedCount = 0,
+                    searchSelection = SelectionState.EMPTY,
                     searchType = type,
+                    history = historyStore.list(),
                     fuzzy = it.fuzzy.copy(active = false)
                 )
             }
-            historyStore.add(input)
-            _ui.update { it.copy(history = historyStore.list()) }
             toast("找到 ${result.totalFound} 条结果")
         }
     }
 
-    /** 执行模糊搜索（初始搜索 / 无变化 / 有变化 / 增加了 / 减少了） */
+    /** 执行模糊搜索（支持 onlyNth 步进下推到 C++ 层） */
     fun runFuzzySearch(sign: Int, forceNew: Boolean = false) {
         val st = _ui.value
         if (st.target == null) {
@@ -1391,7 +1838,8 @@ object Session {
             toast("请先成功附加目标进程（当前无内存读取权限）")
             return
         }
-        scope.launch {
+        activeSearchJob?.cancel()
+        activeSearchJob = scope.launch {
             val isInit = forceNew || (!hasFuzzySession && st.rawResults.isEmpty())
             if (isInit) {
                 saveListScrollPosition("search_list", 0, 0)
@@ -1403,20 +1851,18 @@ object Session {
                 else -> "无变化"
             }
             val startTime = System.currentTimeMillis()
+            val label = if (isInit) "模糊初始采样中..." else "模糊筛选 ($actionName)..."
+            _searchProgressState.value = SearchProgressUi(active = true, text = label)
             _ui.update {
                 it.copy(
                     busy = true,
-                    busyText = if (isInit) "模糊初始采样中..." else "模糊筛选 ($actionName)...",
-                    searchProgress = 0f,
-                    searchFoundSoFar = 0L,
-                    searchEtaSeconds = -1,
-                    searchScannedMb = 0f,
-                    searchTotalMb = 0f,
-                    sheet = Sheet.NONE,
+                    busyText = label,
+                    sheetStack = emptyList(),
                     tab = NextTab.SEARCH_LIST
                 )
             }
             val delta = st.fuzzy.deltaText.trim().toLongOrNull() ?: 0L
+            val onlyNthVal = st.fuzzy.onlyNth.trim().toIntOrNull()?.coerceAtLeast(0) ?: 0
             val memFrom = when (st.fuzzy.rangeMode) {
                 1 -> st.fuzzy.rangeFrom.trim().removePrefix("0x").removeSuffix("h").toULongOrNull(16)?.toLong() ?: 0L
                 2 -> {
@@ -1436,33 +1882,39 @@ object Session {
                 else -> Long.MAX_VALUE
             }
             val prev = if (isInit) null else st.rawResults
-            val progressCb = makeProgressCallback(startTime)
-            val result = withContext(Dispatchers.IO) {
-                engine.fuzzySearch(
+            val progressCb = makeProgressCallback(label, startTime)
+            val activeFilter = _ui.value.filter
+            val fetchLimit = computeNativeFetchLimit(activeFilter)
+            val (result, filtered) = withContext(Dispatchers.IO) {
+                val res = engine.fuzzySearch(
                     type = st.fuzzy.type,
                     sign = sign,
                     delta = delta,
-                    onlyNth = 0,
+                    onlyNth = onlyNthVal,
                     previous = prev,
                     selectedRegions = st.selectedRegions,
-                    limit = maxOf(st.filter.maxShow, MemoryEngine.MAX_CACHED_CANDIDATES),
+                    limit = fetchLimit,
                     memoryFrom = memFrom,
                     memoryTo = memTo,
                     onProgress = progressCb
                 )
+                val flt = if (res.cancelled) emptyList() else filterList(res.items, activeFilter)
+                res to flt
+            }
+            _searchProgressState.value = SearchProgressUi()
+            if (result.cancelled) {
+                _ui.update { it.copy(busy = false) }
+                return@launch
             }
             hasFuzzySession = result.totalFound > 0L || result.items.isNotEmpty()
-            val filtered = filterList(result.items, _ui.value.filter)
             _ui.update {
                 it.copy(
                     rawResults = result.items,
                     results = filtered,
                     totalCount = result.totalFound,
                     busy = false,
-                    searchProgress = 1f,
-                    searchEtaSeconds = 0,
                     hintVisible = filtered.isEmpty(),
-                    selectedCount = 0,
+                    searchSelection = SelectionState.EMPTY,
                     fuzzy = it.fuzzy.copy(active = hasFuzzySession)
                 )
             }
@@ -1492,45 +1944,55 @@ object Session {
         val rawMask = st.search.mask.trim().removePrefix("0x").removeSuffix("h")
         val addrVal = rawAddr.toULongOrNull(16)?.toLong() ?: rawAddr.toLongOrNull(16) ?: st.memoryBase
         val maskVal = rawMask.toULongOrNull(16)?.toLong() ?: -1L
-        scope.launch {
+        activeSearchJob?.cancel()
+        activeSearchJob = scope.launch {
+            val startTime = System.currentTimeMillis()
+            val label = "地址蒙版搜索中..."
+            _searchProgressState.value = SearchProgressUi(active = true, text = label)
             _ui.update {
                 it.copy(
                     busy = true,
-                    busyText = "地址蒙版搜索中...",
-                    searchProgress = 0f,
-                    searchFoundSoFar = 0L,
-                    searchEtaSeconds = -1,
-                    sheet = Sheet.NONE,
+                    busyText = label,
+                    sheetStack = emptyList(),
                     tab = NextTab.SEARCH_LIST
                 )
             }
             val prev = if (!newSearch && st.rawResults.isNotEmpty()) st.rawResults else null
-            val result = withContext(Dispatchers.IO) {
-                engine.maskSearch(
+            val progressCb = makeProgressCallback(label, startTime)
+            val activeFilter = _ui.value.filter
+            val fetchLimit = computeNativeFetchLimit(activeFilter)
+            val (result, filtered) = withContext(Dispatchers.IO) {
+                val res = engine.maskSearch(
                     addressPattern = addrVal,
                     maskBits = maskVal,
                     type = st.search.type,
                     sign = st.search.sign,
                     previous = prev,
                     selectedRegions = st.selectedRegions,
-                    limit = maxOf(st.filter.maxShow, MemoryEngine.MAX_CACHED_CANDIDATES)
+                    limit = fetchLimit,
+                    onProgress = progressCb
                 )
+                val flt = if (res.cancelled) emptyList() else filterList(res.items, activeFilter)
+                res to flt
             }
-            val filtered = filterList(result.items, _ui.value.filter)
+            _searchProgressState.value = SearchProgressUi()
+            if (result.cancelled) {
+                _ui.update { it.copy(busy = false) }
+                return@launch
+            }
+            if (st.search.text.isNotBlank() && historyStore.add(st.search.text.trim())) {
+                persistSearchHistoryAsync()
+            }
             _ui.update {
                 it.copy(
                     rawResults = result.items,
                     results = filtered,
                     totalCount = result.totalFound,
                     busy = false,
-                    searchProgress = 1f,
                     hintVisible = filtered.isEmpty(),
-                    selectedCount = 0
+                    searchSelection = SelectionState.EMPTY,
+                    history = historyStore.list()
                 )
-            }
-            if (st.search.text.isNotBlank()) {
-                historyStore.add(st.search.text.trim())
-                _ui.update { it.copy(history = historyStore.list()) }
             }
             toast("蒙版搜索找到 ${result.totalFound} 项")
         }
@@ -1572,42 +2034,49 @@ object Session {
         } else {
             if (st.target.x64) ValueType.QWORD else ValueType.DWORD
         }
-        scope.launch {
+        activeSearchJob?.cancel()
+        activeSearchJob = scope.launch {
             val startTime = System.currentTimeMillis()
+            val label = "指针链搜索中..."
+            _searchProgressState.value = SearchProgressUi(active = true, text = label)
             _ui.update {
                 it.copy(
                     busy = true,
-                    busyText = "指针链搜索中...",
-                    searchProgress = 0f,
-                    searchFoundSoFar = 0L,
-                    searchEtaSeconds = -1,
-                    sheet = Sheet.NONE,
+                    busyText = label,
+                    sheetStack = emptyList(),
                     tab = NextTab.SEARCH_LIST
                 )
             }
             val prev = if (!newSearch && st.rawResults.isNotEmpty()) st.rawResults else null
-            val progressCb = makeProgressCallback(startTime)
-            val result = withContext(Dispatchers.IO) {
-                engine.pointerSearch(
+            val progressCb = makeProgressCallback(label, startTime)
+            val activeFilter = _ui.value.filter
+            val fetchLimit = computeNativeFetchLimit(activeFilter)
+            val (result, filtered) = withContext(Dispatchers.IO) {
+                val res = engine.pointerSearch(
                     targetAddress = targetAddr,
                     maxOffset = maxOffset,
                     type = ptrType,
                     previous = prev,
                     selectedRegions = st.selectedRegions,
-                    limit = maxOf(st.filter.maxShow, MemoryEngine.MAX_CACHED_CANDIDATES),
+                    limit = fetchLimit,
                     onProgress = progressCb
                 )
+                val flt = if (res.cancelled) emptyList() else filterList(res.items, activeFilter)
+                res to flt
             }
-            val filtered = filterList(result.items, _ui.value.filter)
+            _searchProgressState.value = SearchProgressUi()
+            if (result.cancelled) {
+                _ui.update { it.copy(busy = false) }
+                return@launch
+            }
             _ui.update {
                 it.copy(
                     rawResults = result.items,
                     results = filtered,
                     totalCount = result.totalFound,
                     busy = false,
-                    searchProgress = 1f,
                     hintVisible = filtered.isEmpty(),
-                    selectedCount = 0,
+                    searchSelection = SelectionState.EMPTY,
                     searchType = ptrType
                 )
             }
@@ -1622,7 +2091,6 @@ object Session {
         val maxShow = newFilter.maxShow.coerceIn(1, 100000)
         setSetting("filter_max_show", maxShow.toString())
         val normalized = newFilter.copy(maxShow = maxShow)
-        val filtered = filterList(st.rawResults, normalized)
 
         var mask = st.valueMask
         fun setBit(bit: Int, on: Boolean) {
@@ -1632,42 +2100,77 @@ object Session {
         setBit(Formatter.F_RHEX, normalized.formatRHex)
         setBit(Formatter.F_STRING, normalized.formatString)
         setBit(Formatter.F_JAVA, normalized.formatUtf16)
-        setBit(Formatter.F_ARM, normalized.formatArm32)
-        setBit(Formatter.F_THUMB, normalized.formatThumb)
-        setBit(Formatter.F_ARM8, normalized.formatArm64)
         if (mask == 0) mask = SettingsSpecs.DEFAULT_FORMAT_MASK
-        repo?.let { r -> scope.launch { r.setValueFormatMask(mask) } }
+        repo?.let { r -> scope.launch(Dispatchers.IO) { r.setValueFormatMask(mask) } }
+
+        val desiredCap = computeNativeFetchLimit(normalized)
+        val needExpandFromNative = engine.supportsNativeScan &&
+            st.totalCount > st.rawResults.size.toLong() &&
+            desiredCap > st.rawResults.size
+
+        if (!needExpandFromNative) {
+            val filtered = filterList(st.rawResults, normalized)
+            val validKeys = filtered.mapTo(HashSet(filtered.size * 2)) { SelectionState.itemKey(it) }
+            _ui.update {
+                it.copy(
+                    filter = normalized,
+                    results = filtered,
+                    searchSelection = it.searchSelection.prune(validKeys),
+                    valueMask = mask,
+                    sheetStack = emptyList()
+                )
+            }
+            toast("已应用筛选")
+            return
+        }
 
         _ui.update {
             it.copy(
                 filter = normalized,
-                results = filtered,
                 valueMask = mask,
-                sheet = Sheet.NONE
+                sheetStack = emptyList(),
+                isBatchBusy = true
             )
         }
-        recount()
-        toast("已应用筛选")
+        scope.launch {
+            val (expandedRaw, filtered) = withContext(Dispatchers.IO) {
+                val fetched = engine.fetchStoredCandidates(
+                    limit = desiredCap,
+                    defaultType = st.searchType,
+                    useCandidateDt = true
+                )
+                val base = if (fetched.isNotEmpty()) fetched else st.rawResults
+                base to filterList(base, normalized)
+            }
+            val validKeys = filtered.mapTo(HashSet(filtered.size * 2)) { SelectionState.itemKey(it) }
+            _ui.update {
+                it.copy(
+                    rawResults = expandedRaw,
+                    results = filtered,
+                    searchSelection = it.searchSelection.prune(validKeys),
+                    isBatchBusy = false
+                )
+            }
+            toast("已应用筛选")
+        }
     }
 
     fun resetFilter() {
         val def = FilterState()
         setSetting("filter_max_show", def.maxShow.toString())
-        repo?.let { r -> scope.launch { r.setValueFormatMask(SettingsSpecs.DEFAULT_FORMAT_MASK) } }
+        repo?.let { r -> scope.launch(Dispatchers.IO) { r.setValueFormatMask(SettingsSpecs.DEFAULT_FORMAT_MASK) } }
         val filtered = filterList(_ui.value.rawResults, def)
+        val validKeys = filtered.mapTo(HashSet(filtered.size * 2)) { SelectionState.itemKey(it) }
         _ui.update {
             it.copy(
                 filter = def,
                 results = filtered,
+                searchSelection = it.searchSelection.prune(validKeys),
                 valueMask = SettingsSpecs.DEFAULT_FORMAT_MASK
             )
         }
-        recount()
         toast("已重置筛选条件")
     }
-
-    private fun itemCompositeKey(item: MemoryItem): Long =
-        (item.address shl 8) xor (item.flags and 0x7F).toLong()
 
     private fun filterList(source: List<MemoryItem>, f: FilterState): List<MemoryItem> {
         if (source.isEmpty()) return emptyList()
@@ -1680,7 +2183,7 @@ object Session {
         val seenKeys = HashSet<Long>(minOf(source.size, f.maxShow) * 2)
         val out = ArrayList<MemoryItem>(minOf(source.size, f.maxShow))
         for (item in source) {
-            if (!seenKeys.add(itemCompositeKey(item))) continue
+            if (!seenKeys.add(SelectionState.itemKey(item))) continue
             if (addrMin != null && java.lang.Long.compareUnsigned(item.address, addrMin) < 0) continue
             if (addrMax != null && java.lang.Long.compareUnsigned(item.address, addrMax) > 0) continue
             val signedVal = Formatter.signed(item.value, item.size)
@@ -1710,71 +2213,32 @@ object Session {
 
     fun clearResults() {
         hasFuzzySession = false
-        engine.clearSession()
         saveListScrollPosition("search_list", 0, 0)
+        scope.launch(Dispatchers.IO) { engine.clearSession() }
         _ui.update {
             it.copy(
                 rawResults = emptyList(),
                 results = emptyList(),
                 totalCount = 0,
-                selectedCount = 0,
+                searchSelection = SelectionState.EMPTY,
                 hintVisible = true,
                 fuzzy = it.fuzzy.copy(active = false)
             )
         }
     }
 
-    // ============ 选择（Bug 5 & Bug 6 深度优化：单次原子更新 + 零字符串分配 + O(N) 高速全选） ============
+    // ============ O(1) 选择操作（模块 4：零列表拷贝，常数时间） ============
 
     private fun sameItemKey(a: MemoryItem, b: MemoryItem): Boolean =
         a.address == b.address && (a.flags and 0x7F) == (b.flags and 0x7F)
 
     fun toggle(item: MemoryItem) {
-        val targetAddr = item.address
         _ui.update { s ->
             when (s.tab) {
-                NextTab.SAVED_LIST -> {
-                    val idx = s.saved.indexOfFirst { sameItemKey(it, item) }
-                        .let { if (it >= 0) it else s.saved.indexOfFirst { r -> r.address == targetAddr } }
-                    if (idx < 0) s else {
-                        val cur = s.saved[idx]
-                        val nextChecked = !cur.checked
-                        val nextList = ArrayList<MemoryItem>(s.saved).also { it[idx] = cur.copy(checked = nextChecked) }
-                        val nextCount = s.selectedCount + (if (nextChecked) 1 else -1)
-                        s.copy(saved = nextList, selectedCount = nextCount.coerceAtLeast(0))
-                    }
-                }
-                NextTab.MEMORY -> {
-                    val idx = s.memoryRows.indexOfFirst { it.address == targetAddr }
-                    if (idx < 0) s else {
-                        val cur = s.memoryRows[idx]
-                        val nextChecked = !cur.checked
-                        val nextList = ArrayList<MemoryItem>(s.memoryRows).also { it[idx] = cur.copy(checked = nextChecked) }
-                        val nextCount = s.selectedCount + (if (nextChecked) 1 else -1)
-                        s.copy(memoryRows = nextList, selectedCount = nextCount.coerceAtLeast(0))
-                    }
-                }
-                else -> {
-                    val idx = s.results.indexOfFirst { sameItemKey(it, item) }
-                        .let { if (it >= 0) it else s.results.indexOfFirst { r -> r.address == targetAddr } }
-                    if (idx < 0) s else {
-                        val cur = s.results[idx]
-                        val nextChecked = !cur.checked
-                        val updatedItem = cur.copy(checked = nextChecked)
-                        val nextRes = ArrayList<MemoryItem>(s.results).also { it[idx] = updatedItem }
-                        val nextRaw = if (s.rawResults.size == s.results.size && idx < s.rawResults.size && sameItemKey(s.rawResults[idx], cur)) {
-                            nextRes
-                        } else {
-                            val rawIdx = s.rawResults.indexOfFirst { sameItemKey(it, item) }
-                                .let { if (it >= 0) it else s.rawResults.indexOfFirst { r -> r.address == targetAddr } }
-                            if (rawIdx >= 0) {
-                                ArrayList<MemoryItem>(s.rawResults).also { it[rawIdx] = updatedItem }
-                            } else s.rawResults
-                        }
-                        val nextCount = s.selectedCount + (if (nextChecked) 1 else -1)
-                        s.copy(results = nextRes, rawResults = nextRaw, selectedCount = nextCount.coerceAtLeast(0))
-                    }
-                }
+                NextTab.SAVED_LIST -> s.copy(savedSelection = s.savedSelection.toggle(SelectionState.itemKey(item)))
+                NextTab.MEMORY -> s.copy(memorySelection = s.memorySelection.toggle(SelectionState.memoryRowKey(item)))
+                NextTab.SEARCH_LIST -> s.copy(searchSelection = s.searchSelection.toggle(SelectionState.itemKey(item)))
+                NextTab.SETTINGS -> s
             }
         }
     }
@@ -1782,22 +2246,10 @@ object Session {
     fun selectAll() {
         _ui.update { s ->
             when (s.tab) {
-                NextTab.SAVED_LIST -> {
-                    val next = ArrayList<MemoryItem>(s.saved.size)
-                    for (item in s.saved) next.add(if (item.checked) item else item.copy(checked = true))
-                    s.copy(saved = next, selectedCount = next.size)
-                }
-                NextTab.MEMORY -> {
-                    val next = ArrayList<MemoryItem>(s.memoryRows.size)
-                    for (item in s.memoryRows) next.add(if (item.checked) item else item.copy(checked = true))
-                    s.copy(memoryRows = next, selectedCount = next.size)
-                }
-                else -> {
-                    val nextRes = ArrayList<MemoryItem>(s.results.size)
-                    for (item in s.results) nextRes.add(if (item.checked) item else item.copy(checked = true))
-                    val nextRaw = if (s.rawResults.size == s.results.size) nextRes else s.rawResults
-                    s.copy(results = nextRes, rawResults = nextRaw, selectedCount = nextRes.size)
-                }
+                NextTab.SAVED_LIST -> if (s.saved.isEmpty()) s else s.copy(savedSelection = s.savedSelection.selectAll())
+                NextTab.MEMORY -> if (s.memoryRows.isEmpty()) s else s.copy(memorySelection = s.memorySelection.selectAll())
+                NextTab.SEARCH_LIST -> if (s.results.isEmpty()) s else s.copy(searchSelection = s.searchSelection.selectAll())
+                NextTab.SETTINGS -> s
             }
         }
     }
@@ -1805,37 +2257,10 @@ object Session {
     fun invertSelection() {
         _ui.update { s ->
             when (s.tab) {
-                NextTab.SAVED_LIST -> {
-                    var count = 0
-                    val next = ArrayList<MemoryItem>(s.saved.size)
-                    for (item in s.saved) {
-                        val c = !item.checked
-                        if (c) count++
-                        next.add(item.copy(checked = c))
-                    }
-                    s.copy(saved = next, selectedCount = count)
-                }
-                NextTab.MEMORY -> {
-                    var count = 0
-                    val next = ArrayList<MemoryItem>(s.memoryRows.size)
-                    for (item in s.memoryRows) {
-                        val c = !item.checked
-                        if (c) count++
-                        next.add(item.copy(checked = c))
-                    }
-                    s.copy(memoryRows = next, selectedCount = count)
-                }
-                else -> {
-                    var count = 0
-                    val nextRes = ArrayList<MemoryItem>(s.results.size)
-                    for (item in s.results) {
-                        val c = !item.checked
-                        if (c) count++
-                        nextRes.add(item.copy(checked = c))
-                    }
-                    val nextRaw = if (s.rawResults.size == s.results.size) nextRes else s.rawResults
-                    s.copy(results = nextRes, rawResults = nextRaw, selectedCount = count)
-                }
+                NextTab.SAVED_LIST -> if (s.saved.isEmpty()) s else s.copy(savedSelection = s.savedSelection.invert())
+                NextTab.MEMORY -> if (s.memoryRows.isEmpty()) s else s.copy(memorySelection = s.memorySelection.invert())
+                NextTab.SEARCH_LIST -> if (s.results.isEmpty()) s else s.copy(searchSelection = s.searchSelection.invert())
+                NextTab.SETTINGS -> s
             }
         }
     }
@@ -1843,40 +2268,22 @@ object Session {
     fun clearSelection() {
         _ui.update { s ->
             when (s.tab) {
-                NextTab.SAVED_LIST -> {
-                    val next = ArrayList<MemoryItem>(s.saved.size)
-                    for (item in s.saved) next.add(if (!item.checked) item else item.copy(checked = false))
-                    s.copy(saved = next, selectedCount = 0)
-                }
-                NextTab.MEMORY -> {
-                    val next = ArrayList<MemoryItem>(s.memoryRows.size)
-                    for (item in s.memoryRows) next.add(if (!item.checked) item else item.copy(checked = false))
-                    s.copy(memoryRows = next, selectedCount = 0)
-                }
-                else -> {
-                    val nextRes = ArrayList<MemoryItem>(s.results.size)
-                    for (item in s.results) nextRes.add(if (!item.checked) item else item.copy(checked = false))
-                    val nextRaw = if (s.rawResults.size == s.results.size) nextRes else s.rawResults
-                    s.copy(results = nextRes, rawResults = nextRaw, selectedCount = 0)
-                }
+                NextTab.SAVED_LIST -> s.copy(savedSelection = SelectionState.EMPTY)
+                NextTab.MEMORY -> s.copy(memorySelection = SelectionState.EMPTY)
+                NextTab.SEARCH_LIST -> s.copy(searchSelection = SelectionState.EMPTY)
+                NextTab.SETTINGS -> s
             }
         }
     }
 
-    private fun recount() = _ui.update {
-        it.copy(
-            selectedCount = when (it.tab) {
-                NextTab.SAVED_LIST -> it.saved.count { r -> r.checked }
-                NextTab.MEMORY -> it.memoryRows.count { r -> r.checked }
-                else -> it.results.count { r -> r.checked }
-            }
-        )
-    }
-
-    fun checkedItems(): List<MemoryItem> = when (_ui.value.tab) {
-        NextTab.SAVED_LIST -> _ui.value.saved.filter { it.checked }
-        NextTab.MEMORY -> _ui.value.memoryRows.filter { it.checked }
-        else -> _ui.value.results.filter { it.checked }
+    fun checkedItems(): List<MemoryItem> {
+        val st = _ui.value
+        return when (st.tab) {
+            NextTab.SAVED_LIST -> st.savedSelection.resolveSelected(st.saved, SelectionState::itemKey)
+            NextTab.MEMORY -> st.memorySelection.resolveSelected(st.memoryRows, SelectionState::memoryRowKey)
+            NextTab.SEARCH_LIST -> st.searchSelection.resolveSelected(st.results, SelectionState::itemKey)
+            NextTab.SETTINGS -> emptyList()
+        }
     }
 
     fun itemsToEdit(): List<MemoryItem> {
@@ -1887,105 +2294,99 @@ object Session {
         val checked = checkedItems()
         if (checked.isNotEmpty()) return checked
         st.editing?.let { return listOf(it) }
-        val activeList = when (st.tab) {
+        return when (st.tab) {
             NextTab.SAVED_LIST -> st.saved
             NextTab.MEMORY -> st.memoryRows
-            else -> st.results
+            NextTab.SEARCH_LIST -> st.results
+            NextTab.SETTINGS -> emptyList()
         }
-        return activeList
     }
 
-    // ============ 保存 / 批量编辑（Bug 5 深度优化：O(N) 哈希表合并，支持 50000+ 项无卡顿保存） ============
+    // ============ 保存 / 删除 / 冻结 / 恢复（全部异步 IO） ============
 
     fun saveChecked() {
-        val st = _ui.value
-        val activeList = when (st.tab) {
-            NextTab.SAVED_LIST -> st.saved
-            NextTab.MEMORY -> st.memoryRows
-            else -> st.results
-        }
-        if (activeList.none { it.checked }) {
+        val selected = checkedItems()
+        if (selected.isEmpty()) {
             toast("无项目被选中")
             return
         }
         scope.launch(Dispatchers.Default) {
             val cur = _ui.value
-            val sourceList = when (cur.tab) {
-                NextTab.SAVED_LIST -> cur.saved
-                NextTab.MEMORY -> cur.memoryRows
-                else -> cur.results
-            }
-            val selectedItems = ArrayList<MemoryItem>()
-            for (item in sourceList) {
-                if (item.checked) selectedItems.add(item)
-            }
-            if (selectedItems.isEmpty()) return@launch
-
-            val map = LinkedHashMap<Long, MemoryItem>((cur.saved.size + selectedItems.size) * 4 / 3 + 16)
+            val map = LinkedHashMap<Long, MemoryItem>((cur.saved.size + selected.size) * 4 / 3 + 16)
             for (existing in cur.saved) {
-                map[itemCompositeKey(existing)] = existing
+                map[SelectionState.itemKey(existing)] = existing
             }
-            for (item in selectedItems) {
-                val k = itemCompositeKey(item)
+            for (item in selected) {
+                val k = SelectionState.itemKey(item)
                 val prev = map[k]
                 map[k] = if (prev != null) {
-                    item.copy(checked = false, freeze = prev.freeze, note = item.note.ifEmpty { prev.note })
+                    item.copy(checked = false, freeze = prev.freeze, freezeType = prev.freezeType, freezeFrom = prev.freezeFrom, freezeTo = prev.freezeTo, note = item.note.ifEmpty { prev.note })
                 } else {
                     item.copy(checked = false)
                 }
             }
             val mergedList = ArrayList<MemoryItem>(map.values)
             syncFrozenSnapshot(mergedList)
-            _ui.update { s ->
-                s.copy(
-                    saved = mergedList,
-                    toast = "已保存 ${selectedItems.size} 项到保存列表"
-                )
-            }
+            persistSavedListAsync(mergedList)
+            _ui.update { s -> s.copy(saved = mergedList) }
+            toast("已保存 ${selected.size} 项到保存列表")
         }
     }
 
     fun deleteSaved(item: MemoryItem) {
-        engine.setFreeze(item.address, item.flags, item.value, false)
+        scope.launch(Dispatchers.IO) {
+            engine.setFreeze(item.address, item.flags, item.value, false)
+        }
+        var nextSavedSnapshot: List<MemoryItem> = emptyList()
         _ui.update { st ->
             val nextSaved = st.saved.filterNot { sameItemKey(it, item) }
+            nextSavedSnapshot = nextSaved
             syncFrozenSnapshot(nextSaved)
-            st.copy(saved = nextSaved)
+            val validKeys = nextSaved.mapTo(HashSet()) { SelectionState.itemKey(it) }
+            st.copy(saved = nextSaved, savedSelection = st.savedSelection.prune(validKeys))
         }
-        recount()
+        persistSavedListAsync(nextSavedSnapshot)
     }
 
     fun deleteResultItem(item: MemoryItem) {
-        engine.markRemoved(listOf(item.address))
+        scope.launch(Dispatchers.IO) {
+            engine.markRemoved(listOf(item.address))
+        }
         _ui.update { st ->
             val nextRaw = st.rawResults.filterNot { sameItemKey(it, item) }
             val nextRes = filterList(nextRaw, st.filter)
             val nextTotal = (st.totalCount - 1L).coerceAtLeast(nextRaw.size.toLong())
+            val validKeys = nextRes.mapTo(HashSet()) { SelectionState.itemKey(it) }
             st.copy(
                 rawResults = nextRaw,
                 results = nextRes,
                 totalCount = nextTotal,
+                searchSelection = st.searchSelection.prune(validKeys),
                 hintVisible = nextRes.isEmpty()
             )
         }
-        recount()
     }
 
     fun toggleFreeze(item: MemoryItem) {
         val nextFreeze = !item.freeze
-        engine.setFreeze(
-            address = item.address,
-            flags = item.flags,
-            value = item.value,
-            enabled = nextFreeze,
-            freezeType = item.freezeType,
-            freezeFrom = item.freezeFrom,
-            freezeTo = item.freezeTo
-        )
+        var nextSavedSnapshot: List<MemoryItem> = emptyList()
         _ui.update { st ->
             val nextSaved = st.saved.map { if (sameItemKey(it, item)) it.copy(freeze = nextFreeze) else it }
+            nextSavedSnapshot = nextSaved
             syncFrozenSnapshot(nextSaved)
             st.copy(saved = nextSaved)
+        }
+        persistSavedListAsync(nextSavedSnapshot)
+        scope.launch(Dispatchers.IO) {
+            engine.setFreeze(
+                address = item.address,
+                flags = item.flags,
+                value = item.value,
+                enabled = nextFreeze,
+                freezeType = item.freezeType,
+                freezeFrom = item.freezeFrom,
+                freezeTo = item.freezeTo
+            )
         }
     }
 
@@ -1995,19 +2396,28 @@ object Session {
             toast("无项目被选中")
             return
         }
-        val addrSet = targets.map { it.address }.toHashSet()
-        targets.forEach { engine.write(it.address, it.size, it.previousValue) }
-        _ui.update { st ->
-            val nextSaved = st.saved.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it }
-            syncFrozenSnapshot(nextSaved)
-            st.copy(
-                rawResults = st.rawResults.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it },
-                results = st.results.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it },
-                saved = nextSaved,
-                memoryRows = st.memoryRows.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it }
-            )
+        scope.launch {
+            _ui.update { it.copy(isBatchBusy = true) }
+            withContext(Dispatchers.IO) {
+                targets.forEach { engine.write(it.address, it.size, it.previousValue) }
+            }
+            val addrSet = targets.mapTo(HashSet()) { it.address }
+            var nextSavedSnapshot: List<MemoryItem> = emptyList()
+            _ui.update { st ->
+                val nextSaved = st.saved.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it }
+                nextSavedSnapshot = nextSaved
+                syncFrozenSnapshot(nextSaved)
+                st.copy(
+                    isBatchBusy = false,
+                    rawResults = st.rawResults.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it },
+                    results = st.results.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it },
+                    saved = nextSaved,
+                    memoryRows = st.memoryRows.map { if (it.address in addrSet) it.copy(value = it.previousValue, manuallyEdited = false) else it }
+                )
+            }
+            persistSavedListAsync(nextSavedSnapshot)
+            toast("已恢复 ${targets.size} 项为先前数值")
         }
-        toast("已恢复 ${targets.size} 项为先前数值")
     }
 
     fun loadCheckedAsResults() {
@@ -2023,7 +2433,7 @@ object Session {
                 rawResults = clean,
                 results = clean,
                 totalCount = clean.size.toLong(),
-                selectedCount = 0,
+                searchSelection = SelectionState.EMPTY,
                 hintVisible = false,
                 tab = NextTab.SEARCH_LIST
             )
@@ -2043,60 +2453,105 @@ object Session {
                 rawResults = changed,
                 results = filterList(changed, it.filter),
                 totalCount = changed.size.toLong(),
-                selectedCount = 0
+                searchSelection = SelectionState.EMPTY
             )
         }
         toast("已保留 ${changed.size} 个有变化的结果")
     }
 
     fun removeChecked(all: Boolean = false, revertFirst: Boolean = false) {
-        if (revertFirst) {
-            revertChecked()
+        val stNow = _ui.value
+        val targets = if (all) {
+            when (stNow.tab) {
+                NextTab.SAVED_LIST -> stNow.saved
+                NextTab.MEMORY -> stNow.memoryRows
+                else -> stNow.results
+            }
+        } else {
+            checkedItems()
         }
-        if (all) {
-            when (_ui.value.tab) {
+        scope.launch {
+            if (revertFirst && targets.isNotEmpty()) {
+                withContext(Dispatchers.IO) {
+                    targets.forEach { engine.write(it.address, it.size, it.previousValue) }
+                }
+            }
+            if (all) {
+                when (stNow.tab) {
+                    NextTab.SAVED_LIST -> {
+                        val toUnlock = _ui.value.saved.filter { it.freeze }
+                        withContext(Dispatchers.IO) {
+                            toUnlock.forEach { engine.setFreeze(it.address, it.flags, it.value, false) }
+                        }
+                        syncFrozenSnapshot(emptyList())
+                        persistSavedListAsync(emptyList())
+                        _ui.update { it.copy(saved = emptyList(), savedSelection = SelectionState.EMPTY, sheetStack = emptyList()) }
+                    }
+                    NextTab.MEMORY -> _ui.update { it.copy(memoryRows = emptyList(), memorySelection = SelectionState.EMPTY, sheetStack = emptyList()) }
+                    else -> {
+                        clearResults()
+                        closeAllSheets()
+                    }
+                }
+                return@launch
+            }
+
+            when (stNow.tab) {
                 NextTab.SAVED_LIST -> {
-                    _ui.value.saved.forEach { if (it.freeze) engine.setFreeze(it.address, it.flags, it.value, false) }
-                    syncFrozenSnapshot(emptyList())
-                    _ui.update { it.copy(saved = emptyList()) }
+                    val removeKeys = targets.mapTo(HashSet()) { SelectionState.itemKey(it) }
+                    val toUnlock = targets.filter { it.freeze }
+                    withContext(Dispatchers.IO) {
+                        toUnlock.forEach { engine.setFreeze(it.address, it.flags, it.value, false) }
+                    }
+                    var nextSavedSnapshot: List<MemoryItem> = emptyList()
+                    _ui.update { s ->
+                        val nextSaved = s.saved.filterNot { SelectionState.itemKey(it) in removeKeys }
+                        nextSavedSnapshot = nextSaved
+                        syncFrozenSnapshot(nextSaved)
+                        s.copy(saved = nextSaved, savedSelection = SelectionState.EMPTY, sheetStack = emptyList())
+                    }
+                    persistSavedListAsync(nextSavedSnapshot)
                 }
-                NextTab.MEMORY -> _ui.update { it.copy(memoryRows = emptyList()) }
-                else -> clearResults()
+                NextTab.MEMORY -> {
+                    val removeAddrs = targets.mapTo(HashSet()) { it.address }
+                    _ui.update { s ->
+                        s.copy(
+                            memoryRows = s.memoryRows.filterNot { it.address in removeAddrs },
+                            memorySelection = SelectionState.EMPTY,
+                            sheetStack = emptyList()
+                        )
+                    }
+                }
+                else -> {
+                    val removedAddrs = targets.mapTo(HashSet()) { it.address }
+                    val removeKeys = targets.mapTo(HashSet()) { SelectionState.itemKey(it) }
+                    if (removedAddrs.isNotEmpty()) {
+                        withContext(Dispatchers.IO) { engine.markRemoved(removedAddrs) }
+                    }
+                    _ui.update { s ->
+                        val nextRaw = s.rawResults.filterNot { SelectionState.itemKey(it) in removeKeys || it.address in removedAddrs }
+                        val nextRes = filterList(nextRaw, s.filter)
+                        val nextTotal = (s.totalCount - removedAddrs.size).coerceAtLeast(nextRaw.size.toLong())
+                        s.copy(
+                            rawResults = nextRaw,
+                            results = nextRes,
+                            totalCount = nextTotal,
+                            searchSelection = SelectionState.EMPTY,
+                            hintVisible = nextRes.isEmpty(),
+                            sheetStack = emptyList()
+                        )
+                    }
+                }
             }
-            _ui.update { it.copy(sheet = Sheet.NONE) }
-            recount()
-            return
         }
-        when (_ui.value.tab) {
-            NextTab.SAVED_LIST -> _ui.update { s ->
-                s.saved.forEach { if (it.checked && it.freeze) engine.setFreeze(it.address, it.flags, it.value, false) }
-                val nextSaved = s.saved.filterNot { it.checked }
-                syncFrozenSnapshot(nextSaved)
-                s.copy(saved = nextSaved)
-            }
-            NextTab.MEMORY -> _ui.update { s -> s.copy(memoryRows = s.memoryRows.filterNot { it.checked }) }
-            else -> {
-                val removedAddrs = _ui.value.results.filter { it.checked }.map { it.address }.toHashSet()
-                if (removedAddrs.isNotEmpty()) {
-                    engine.markRemoved(removedAddrs)
-                }
-                _ui.update { s ->
-                    val nextRaw = s.rawResults.filterNot { it.checked || it.address in removedAddrs }
-                    val nextRes = filterList(nextRaw, s.filter)
-                    val nextTotal = (s.totalCount - removedAddrs.size).coerceAtLeast(nextRaw.size.toLong())
-                    s.copy(
-                        rawResults = nextRaw,
-                        results = nextRes,
-                        totalCount = nextTotal,
-                        hintVisible = nextRes.isEmpty()
-                    )
-                }
-            }
-        }
-        _ui.update { it.copy(sheet = Sheet.NONE) }
-        recount()
     }
 
+    /**
+     * 模块 1 & 模块 2：全异步批量编辑：
+     * - 所有 `engine.write` / `engine.setFreeze` 均在 `Dispatchers.IO` 执行，零主线程阻塞；
+     * - 完整支持 4 种冻结模式 (`0=正常`, `1=递增`, `2=递减`, `3=范围钳制` + `freezeFrom`/`freezeTo`)；
+     * - 若条目由加密/XOR 搜索命中 (`xorKey`/`xorOffset`/`encryptedAuto`)，自动按原编码方式重编码写回！
+     */
     fun batchEdit(
         targets: List<MemoryItem>,
         rawInput: String,
@@ -2105,334 +2560,475 @@ object Session {
         addNotReplace: Boolean = false,
         freeze: Boolean = false,
         freezeType: Int = 0,
-        customNote: String? = null
+        freezeFromRaw: String = "",
+        freezeToRaw: String = "",
+        customNote: String? = null,
+        onComplete: ((Boolean) -> Unit)? = null
     ): Boolean {
         if (targets.isEmpty()) {
             toast("没有可修改的项目")
+            onComplete?.invoke(false)
             return false
         }
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) {
             toast("请输入修改数值")
+            onComplete?.invoke(false)
             return false
         }
-        val cleanType = if (targetType and 0x7F == 0 || targetType == ValueType.AUTO) {
+        val cleanType = if ((targetType and 0x7F) == 0 || targetType == ValueType.AUTO) {
             targets.first().flags and 0x7F
         } else {
             targetType and 0x7F
         }
-
         val stepDouble = rawStep.trim().toDoubleOrNull() ?: 0.0
         val stepLong = rawStep.trim().toLongOrNull() ?: 0L
 
-        return try {
-            val updatedByAddr = HashMap<Long, MemoryItem>(targets.size * 4 / 3 + 16)
+        val isUtf8Text = trimmed.startsWith(":") || trimmed.startsWith("'")
+        val isUtf16Text = trimmed.startsWith(";") || trimmed.startsWith("\"")
+        val isHexStream = (trimmed.startsWith("h ", true) || trimmed.startsWith("Q ", true)) && trimmed.length > 2
 
-            val isUtf8Text = trimmed.startsWith(":") || trimmed.startsWith("'")
-            val isUtf16Text = trimmed.startsWith(";") || trimmed.startsWith("\"")
-            val isHexStream = (trimmed.startsWith("h ", true) || trimmed.startsWith("Q ", true)) && trimmed.length > 2
-
-            if (isUtf8Text || isUtf16Text) {
-                val body = trimmed.substring(1).trimEnd('\'', '"')
-                val bytes = if (isUtf16Text) body.toByteArray(Charsets.UTF_16LE) else body.toByteArray(Charsets.UTF_8)
-                targets.forEachIndexed { idx, item ->
-                    val bValue = if (isUtf16Text && cleanType == ValueType.WORD) {
-                        val b0 = bytes.getOrNull(idx * 2)?.toLong()?.and(0xFF) ?: 0L
-                        val b1 = bytes.getOrNull(idx * 2 + 1)?.toLong()?.and(0xFF) ?: 0L
-                        b0 or (b1 shl 8)
-                    } else {
-                        bytes.getOrNull(idx)?.toLong()?.and(0xFF) ?: 0L
-                    }
-                    engine.write(item.address, ValueType.sizeOf(cleanType), bValue)
-                    updatedByAddr[item.address] = item.copy(
-                        value = bValue,
-                        flags = cleanType,
-                        freeze = if (freeze) true else item.freeze,
-                        freezeType = if (freeze) freezeType else item.freezeType,
-                        previousValue = item.value,
-                        manuallyEdited = true,
-                        note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
-                    )
-                }
-            } else if (isHexStream) {
-                val hexTokens = trimmed.substring(2).trim()
-                    .split(Regex("\\s+"))
-                    .mapNotNull { tok -> tok.toIntOrNull(16)?.toByte() }
-                targets.forEachIndexed { idx, item ->
-                    val v = hexTokens.getOrNull(idx)?.toLong()?.and(0xFF) ?: item.value
-                    engine.write(item.address, ValueType.sizeOf(cleanType), v)
-                    updatedByAddr[item.address] = item.copy(
-                        value = v,
-                        flags = cleanType,
-                        freeze = if (freeze) true else item.freeze,
-                        freezeType = if (freeze) freezeType else item.freezeType,
-                        previousValue = item.value,
-                        manuallyEdited = true,
-                        note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
-                    )
-                }
-            } else {
+        val parsedParts: List<Long>
+        val parsedFreezeFrom: Long
+        val parsedFreezeTo: Long
+        try {
+            parsedParts = if (!isUtf8Text && !isUtf16Text && !isHexStream) {
                 val parts = if (trimmed.contains(';')) {
                     trimmed.split(';').map { it.trim() }.filter { it.isNotEmpty() }
                 } else {
                     listOf(trimmed)
                 }
                 if (parts.isEmpty()) throw NumberParser.ParseException("修改值无效")
+                parts.map { NumberParser.parseNumber(it, cleanType).first }
+            } else emptyList()
 
-                targets.forEachIndexed { idx, item ->
-                    val partRaw = parts[idx % parts.size]
-                    val parsedBase = NumberParser.parseNumber(partRaw, cleanType).first
-                    val finalBits = when (cleanType) {
-                        ValueType.FLOAT -> {
-                            val baseF = Float.fromBits(parsedBase.toInt())
-                            val curF = Float.fromBits(item.value.toInt())
-                            val nextF = (if (addNotReplace) curF + baseF else baseF) + (idx * stepDouble).toFloat()
-                            nextF.toRawBits().toLong() and 0xFFFFFFFFL
+            parsedFreezeFrom = if (freeze && freezeType == 3 && freezeFromRaw.isNotBlank()) {
+                NumberParser.parseNumber(freezeFromRaw.trim(), cleanType).first
+            } else 0L
+            parsedFreezeTo = if (freeze && freezeType == 3 && freezeToRaw.isNotBlank()) {
+                NumberParser.parseNumber(freezeToRaw.trim(), cleanType).first
+            } else 0L
+        } catch (e: NumberParser.ParseException) {
+            toast(e.message ?: "输入格式错误")
+            onComplete?.invoke(false)
+            return false
+        }
+
+        scope.launch {
+            _ui.update { it.copy(isBatchBusy = true) }
+            val updatedByAddr = withContext(Dispatchers.IO) {
+                val map = HashMap<Long, MemoryItem>(targets.size * 4 / 3 + 16)
+                val itemSize = ValueType.sizeOf(cleanType)
+
+                fun reencodeIfEncrypted(item: MemoryItem, plainBits: Long): Long {
+                    return when {
+                        item.xorOffset != 0 -> {
+                            val key = engine.read(item.address + item.xorOffset, itemSize)
+                            plainBits xor key
                         }
-                        ValueType.DOUBLE -> {
-                            val baseD = Double.fromBits(parsedBase)
-                            val curD = Double.fromBits(item.value)
-                            val nextD = (if (addNotReplace) curD + baseD else baseD) + (idx * stepDouble)
-                            nextD.toRawBits()
+                        item.xorKey != 0L -> plainBits xor item.xorKey
+                        item.encryptedAuto -> {
+                            val key = engine.read(item.address + itemSize, itemSize)
+                            plainBits xor key
                         }
-                        else -> {
-                            val curSigned = Formatter.signed(item.value, ValueType.sizeOf(cleanType))
-                            val baseSigned = Formatter.signed(parsedBase, ValueType.sizeOf(cleanType))
-                            (if (addNotReplace) curSigned + baseSigned else baseSigned) + (idx * stepLong)
-                        }
+                        else -> plainBits
                     }
-                    engine.write(item.address, ValueType.sizeOf(cleanType), finalBits)
-                    updatedByAddr[item.address] = item.copy(
-                        value = finalBits,
-                        flags = cleanType,
-                        freeze = if (freeze) true else item.freeze,
-                        freezeType = if (freeze) freezeType else item.freezeType,
-                        previousValue = item.value,
-                        manuallyEdited = true,
-                        note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
-                    )
                 }
+
+                if (isUtf8Text || isUtf16Text) {
+                    val body = trimmed.substring(1).trimEnd('\'', '"')
+                    val bytes = if (isUtf16Text) body.toByteArray(Charsets.UTF_16LE) else body.toByteArray(Charsets.UTF_8)
+                    targets.forEachIndexed { idx, item ->
+                        val bValue = if (isUtf16Text && cleanType == ValueType.WORD) {
+                            val b0 = bytes.getOrNull(idx * 2)?.toLong()?.and(0xFF) ?: 0L
+                            val b1 = bytes.getOrNull(idx * 2 + 1)?.toLong()?.and(0xFF) ?: 0L
+                            b0 or (b1 shl 8)
+                        } else {
+                            bytes.getOrNull(idx)?.toLong()?.and(0xFF) ?: 0L
+                        }
+                        engine.write(item.address, itemSize, bValue)
+                        map[item.address] = item.copy(
+                            value = bValue,
+                            flags = cleanType,
+                            freeze = if (freeze) true else item.freeze,
+                            freezeType = if (freeze) freezeType else item.freezeType,
+                            freezeFrom = if (freeze && freezeType == 3) parsedFreezeFrom else item.freezeFrom,
+                            freezeTo = if (freeze && freezeType == 3) parsedFreezeTo else item.freezeTo,
+                            previousValue = item.value,
+                            manuallyEdited = true,
+                            note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
+                        )
+                    }
+                } else if (isHexStream) {
+                    val hexTokens = trimmed.substring(2).trim()
+                        .split(Regex("\\s+"))
+                        .mapNotNull { tok -> tok.toIntOrNull(16)?.toByte() }
+                    targets.forEachIndexed { idx, item ->
+                        val v = hexTokens.getOrNull(idx)?.toLong()?.and(0xFF) ?: item.value
+                        engine.write(item.address, itemSize, v)
+                        map[item.address] = item.copy(
+                            value = v,
+                            flags = cleanType,
+                            freeze = if (freeze) true else item.freeze,
+                            freezeType = if (freeze) freezeType else item.freezeType,
+                            freezeFrom = if (freeze && freezeType == 3) parsedFreezeFrom else item.freezeFrom,
+                            freezeTo = if (freeze && freezeType == 3) parsedFreezeTo else item.freezeTo,
+                            previousValue = item.value,
+                            manuallyEdited = true,
+                            note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
+                        )
+                    }
+                } else {
+                    targets.forEachIndexed { idx, item ->
+                        val parsedBase = parsedParts[idx % parsedParts.size]
+                        val plainCur = when {
+                            item.xorOffset != 0 -> item.value xor engine.read(item.address + item.xorOffset, itemSize)
+                            item.xorKey != 0L -> item.value xor item.xorKey
+                            item.encryptedAuto -> item.value xor engine.read(item.address + itemSize, itemSize)
+                            else -> item.value
+                        }
+                        val plainNextBits = when (cleanType) {
+                            ValueType.FLOAT -> {
+                                val baseF = Float.fromBits(parsedBase.toInt())
+                                val curF = Float.fromBits(plainCur.toInt())
+                                val nextF = (if (addNotReplace) curF + baseF else baseF) + (idx * stepDouble).toFloat()
+                                nextF.toRawBits().toLong() and 0xFFFFFFFFL
+                            }
+                            ValueType.DOUBLE -> {
+                                val baseD = Double.fromBits(parsedBase)
+                                val curD = Double.fromBits(plainCur)
+                                val nextD = (if (addNotReplace) curD + baseD else baseD) + (idx * stepDouble)
+                                nextD.toRawBits()
+                            }
+                            else -> {
+                                val curSigned = Formatter.signed(plainCur, itemSize)
+                                val baseSigned = Formatter.signed(parsedBase, itemSize)
+                                (if (addNotReplace) curSigned + baseSigned else baseSigned) + (idx * stepLong)
+                            }
+                        }
+                        val encodedBits = reencodeIfEncrypted(item, plainNextBits)
+                        engine.write(item.address, itemSize, encodedBits)
+                        val edited = item.copy(
+                            value = encodedBits,
+                            flags = cleanType,
+                            freeze = if (freeze) true else item.freeze,
+                            freezeType = if (freeze) freezeType else item.freezeType,
+                            freezeFrom = if (freeze && freezeType == 3) parsedFreezeFrom else item.freezeFrom,
+                            freezeTo = if (freeze && freezeType == 3) parsedFreezeTo else item.freezeTo,
+                            previousValue = item.value,
+                            manuallyEdited = true,
+                            note = if (customNote != null && customNote.isNotBlank()) customNote else item.note
+                        )
+                        if (edited.freeze) {
+                            engine.setFreeze(
+                                address = edited.address,
+                                flags = edited.flags,
+                                value = edited.value,
+                                enabled = true,
+                                freezeType = edited.freezeType,
+                                freezeFrom = edited.freezeFrom,
+                                freezeTo = edited.freezeTo
+                            )
+                        }
+                        map[item.address] = edited
+                    }
+                }
+                map
             }
 
+            if (historyStore.add(trimmed)) {
+                persistSearchHistoryAsync()
+            }
+
+            var nextSavedSnapshot: List<MemoryItem> = emptyList()
             _ui.update { st ->
                 val savedByAddr = LinkedHashMap<Long, MemoryItem>((st.saved.size + updatedByAddr.size) * 4 / 3 + 16)
                 for (sItem in st.saved) {
                     savedByAddr[sItem.address] = sItem
                 }
                 updatedByAddr.values.forEach { edited ->
-                    if (edited.freeze) {
-                        engine.setFreeze(
-                            address = edited.address,
-                            flags = edited.flags,
-                            value = edited.value,
-                            enabled = true,
-                            freezeType = edited.freezeType,
-                            freezeFrom = edited.freezeFrom,
-                            freezeTo = edited.freezeTo
-                        )
-                    }
                     val existing = savedByAddr[edited.address]
                     if (existing != null) {
-                        savedByAddr[edited.address] = edited.copy(checked = existing.checked)
+                        savedByAddr[edited.address] = edited
                     } else if (freeze || (customNote != null && customNote.isNotBlank())) {
-                        savedByAddr[edited.address] = edited.copy(checked = false)
+                        savedByAddr[edited.address] = edited
                     }
                 }
                 val nextSaved = ArrayList<MemoryItem>(savedByAddr.values)
+                nextSavedSnapshot = nextSaved
                 syncFrozenSnapshot(nextSaved)
                 st.copy(
+                    isBatchBusy = false,
                     rawResults = st.rawResults.map { updatedByAddr[it.address] ?: it },
                     results = st.results.map { updatedByAddr[it.address] ?: it },
                     saved = nextSaved,
                     memoryRows = st.memoryRows.map { updatedByAddr[it.address] ?: it },
                     lastBatchEditValue = trimmed,
-                    lastBatchEditStep = rawStep.trim()
+                    lastBatchEditStep = rawStep.trim(),
+                    history = historyStore.list()
                 )
             }
-            historyStore.add(trimmed)
-            _ui.update { it.copy(history = historyStore.list()) }
+            persistSavedListAsync(nextSavedSnapshot)
             toast(if (targets.size == 1) "已修改地址 ${targets.first().cachedAddressHex}" else "已批量修改 ${targets.size} 项")
-            true
-        } catch (e: NumberParser.ParseException) {
-            toast(e.message ?: "输入格式错误")
-            false
+            onComplete?.invoke(true)
         }
+        return true
     }
 
     fun editValue(item: MemoryItem, raw: String): Boolean =
         batchEdit(listOf(item), raw, item.flags)
 
     fun changeType(item: MemoryItem, type: Int) {
-        _ui.update { s ->
-            val nextSaved = s.saved.map { if (it.address == item.address) it.copy(flags = type) else it }
-            syncFrozenSnapshot(nextSaved)
-            s.copy(
-                rawResults = s.rawResults.map { if (it.address == item.address) it.copy(flags = type) else it },
-                results = s.results.map { if (it.address == item.address) it.copy(flags = type) else it },
-                saved = nextSaved,
-                memoryRows = s.memoryRows.map { if (it.address == item.address) it.copy(flags = type) else it }
-            )
-        }
-        _ui.update { it.copy(sheet = Sheet.NONE) }
+        batchChangeType(listOf(item), type)
     }
 
-    /** 更改条目的内存地址与数据类型，并实时读取新地址处的内存数值 */
+    /**
+     * 模块 2：多选地址批量更改数据类型（全异步 Dispatchers.IO）：
+     * 1. 按新类型位宽通过 `engine.batchReadRawValues` 批量重读实时值；
+     * 2. 重新计算指针分类；
+     * 3. 对已冻结条目按新类型与位宽重新注册底层 `ValueLocker` 锁值；
+     * 4. 原子更新搜索列表、保存列表、内存页并持久化保存列表。
+     */
+    fun batchChangeType(targets: List<MemoryItem>, newType: Int) {
+        val cleanType = newType and 0x7F
+        if (targets.isEmpty() || cleanType == 0 || cleanType == ValueType.AUTO) {
+            toast("没有可修改的项目")
+            return
+        }
+        val newSize = ValueType.sizeOf(cleanType).coerceIn(1, 8)
+        scope.launch {
+            _ui.update { it.copy(isBatchBusy = true) }
+            val updatedByOldKey = withContext(Dispatchers.IO) {
+                val readPairs = targets.map { it.address to newSize }.distinctBy { it.first }
+                val liveVals = engine.batchReadRawValues(readPairs)
+                val out = HashMap<Long, MemoryItem>(targets.size * 4 / 3 + 8)
+                for (item in targets) {
+                    val freshVal = liveVals[item.address] ?: engine.read(item.address, newSize)
+                    val ptrKind = engine.classifyPointer(freshVal)
+                    val updated = item.copy(
+                        value = freshVal,
+                        previousValue = freshVal,
+                        flags = cleanType,
+                        pointer = ptrKind
+                    )
+                    if (updated.freeze) {
+                        engine.setFreeze(
+                            address = updated.address,
+                            flags = cleanType,
+                            value = freshVal,
+                            enabled = true,
+                            freezeType = updated.freezeType,
+                            freezeFrom = updated.freezeFrom,
+                            freezeTo = updated.freezeTo
+                        )
+                    }
+                    out[SelectionState.itemKey(item)] = updated
+                }
+                out
+            }
+
+            val updatedByAddr = HashMap<Long, MemoryItem>(updatedByOldKey.size * 2)
+            updatedByOldKey.values.forEach { updatedByAddr[it.address] = it }
+
+            var nextSavedSnapshot: List<MemoryItem> = emptyList()
+            _ui.update { s ->
+                fun remap(list: List<MemoryItem>): List<MemoryItem> = list.map { cur ->
+                    updatedByOldKey[SelectionState.itemKey(cur)]
+                        ?: updatedByAddr[cur.address]?.takeIf { targets.any { t -> sameItemKey(t, cur) } }
+                        ?: cur
+                }
+                val nextSaved = remap(s.saved)
+                nextSavedSnapshot = nextSaved
+                syncFrozenSnapshot(nextSaved)
+                val nextRaw = remap(s.rawResults)
+                val nextRes = remap(s.results)
+                val nextMem = s.memoryRows.map { row ->
+                    val upd = updatedByAddr[row.address]
+                    if (upd != null) row.copy(flags = cleanType, value = upd.value, pointer = upd.pointer) else row
+                }
+                s.copy(
+                    isBatchBusy = false,
+                    rawResults = nextRaw,
+                    results = nextRes,
+                    saved = nextSaved,
+                    memoryRows = nextMem,
+                    searchSelection = SelectionState.EMPTY,
+                    savedSelection = SelectionState.EMPTY,
+                    memorySelection = SelectionState.EMPTY,
+                    sheetStack = emptyList()
+                )
+            }
+            persistSavedListAsync(nextSavedSnapshot)
+            toast("已批量更改 ${targets.size} 项的类型为 ${ValueType.nameOf(cleanType)}")
+        }
+    }
+
+    /** 异步更改单个条目的地址与类型 */
     fun changeAddress(item: MemoryItem, newAddress: Long, newType: Int = item.flags) {
         val cleanType = if (newType == 0) item.flags else newType
         val size = ValueType.sizeOf(cleanType)
-        val liveVal = engine.read(newAddress, size)
-        val regCode = engine.regionCodeAt(newAddress)
-        val updated = item.copy(
-            address = newAddress,
-            value = liveVal,
-            previousValue = liveVal,
-            flags = cleanType,
-            region = regCode,
-            pointer = engine.classifyPointer(liveVal)
-        )
-        _ui.update { s ->
-            val nextSaved = s.saved.map { if (it.address == item.address) updated else it }.distinctBy { it.address }
-            syncFrozenSnapshot(nextSaved)
-            s.copy(
-                rawResults = s.rawResults.map { if (it.address == item.address) updated else it }.distinctBy { it.address },
-                results = s.results.map { if (it.address == item.address) updated else it }.distinctBy { it.address },
-                saved = nextSaved,
-                memoryRows = s.memoryRows.map { if (it.address == item.address) updated else it }.distinctBy { it.address },
-                sheet = Sheet.NONE
-            )
+        scope.launch {
+            _ui.update { it.copy(isBatchBusy = true) }
+            val updated = withContext(Dispatchers.IO) {
+                if (item.freeze && item.address != newAddress) {
+                    engine.setFreeze(item.address, item.flags, item.value, false)
+                }
+                val liveVal = engine.read(newAddress, size)
+                val regCode = engine.regionCodeAt(newAddress)
+                val next = item.copy(
+                    address = newAddress,
+                    value = liveVal,
+                    previousValue = liveVal,
+                    flags = cleanType,
+                    region = regCode,
+                    pointer = engine.classifyPointer(liveVal)
+                )
+                if (next.freeze) {
+                    engine.setFreeze(newAddress, cleanType, liveVal, true, next.freezeType, next.freezeFrom, next.freezeTo)
+                }
+                next
+            }
+            var nextSavedSnapshot: List<MemoryItem> = emptyList()
+            _ui.update { s ->
+                val nextSaved = s.saved.map { if (sameItemKey(it, item)) updated else it }.distinctBy { SelectionState.itemKey(it) }
+                nextSavedSnapshot = nextSaved
+                syncFrozenSnapshot(nextSaved)
+                s.copy(
+                    isBatchBusy = false,
+                    rawResults = s.rawResults.map { if (sameItemKey(it, item)) updated else it }.distinctBy { SelectionState.itemKey(it) },
+                    results = s.results.map { if (sameItemKey(it, item)) updated else it }.distinctBy { SelectionState.itemKey(it) },
+                    saved = nextSaved,
+                    memoryRows = s.memoryRows.map { if (it.address == item.address) updated else it }.distinctBy { it.address },
+                    sheetStack = emptyList()
+                )
+            }
+            persistSavedListAsync(nextSavedSnapshot)
+            toast("已更新地址为 ${updated.cachedAddressHex}")
         }
-        toast("已更新地址为 ${updated.cachedAddressHex}")
     }
 
-    /** 保存或载入保存列表文件 (.txt) */
-    fun saveOrLoadListFile(path: String): Boolean {
+    // ============ 模块 2：分离只读载入与只写保存列表文件（全异步 IO） ============
+
+    /** 只读载入保存列表文件（绝不覆盖目标文件！） */
+    fun loadListFromFile(path: String) {
         val clean = path.trim()
         if (clean.isEmpty()) {
             toast("请输入有效的文件路径")
-            return false
+            return
         }
         setSetting("file_manager_path", clean)
-        val file = java.io.File(clean)
-        val st = _ui.value
-        return try {
-            if (st.saved.isNotEmpty() || !file.exists()) {
-                file.parentFile?.mkdirs()
-                val lines = st.saved.map { item ->
-                    "${item.cachedAddressHex}|${item.value}|${item.flags}|${item.region}|${if (item.freeze) 1 else 0}|${item.freezeType}|${item.name.replace('|', ' ')}|${item.note.replace('|', ' ')}"
-                }
-                file.writeText(lines.joinToString("\n"))
-                _ui.update { it.copy(fileManagerPath = clean, sheet = Sheet.NONE) }
-                toast("已保存 ${lines.size} 项到 ${file.name}")
-                true
-            } else {
-                val loaded = file.readLines().mapNotNull { line ->
-                    val parts = line.trim().split('|')
-                    if (parts.size < 3) return@mapNotNull null
-                    val addr = parts[0].removePrefix("0x").toULongOrNull(16)?.toLong() ?: return@mapNotNull null
-                    val v = parts[1].toLongOrNull() ?: 0L
-                    val flags = parts[2].toIntOrNull() ?: ValueType.DWORD
-                    val reg = parts.getOrNull(3)?.ifEmpty { "Ca" } ?: "Ca"
-                    val frz = parts.getOrNull(4) == "1"
-                    val frzType = parts.getOrNull(5)?.toIntOrNull() ?: 0
-                    val name = parts.getOrNull(6).orEmpty()
-                    val note = parts.getOrNull(7).orEmpty()
-                    val item = MemoryItem(
-                        address = addr,
-                        value = v,
-                        previousValue = v,
-                        flags = flags,
-                        region = reg,
-                        freeze = frz,
-                        freezeType = frzType,
-                        name = name,
-                        note = note
-                    )
-                    if (frz) {
-                        engine.setFreeze(addr, flags, v, true, frzType, item.freezeFrom, item.freezeTo)
+        scope.launch {
+            _ui.update { it.copy(isBatchBusy = true) }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val file = File(clean)
+                    if (!file.exists()) {
+                        return@runCatching Result.failure<Pair<String, List<MemoryItem>>>(IllegalStateException("文件不存在"))
                     }
-                    item
-                }.distinctBy { it.address }
-                syncFrozenSnapshot(loaded)
-                _ui.update { it.copy(saved = loaded, fileManagerPath = clean, sheet = Sheet.NONE, tab = NextTab.SAVED_LIST) }
-                toast("已从 ${file.name} 载入 ${loaded.size} 项")
-                true
+                    val content = file.readText()
+                    val loaded = SavedListFileCodec.parseFromText(content)
+                    if (loaded.isEmpty()) {
+                        return@runCatching Result.failure<Pair<String, List<MemoryItem>>>(IllegalStateException("文件中没有可载入的有效条目"))
+                    }
+                    loaded.forEach { item ->
+                        if (item.freeze) {
+                            engine.setFreeze(item.address, item.flags, item.value, true, item.freezeType, item.freezeFrom, item.freezeTo)
+                        }
+                    }
+                    Result.success(file.name to loaded)
+                }.getOrElse { Result.failure(it) }
             }
-        } catch (t: Throwable) {
-            toast("文件读写失败: ${t.message}")
-            false
+            _ui.update { it.copy(isBatchBusy = false) }
+            result.onSuccess { (fileName, loaded) ->
+                syncFrozenSnapshot(loaded)
+                persistSavedListAsync(loaded)
+                _ui.update {
+                    it.copy(
+                        saved = loaded,
+                        savedSelection = SelectionState.EMPTY,
+                        fileManagerPath = clean,
+                        sheetStack = emptyList(),
+                        tab = NextTab.SAVED_LIST
+                    )
+                }
+                toast("已从 $fileName 载入 ${loaded.size} 项")
+            }.onFailure { err ->
+                val msg = err.message ?: "未知错误"
+                if (msg == "文件不存在" || msg == "文件中没有可载入的有效条目") {
+                    toast(msg)
+                } else {
+                    toast("文件读写失败: $msg")
+                }
+            }
+        }
+    }
+
+    /** 只写保存列表到文件（`onlyChecked = true` 用于导出选中项） */
+    fun saveListToFile(path: String, onlyChecked: Boolean = false) {
+        val clean = path.trim()
+        if (clean.isEmpty()) {
+            toast("请输入有效的文件路径")
+            return
+        }
+        val itemsToWrite = if (onlyChecked) {
+            checkedItems().ifEmpty { _ui.value.saved }
+        } else {
+            _ui.value.saved
+        }
+        if (itemsToWrite.isEmpty()) {
+            toast("保存列表为空，无可保存项目")
+            return
+        }
+        setSetting("file_manager_path", clean)
+        scope.launch {
+            _ui.update { it.copy(isBatchBusy = true) }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val file = File(clean)
+                    file.parentFile?.mkdirs()
+                    file.writeText(SavedListFileCodec.formatToText(itemsToWrite))
+                    file.name
+                }
+            }
+            _ui.update { it.copy(isBatchBusy = false) }
+            result.onSuccess { fileName ->
+                _ui.update { it.copy(fileManagerPath = clean, sheetStack = emptyList()) }
+                toast("已保存 ${itemsToWrite.size} 项到 $fileName")
+            }.onFailure { err ->
+                toast("文件读写失败: ${err.message}")
+            }
         }
     }
 
     fun setValueMask(mask: Int, forSaved: Boolean) {
-        repo?.let { r -> scope.launch { if (forSaved) r.setSavedFormatMask(mask) else r.setValueFormatMask(mask) } }
+        repo?.let { r -> scope.launch(Dispatchers.IO) { if (forSaved) r.setSavedFormatMask(mask) else r.setValueFormatMask(mask) } }
         _ui.update { if (forSaved) it.copy(valueMaskSaved = mask) else it.copy(valueMask = mask) }
     }
 
-    // ============ 改进7 / 9 / 10：内存浏览（4KB 单页 + 跳转专属高亮 + 指针类型着色） ============
+    // ============ 内存浏览（4KB 单页 + 跳转高亮 + 持久化历史） ============
 
     fun goto(address: Long, recordHistory: Boolean = true, highlightTarget: Boolean = true) {
         scope.launch {
             val prevBase = _ui.value.memoryBase
             _ui.update { it.copy(busy = true, busyText = "读取内存页") }
             val targetAligned = address and -4L
-            // 若是用户主动跳转到某地址，让页面起始地址略微提前 3 行，使被跳转地址处于视图上方显眼位置（如图3）
             val pageBase = if (highlightTarget && targetAligned >= 12L) {
                 (targetAligned - 12L) and -4L
             } else {
                 targetAligned
             }
-            val rows = withContext(Dispatchers.IO) {
-                val count = MEMORY_PAGE_ROWS // 1024 行 * 4 字节 = 4096 字节 (4KB)
-                val block = engine.readBlock(pageBase, MEMORY_PAGE_BYTES)
-                val candidatePtrs = LongArray(count) { r ->
-                    val off = (r and -2) * 4
-                    if (engine.x64 && off + 8 <= block.size) {
-                        (block[off].toLong() and 0xFF) or
-                            ((block[off + 1].toLong() and 0xFF) shl 8) or
-                            ((block[off + 2].toLong() and 0xFF) shl 16) or
-                            ((block[off + 3].toLong() and 0xFF) shl 24) or
-                            ((block[off + 4].toLong() and 0xFF) shl 32) or
-                            ((block[off + 5].toLong() and 0xFF) shl 40) or
-                            ((block[off + 6].toLong() and 0xFF) shl 48) or
-                            ((block[off + 7].toLong() and 0xFF) shl 56)
-                    } else if (off + 4 <= block.size) {
-                        (block[off].toLong() and 0xFF) or
-                            ((block[off + 1].toLong() and 0xFF) shl 8) or
-                            ((block[off + 2].toLong() and 0xFF) shl 16) or
-                            ((block[off + 3].toLong() and 0xFF) shl 24)
-                    } else 0L
-                }
-                val classifiedPtrs = engine.classifyPointers(candidatePtrs)
-                val out = ArrayList<MemoryItem>(count)
-                for (r in 0 until count) {
-                    val off = r * 4
-                    val rowAddr = pageBase + r * 4L
-                    val v = if (off + 4 <= block.size) {
-                        (block[off].toLong() and 0xFF) or
-                            ((block[off + 1].toLong() and 0xFF) shl 8) or
-                            ((block[off + 2].toLong() and 0xFF) shl 16) or
-                            ((block[off + 3].toLong() and 0xFF) shl 24)
-                    } else 0L
-                    val ptrType = classifiedPtrs[r]
-                    out.add(
-                        MemoryItem(
-                            address = rowAddr,
-                            value = v,
-                            flags = ValueType.DWORD,
-                            region = engine.regionCodeAt(rowAddr),
-                            pointer = ptrType
-                        )
-                    )
-                }
-                out
-            }
+            val rows = withContext(Dispatchers.IO) { readMemoryPageRows(pageBase) }
+            val targetHex = java.lang.Long.toHexString(address).uppercase()
+            var updatedGotoHist: List<String>? = null
+            val limit = currentHistoryLimit()
             _ui.update {
                 val nextBack = if (recordHistory && prevBase != pageBase && prevBase != 0L) {
                     (it.memoryHistoryBack + prevBase).takeLast(32)
                 } else it.memoryHistoryBack
-                val targetHex = java.lang.Long.toHexString(address).uppercase()
-                val nextGotoHist = if (highlightTarget && targetHex.isNotEmpty()) {
-                    (listOf(targetHex) + it.gotoHistory.filter { h -> h != targetHex }).take(20)
+                val nextGotoHist = if (highlightTarget && targetHex.isNotEmpty() && limit > 0) {
+                    (listOf(targetHex) + it.gotoHistory.filter { h -> h != targetHex }).take(limit.coerceAtMost(200)).also { list ->
+                        updatedGotoHist = list
+                    }
                 } else it.gotoHistory
                 it.copy(
                     memoryRows = rows,
@@ -2442,27 +3038,67 @@ object Session {
                     memoryScrollTrigger = it.memoryScrollTrigger + 1,
                     memoryHistoryBack = nextBack,
                     memoryHistoryForward = if (recordHistory) emptyList() else it.memoryHistoryForward,
-                    selectedCount = 0,
+                    memorySelection = SelectionState.EMPTY,
                     busy = false,
                     tab = NextTab.MEMORY,
-                    sheet = Sheet.NONE
+                    sheetStack = emptyList()
                 )
             }
+            updatedGotoHist?.let { persistGotoHistoryAsync(it) }
         }
     }
 
-    /** 改进9：点击内存页左上角地址时，自动定位并高亮该地址 */
+    private fun readMemoryPageRows(pageBase: Long): List<MemoryItem> {
+        val count = MEMORY_PAGE_ROWS
+        val block = engine.readBlock(pageBase, MEMORY_PAGE_BYTES)
+        val candidatePtrs = LongArray(count) { r ->
+            val off = (r and -2) * 4
+            if (engine.x64 && off + 8 <= block.size) {
+                (block[off].toLong() and 0xFF) or
+                    ((block[off + 1].toLong() and 0xFF) shl 8) or
+                    ((block[off + 2].toLong() and 0xFF) shl 16) or
+                    ((block[off + 3].toLong() and 0xFF) shl 24) or
+                    ((block[off + 4].toLong() and 0xFF) shl 32) or
+                    ((block[off + 5].toLong() and 0xFF) shl 40) or
+                    ((block[off + 6].toLong() and 0xFF) shl 48) or
+                    ((block[off + 7].toLong() and 0xFF) shl 56)
+            } else if (off + 4 <= block.size) {
+                (block[off].toLong() and 0xFF) or
+                    ((block[off + 1].toLong() and 0xFF) shl 8) or
+                    ((block[off + 2].toLong() and 0xFF) shl 16) or
+                    ((block[off + 3].toLong() and 0xFF) shl 24)
+            } else 0L
+        }
+        val classifiedPtrs = engine.classifyPointers(candidatePtrs)
+        val out = ArrayList<MemoryItem>(count)
+        for (r in 0 until count) {
+            val off = r * 4
+            val rowAddr = pageBase + r * 4L
+            val v = if (off + 4 <= block.size) {
+                (block[off].toLong() and 0xFF) or
+                    ((block[off + 1].toLong() and 0xFF) shl 8) or
+                    ((block[off + 2].toLong() and 0xFF) shl 16) or
+                    ((block[off + 3].toLong() and 0xFF) shl 24)
+            } else 0L
+            out.add(
+                MemoryItem(
+                    address = rowAddr,
+                    value = v,
+                    flags = ValueType.DWORD,
+                    region = engine.regionCodeAt(rowAddr),
+                    pointer = classifiedPtrs[r]
+                )
+            )
+        }
+        return out
+    }
+
     fun focusHighlightedMemoryAddress() {
         val st = _ui.value
         val target = st.memoryHighlightAddress ?: st.memoryBase
         goto(target, recordHistory = false, highlightTarget = true)
     }
 
-    /**
-     * 问题 3 修复：内存列表上下边界处的「转到此地址：xxxx」翻页跳转
-     * - 当向上翻页 (isUpward = true) 时，加载以 targetAligned 为末尾地址的 4KB 页，使 xxxx 位于新页底部并连续衔接；
-     * - 当向下翻页 (isUpward = false) 时，加载以 targetAligned 为起始地址的 4KB 页，使 xxxx 位于新页顶部并连续衔接。
-     */
     fun gotoBoundary(address: Long, isUpward: Boolean) {
         scope.launch {
             val prevBase = _ui.value.memoryBase
@@ -2472,56 +3108,11 @@ object Session {
                 val span = (MEMORY_PAGE_BYTES - 4).toLong()
                 if (java.lang.Long.compareUnsigned(targetAligned, span) >= 0) {
                     (targetAligned - span) and -4L
-                } else {
-                    0L
-                }
+                } else 0L
             } else {
                 targetAligned
             }
-            val rows = withContext(Dispatchers.IO) {
-                val count = MEMORY_PAGE_ROWS
-                val block = engine.readBlock(pageBase, MEMORY_PAGE_BYTES)
-                val candidatePtrs = LongArray(count) { r ->
-                    val off = (r and -2) * 4
-                    if (engine.x64 && off + 8 <= block.size) {
-                        (block[off].toLong() and 0xFF) or
-                            ((block[off + 1].toLong() and 0xFF) shl 8) or
-                            ((block[off + 2].toLong() and 0xFF) shl 16) or
-                            ((block[off + 3].toLong() and 0xFF) shl 24) or
-                            ((block[off + 4].toLong() and 0xFF) shl 32) or
-                            ((block[off + 5].toLong() and 0xFF) shl 40) or
-                            ((block[off + 6].toLong() and 0xFF) shl 48) or
-                            ((block[off + 7].toLong() and 0xFF) shl 56)
-                    } else if (off + 4 <= block.size) {
-                        (block[off].toLong() and 0xFF) or
-                            ((block[off + 1].toLong() and 0xFF) shl 8) or
-                            ((block[off + 2].toLong() and 0xFF) shl 16) or
-                            ((block[off + 3].toLong() and 0xFF) shl 24)
-                    } else 0L
-                }
-                val classifiedPtrs = engine.classifyPointers(candidatePtrs)
-                val out = ArrayList<MemoryItem>(count)
-                for (r in 0 until count) {
-                    val off = r * 4
-                    val rowAddr = pageBase + r * 4L
-                    val v = if (off + 4 <= block.size) {
-                        (block[off].toLong() and 0xFF) or
-                            ((block[off + 1].toLong() and 0xFF) shl 8) or
-                            ((block[off + 2].toLong() and 0xFF) shl 16) or
-                            ((block[off + 3].toLong() and 0xFF) shl 24)
-                    } else 0L
-                    out.add(
-                        MemoryItem(
-                            address = rowAddr,
-                            value = v,
-                            flags = ValueType.DWORD,
-                            region = engine.regionCodeAt(rowAddr),
-                            pointer = classifiedPtrs[r]
-                        )
-                    )
-                }
-                out
-            }
+            val rows = withContext(Dispatchers.IO) { readMemoryPageRows(pageBase) }
             _ui.update {
                 val nextBack = if (prevBase != pageBase && prevBase != 0L) {
                     (it.memoryHistoryBack + prevBase).takeLast(32)
@@ -2533,7 +3124,7 @@ object Session {
                     memoryScrollTrigger = it.memoryScrollTrigger + 1,
                     memoryHistoryBack = nextBack,
                     memoryHistoryForward = emptyList(),
-                    selectedCount = 0,
+                    memorySelection = SelectionState.EMPTY,
                     busy = false,
                     tab = NextTab.MEMORY
                 )
@@ -2578,7 +3169,7 @@ object Session {
         goto(next, recordHistory = false, highlightTarget = true)
     }
 
-    // ============ 改进11：分配内存页（支持可读/可写/可执行多选与指定地址） ============
+    // ============ 内存导出 & 诚实的内存页分配 ============
 
     fun dumpMemory(startAddr: Long, endAddr: Long, dirPath: String) {
         if (endAddr <= startAddr) {
@@ -2594,49 +3185,50 @@ object Session {
             val ok = withContext(Dispatchers.IO) {
                 engine.dumpMemory(startAddr, endAddr, fullPath)
             }
-            _ui.update { it.copy(busy = false, dumpDirPath = cleanDir, sheet = Sheet.NONE) }
+            _ui.update { it.copy(busy = false, dumpDirPath = cleanDir, sheetStack = emptyList()) }
             if (ok) {
                 toast("已导出内存区间到 $fullPath")
             } else {
-                toast("已生成导出记录：$fullPath")
+                toast("导出内存失败")
             }
         }
     }
 
+    /** 模块 2：诚实提示暂未实现跨进程 ptrace mmap 内存分配，绝不伪造成功并跳转 Ca/Ch */
     fun allocateMemoryPage(address: Long, read: Boolean, write: Boolean, exec: Boolean) {
-        val protParts = mutableListOf<String>()
-        if (read) protParts.add("R")
-        if (write) protParts.add("W")
-        if (exec) protParts.add("X")
-        val protDesc = if (protParts.isEmpty()) "NONE" else protParts.joinToString("")
-        val fallbackAddr = engine.firstRegionBase("Ca")?.takeIf { it != 0L }
-            ?: engine.firstRegionBase("Ch")?.takeIf { it != 0L }
-            ?: _ui.value.memoryBase
-        val allocatedAddr = if (address == 0L) fallbackAddr else (address and -4L)
-        val hexStr = "0x" + java.lang.Long.toHexString(allocatedAddr).uppercase()
-        AppLog.add("alloc", "allocatePage addr=$hexStr prot=$protDesc")
-        toast("已分配 4KB 内存页 [$protDesc]：$hexStr")
-        goto(allocatedAddr, recordHistory = true, highlightTarget = true)
+        toast("当前版本暂未实现跨进程内存分配")
     }
 
-    // ============ 历史 ============
+    // ============ 历史（完整持久化） ============
 
     fun clearHistory() {
         historyStore.clear()
-        _ui.update { it.copy(history = emptyList()) }
+        persistSearchHistoryAsync()
+        persistGotoHistoryAsync(emptyList())
+        _ui.update { it.copy(history = emptyList(), gotoHistory = emptyList()) }
         toast("已清空历史")
     }
 
     fun removeHistory(v: String) {
         historyStore.remove(v)
+        persistSearchHistoryAsync()
         _ui.update { it.copy(history = historyStore.list()) }
     }
 
-    fun pickHistory(v: String) = _ui.update {
-        val targetSheet = if (historyCallerSheet != Sheet.NONE && historyCallerSheet != Sheet.HISTORY) historyCallerSheet else Sheet.SEARCH
-        when (targetSheet) {
-            Sheet.EDITOR -> it.copy(lastBatchEditValue = v, sheet = Sheet.EDITOR)
-            else -> it.copy(search = it.search.copy(text = v), sheet = targetSheet)
+    fun toggleHistoryPin(v: String) {
+        historyStore.togglePin(v)
+        persistSearchHistoryAsync()
+        _ui.update { it.copy(history = historyStore.list()) }
+    }
+
+    fun isHistoryPinned(v: String): Boolean = historyStore.isPinned(v)
+
+    fun pickHistory(v: String) = _ui.update { st ->
+        val parentSheet = st.sheetStack.dropLast(1).lastOrNull() ?: Sheet.SEARCH
+        val nextStack = if (st.sheetStack.size > 1) st.sheetStack.dropLast(1) else listOf(parentSheet)
+        when (parentSheet) {
+            Sheet.EDITOR -> st.copy(lastBatchEditValue = v, sheetStack = nextStack)
+            else -> st.copy(search = st.search.copy(text = v), sheetStack = nextStack)
         }
     }
 
@@ -2646,7 +3238,7 @@ object Session {
         if (enabled) {
             setFloatingBallVisible(true)
             com.littlecodesauce.ggnext.service.OverlayManager.start(app)
-            toast("已启动悬浮球，短按打开面板，长按调节变速")
+            toast("已启动悬浮球，短按打开面板")
         } else {
             setFloatingBallVisible(false)
             setPanelVisible(false)
@@ -2691,11 +3283,11 @@ object Session {
             NextTab.MEMORY -> DEFAULT_TOOLS_MEMORY
             NextTab.SETTINGS -> emptyList()
         }
-        _ui.update { 
+        _ui.update {
             it.copy(
                 tools = it.tools + (tab to def),
                 pinnedTools = it.pinnedTools + (tab to DEFAULT_PINNED_TOOLS)
-            ) 
+            )
         }
         persistToolsForTab(tab, def)
         persistPinnedToolsForTab(tab, DEFAULT_PINNED_TOOLS)
@@ -2709,7 +3301,7 @@ object Session {
             list.add(id)
             _ui.update { it.copy(pinnedTools = it.pinnedTools + (tab to list)) }
             persistPinnedToolsForTab(tab, list)
-            toast("已将「${id.label}」固定到右侧工具栏")
+            toast("已将「${AppStrings.tr(id.label)}」固定到右侧工具栏")
         }
     }
 
@@ -2722,7 +3314,7 @@ object Session {
         if (list.remove(id)) {
             _ui.update { it.copy(pinnedTools = it.pinnedTools + (tab to list)) }
             persistPinnedToolsForTab(tab, list)
-            toast("已将「${id.label}」移回流动工具栏")
+            toast("已将「${AppStrings.tr(id.label)}」移回流动工具栏")
         }
     }
 
@@ -2735,38 +3327,51 @@ object Session {
         persistPinnedToolsForTab(tab, list)
     }
 
-    // 终止目标进程
+    /** 模块 1：终止目标进程全异步 IO，绝不阻塞主线程 */
     fun terminateTargetProcess() {
         val target = _ui.value.target ?: run {
             toast("未选择目标进程")
             return
         }
         val pid = target.pid
-        engine.detach()
-        if (com.littlecodesauce.ggnext.engine.Shell.hasRoot()) {
-            com.littlecodesauce.ggnext.engine.Shell.runAs("kill -9 $pid", asRoot = true)
-        } else {
-            try {
-                android.os.Process.killProcess(pid)
-            } catch (_: Throwable) {
-                com.littlecodesauce.ggnext.engine.Shell.runAs("kill -9 $pid", asRoot = false)
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                engine.detach()
+                if (Shell.hasRoot()) {
+                    Shell.runAs("kill -9 $pid", asRoot = true)
+                } else {
+                    try {
+                        android.os.Process.killProcess(pid)
+                    } catch (_: Throwable) {
+                        Shell.runAs("kill -9 $pid", asRoot = false)
+                    }
+                }
             }
+            _ui.update {
+                it.copy(
+                    target = null,
+                    attachedOk = false,
+                    processPaused = false,
+                    rawResults = emptyList(),
+                    results = emptyList(),
+                    memoryRows = emptyList(),
+                    searchSelection = SelectionState.EMPTY,
+                    memorySelection = SelectionState.EMPTY
+                )
+            }
+            toast("已终止目标进程 [${pid}] ${target.label}")
         }
-        _ui.update { it.copy(target = null, rawResults = emptyList(), results = emptyList(), memoryRows = emptyList()) }
-        toast("已终止目标进程 [${pid}] ${target.label}")
     }
 
-    // 退出修改器
     fun exitApp() {
         appContext?.let { ctx ->
             val intent = android.content.Intent(ctx, com.littlecodesauce.ggnext.service.FloatingIconService::class.java)
             ctx.stopService(intent)
         }
-        _ui.update { it.copy(floatingBallVisible = false, panelVisible = false, sheet = Sheet.NONE) }
+        _ui.update { it.copy(floatingBallVisible = false, panelVisible = false, sheetStack = emptyList()) }
         toast("修改器已退出")
     }
 
-    // 复制内存数据覆盖到另一块内存（参考图5）
     fun copyMemory(fromAddr: Long, toAddr: Long, bytes: Long) {
         if (bytes <= 0L) {
             toast("字节数必须大于 0")
@@ -2778,7 +3383,7 @@ object Session {
                 if (ok) {
                     toast("已成功复制 $bytes 字节到 0x${java.lang.Long.toHexString(toAddr).uppercase()}")
                     goto(_ui.value.memoryBase, recordHistory = false, highlightTarget = false)
-                    closeSheet()
+                    closeAllSheets()
                 } else {
                     toast("复制内存失败，请检查地址范围是否可读写")
                 }

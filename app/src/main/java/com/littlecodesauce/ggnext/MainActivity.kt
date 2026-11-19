@@ -1,8 +1,10 @@
 package com.littlecodesauce.ggnext
 
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
@@ -16,6 +18,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,6 +35,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.ui.graphics.Color
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -60,6 +64,7 @@ import com.littlecodesauce.ggnext.ui.components.clickableLongPress
 import com.littlecodesauce.ggnext.ui.home.DisclaimerDialog
 import com.littlecodesauce.ggnext.ui.home.HomeScreen
 import com.littlecodesauce.ggnext.ui.sheet.SheetHost
+import com.littlecodesauce.ggnext.ui.theme.DarkMode
 import com.littlecodesauce.ggnext.ui.theme.GgNextTheme
 import com.littlecodesauce.ggnext.ui.theme.Motion
 import com.littlecodesauce.ggnext.ui.theme.Rose
@@ -76,7 +81,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            ),
+            navigationBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            )
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+            window.isStatusBarContrastEnforced = false
+        }
         Session.init(application)
 
         if (intent?.getBooleanExtra(EXTRA_PANEL, false) == true && Session.ui.value.disclaimerAccepted) {
@@ -87,6 +105,32 @@ class MainActivity : ComponentActivity() {
         setContent {
             GgNextTheme {
                 val ui by Session.ui.collectAsStateWithLifecycle()
+                val toast by Session.toastState.collectAsStateWithLifecycle()
+                val systemDark = isSystemInDarkTheme()
+                val isDark = when (ui.darkMode) {
+                    DarkMode.DARK -> true
+                    DarkMode.LIGHT -> false
+                    DarkMode.FOLLOW -> systemDark
+                }
+
+                LaunchedEffect(isDark) {
+                    val barStyle = if (isDark) {
+                        SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                    } else {
+                        SystemBarStyle.light(
+                            android.graphics.Color.TRANSPARENT,
+                            android.graphics.Color.TRANSPARENT
+                        )
+                    }
+                    enableEdgeToEdge(
+                        statusBarStyle = barStyle,
+                        navigationBarStyle = barStyle
+                    )
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        window.isNavigationBarContrastEnforced = false
+                        window.isStatusBarContrastEnforced = false
+                    }
+                }
 
                 Box(Modifier.fillMaxSize()) {
                     HomeScreen(
@@ -120,7 +164,7 @@ class MainActivity : ComponentActivity() {
 
                     if (!showInActivityPanel) {
                         SheetHost(ui)
-                        ui.toast?.let { msg ->
+                        toast?.let { msg ->
                             ToastBubble(msg) { Session.consumeToast() }
                         }
                     }

@@ -158,7 +158,8 @@ private:
     std::unordered_map<uintptr_t, LockedItem> m_items;
     uint32_t m_intervalMs = 5;
     bool m_paused  = false;
-    bool m_running = true;
+    bool m_running = false;
+    bool m_started = false;
     std::thread m_worker;
 };
 

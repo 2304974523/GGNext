@@ -88,7 +88,10 @@
     private void readObject(java.io.ObjectInputStream);
 }
 
-# ---------- 其他警告抑制 ----------
+# ---------- 其他警告抑制（仅针对已知可选注解，禁止使用全局 -ignorewarnings） ----------
 -dontwarn org.jetbrains.annotations.**
 -dontwarn javax.annotation.**
--ignorewarnings
+-dontwarn java.lang.invoke.StringConcatFactory
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn org.codehaus.mojo.animal_sniffer.**
+

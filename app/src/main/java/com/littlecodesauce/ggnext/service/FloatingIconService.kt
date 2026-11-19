@@ -137,22 +137,39 @@ class FloatingIconService : Service() {
         }
         serviceScope.launch {
             Session.ui
-                .map { it.speedBarExpanded to Triple(it.speedText, it.preset, it.darkMode) }
+                .map {
+                    listOf(it.speedBarExpanded, it.speedText, it.preset, it.darkMode, it.dynamicColor, it.speedMultiplier)
+                }
                 .distinctUntilChanged()
-                .collect { (expanded, triple) ->
-                    val (speedTxt, preset, darkMode) = triple
+                .collect {
+                    val cur = Session.ui.value
+                    val expanded = cur.speedBarExpanded
+                    val speedTxt = cur.speedText
+                    val preset = cur.preset
+                    val darkMode = cur.darkMode
                     val isNight = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES
                     val isDark = when (darkMode) {
                         com.littlecodesauce.ggnext.ui.theme.DarkMode.LIGHT -> false
                         com.littlecodesauce.ggnext.ui.theme.DarkMode.DARK -> true
                         com.littlecodesauce.ggnext.ui.theme.DarkMode.FOLLOW -> isNight
                     }
-                    val seedColor = (preset.seed.value shr 32).toInt()
-                    ball?.setThemeAccent(seedColor, isDark)
+                    val accentColorInt = if (cur.dynamicColor && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                        runCatching {
+                            val resId = if (isDark) android.R.color.system_accent1_200 else android.R.color.system_accent1_600
+                            getColor(resId)
+                        }.getOrElse {
+                            val c = preset.seedFor(isDark)
+                            (c.value shr 32).toInt()
+                        }
+                    } else {
+                        val c = preset.seedFor(isDark)
+                        (c.value shr 32).toInt()
+                    }
+                    ball?.setThemeAccent(accentColorInt, isDark)
 
                     val btnBgColor = if (isDark) Color.parseColor("#EE221C20") else Color.parseColor("#EEFFFFFF")
-                    val btnBorderColor = (seedColor and 0x00FFFFFF) or (if (isDark) (0x88 shl 24) else (0xAA shl 24))
-                    val btnTextColor = if (isDark) Color.parseColor("#F2E8EC") else Color.parseColor("#1A1216")
+                    val btnBorderColor = (accentColorInt and 0x00FFFFFF) or (if (isDark) (0x88 shl 24) else (0xBB shl 24))
+                    val btnTextColor = if (isDark) Color.parseColor("#F2E8EC") else Color.parseColor("#121217")
 
                     speedDecBtn?.background = GradientDrawable().apply {
                         shape = GradientDrawable.RECTANGLE
@@ -180,7 +197,7 @@ class FloatingIconService : Service() {
 
                     speedDecBtn?.visibility = if (expanded) View.VISIBLE else View.GONE
                     speedIncBtn?.visibility = if (expanded) View.VISIBLE else View.GONE
-                    val showBadge = expanded || Session.ui.value.speedMultiplier != 1.0f
+                    val showBadge = expanded || cur.speedMultiplier != 1.0f
                     speedLabel?.visibility = if (showBadge) View.VISIBLE else View.GONE
                     speedLabel?.text = speedTxt
                     refreshBallWindowLayout()
@@ -449,15 +466,15 @@ class FloatingIconService : Service() {
         val root = object : FrameLayout(this) {
             override fun dispatchKeyEvent(event: KeyEvent): Boolean {
                 if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
-                    if (Session.ui.value.sheet != Sheet.NONE) {
-                        Session.closeSheet()
-                    } else {
+                    if (!Session.popSheet()) {
                         hidePanel()
                     }
                     return true
                 }
                 return super.dispatchKeyEvent(event)
             }
+        }.apply {
+            setBackgroundColor(Color.TRANSPARENT)
         }
         val compose = ComposePanel(this) { hidePanel() }
         compose.attach(root)
@@ -467,10 +484,15 @@ class FloatingIconService : Service() {
             WindowManager.LayoutParams.MATCH_PARENT,
             overlayType(),
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                 WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            dimAmount = 0f
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
             @Suppress("DEPRECATION")
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }

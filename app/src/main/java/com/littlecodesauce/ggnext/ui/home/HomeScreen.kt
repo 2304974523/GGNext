@@ -57,6 +57,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -435,29 +436,50 @@ private fun HomeSettingsPage(
                     Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                         Text(tr("主题配色"), color = Rose.Text, fontSize = fsp(14.5f), fontWeight = FontWeight.Medium)
                         Spacer(Modifier.height(10.dp))
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            ThemePreset.entries.forEach { p ->
-                                val selected = ui.preset == p
-                                Box(
-                                    Modifier
-                                        .size(34.dp)
-                                        .clip(CircleShape)
-                                        .background(p.seed, CircleShape)
-                                        .then(
-                                            if (selected) Modifier.border(2.dp, Rose.Text, CircleShape)
-                                            else Modifier
-                                        )
-                                        .clickableWithTooltip {
-                                            Session.setPreset(p)
-                                            Session.toast("已切换主题：${tr(p.label)}")
-                                        },
-                                    contentAlignment = Alignment.Center
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            val isDark = Rose.IsDark
+                            ThemePreset.entries.chunked(4).forEach { rowPresets ->
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    if (selected) {
-                                        Icon(Icons.Rounded.Check, null, tint = Color(0xFF161114), modifier = Modifier.size(16.dp))
+                                    rowPresets.forEach { p ->
+                                        val selected = ui.preset == p
+                                        val swatch = p.seedFor(isDark)
+                                        val checkTint = if (swatch.luminance() > 0.55f) Color(0xFF141013) else Color.White
+                                        Column(
+                                            Modifier
+                                                .weight(1f)
+                                                .clickableWithTooltip(tooltip = tr(p.label)) {
+                                                    Session.setPreset(p)
+                                                    Session.toast("${tr("已切换主题：")}${tr(p.label)}")
+                                                },
+                                            horizontalAlignment = Alignment.CenterHorizontally
+                                        ) {
+                                            Box(
+                                                Modifier
+                                                    .size(36.dp)
+                                                    .clip(CircleShape)
+                                                    .background(swatch, CircleShape)
+                                                    .then(
+                                                        if (selected) Modifier.border(2.dp, Rose.Text, CircleShape)
+                                                        else Modifier
+                                                    ),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                if (selected) {
+                                                    Icon(Icons.Rounded.Check, null, tint = checkTint, modifier = Modifier.size(16.dp))
+                                                }
+                                            }
+                                            Spacer(Modifier.height(3.dp))
+                                            Text(
+                                                tr(p.label),
+                                                color = if (selected) Rose.Text else Rose.TextSecond,
+                                                fontSize = fsp(10.5f),
+                                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                                maxLines = 1
+                                            )
+                                        }
                                     }
                                 }
                             }
